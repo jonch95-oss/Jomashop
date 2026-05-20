@@ -315,6 +315,65 @@ export function mapShopifyToJomashop(
   };
 }
 
+/**
+ * Build the JSON payload sent to Jomashop `POST /v1/products`.
+ *
+ * Picks the requested variant (or the first one) and produces a flat
+ * product-level payload that includes the dynamic category properties as
+ * top-level fields plus a `properties` block. Real Jomashop accepts the
+ * dynamic schema fields at the top level; we send both so the API can pick
+ * whichever shape matches the live schema.
+ *
+ * Returns `{ payload, variant, missingRequired }` so the caller can surface
+ * validation issues before hitting the network.
+ */
+export function buildJomashopProductPayload(
+  mapped: MappedProduct,
+  variantSku?: string,
+): {
+  payload: Record<string, unknown>;
+  variant: MappedProduct["variants"][number] | null;
+  missingRequired: string[];
+} {
+  const variant =
+    (variantSku && mapped.variants.find((v) => v.vendor_sku === variantSku)) ||
+    mapped.variants[0] ||
+    null;
+
+  const properties: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(mapped.properties)) {
+    if (v !== null && v !== undefined && v !== "") properties[k] = v;
+  }
+  // If variant has size/color, surface them in properties (override product-level)
+  if (variant) {
+    for (const [k, v] of Object.entries(variant.options)) {
+      const key = k.toLowerCase();
+      if (key === "size" || key === "color" || key === "colour") {
+        properties[key === "colour" ? "color" : key] = v;
+      }
+    }
+  }
+
+  const price = variant?.jomashop_price ?? mapped.jomashop_price;
+  const msrp = mapped.msrp ?? null;
+
+  const payload: Record<string, unknown> = {
+    category: mapped.category,
+    vendor_sku: variant?.vendor_sku || mapped.vendor_sku,
+    name: mapped.name,
+    description: mapped.description,
+    brand: mapped.brand,
+    price,
+    msrp,
+    images: mapped.images,
+    properties,
+    ...properties,
+  };
+
+  const missingRequired = mapped.warnings.filter((w) => /Missing required/.test(w));
+  return { payload, variant, missingRequired };
+}
+
 /** Sample fixtures used by /api/sync/preview-products when no real Shopify products are available. */
 export const SAMPLE_SHOPIFY_PRODUCTS: ShopifyProduct[] = [
   {

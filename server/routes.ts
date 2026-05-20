@@ -18,6 +18,7 @@ import {
 } from "@shared/schema";
 import {
   mapShopifyToJomashop,
+  buildJomashopProductPayload,
   SAMPLE_SHOPIFY_PRODUCTS,
   type ShopifyProduct,
 } from "./mapping";
@@ -470,6 +471,201 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       },
     };
     res.json({ samples, fulfillExample, note: "Preview only. No live Jomashop calls were made." });
+  });
+
+  // ---------- Live Jomashop push (single product/variant) ----------
+  //
+  // POST /api/jomashop/push-product
+  //   body: { product: ShopifyProduct, variantSku?: string, confirm: true,
+  //           pushInventory?: boolean, forcedCategory?: SupportedCategory }
+  //
+  // Pushes ONE Shopify product (optionally a specific variant) to Jomashop
+  // using the live category schema and the current commercial-discount
+  // pricing logic. After a successful product POST, optionally updates
+  // inventory for the variant SKU. Bulk push is intentionally NOT exposed.
+  app.post("/api/jomashop/push-product", async (req, res) => {
+    const body = (req.body || {}) as {
+      product?: ShopifyProduct;
+      variantSku?: string;
+      confirm?: boolean;
+      pushInventory?: boolean;
+      forcedCategory?: SupportedCategory;
+    };
+
+    if (!body.confirm) {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing confirmation. Set `confirm: true` to acknowledge this will create/update data in Jomashop.",
+      });
+    }
+    if (!body.product) {
+      return res.status(400).json({ ok: false, error: "Missing `product` in request body." });
+    }
+    if (!jomashopConfigured()) {
+      return res.status(503).json({
+        ok: false,
+        error: "Jomashop credentials not configured. Set JOMASHOP_EMAIL and JOMASHOP_PASSWORD.",
+      });
+    }
+
+    // Resolve live (or fallback) schema for the inferred/forced category.
+    const tmpMap = mapShopifyToJomashop(body.product, [], body.forcedCategory);
+    const { source, schema } = await resolveCategorySchema(tmpMap.category);
+    const schemaProps = (schema as { properties?: Array<any> } | undefined)?.properties;
+    const props =
+      schemaProps ||
+      FALLBACK_CATEGORY_SCHEMAS[tmpMap.category].map((f) => ({
+        field: f.field,
+        required: f.required,
+        type: f.type,
+        options: f.options,
+      }));
+
+    const mapped = mapShopifyToJomashop(body.product, props, body.forcedCategory);
+    const { payload, variant, missingRequired } = buildJomashopProductPayload(
+      mapped,
+      body.variantSku,
+    );
+
+    const startedAt = Date.now();
+    const job = storage.createSyncJob({
+      jobType: "products_push",
+      status: "running",
+      startedAt,
+      finishedAt: null,
+      totalItems: 1,
+      successItems: 0,
+      errorItems: 0,
+      summary: `Push ${mapped.vendor_sku} (${mapped.category})`,
+    });
+
+    if (missingRequired.length > 0) {
+      storage.updateSyncJob(job.id, {
+        status: "failed",
+        finishedAt: Date.now(),
+        errorItems: 1,
+        summary: `Validation failed: ${missingRequired.length} required field(s) missing`,
+      });
+      storage.appendLog({
+        jobId: job.id,
+        level: "error",
+        message: `Push aborted before API call: missing required fields for ${mapped.vendor_sku}`,
+        detailsJson: JSON.stringify({ missingRequired, schemaSource: source }),
+        createdAt: Date.now(),
+      });
+      return res.status(422).json({
+        ok: false,
+        error: "Required category fields are missing. Fix the mapping and retry.",
+        missingRequired,
+        warnings: mapped.warnings,
+        payloadPreview: payload,
+        mapped,
+        schemaSource: source,
+      });
+    }
+
+    storage.appendLog({
+      jobId: job.id,
+      level: "info",
+      message: `POST /v1/products for ${mapped.vendor_sku} (${mapped.category})`,
+      detailsJson: JSON.stringify({ schemaSource: source, vendorSku: payload.vendor_sku }),
+      createdAt: Date.now(),
+    });
+
+    const productResp = await jomashopRequest({
+      method: "POST",
+      path: "/v1/products",
+      body: payload,
+    });
+
+    if (!productResp.ok) {
+      storage.updateSyncJob(job.id, {
+        status: "failed",
+        finishedAt: Date.now(),
+        errorItems: 1,
+        summary: `POST /v1/products failed (${productResp.status})`,
+      });
+      storage.appendLog({
+        jobId: job.id,
+        level: "error",
+        message: `Jomashop product push failed (${productResp.status})`,
+        detailsJson: JSON.stringify({ error: productResp.error, payload }),
+        createdAt: Date.now(),
+      });
+      return res.status(502).json({
+        ok: false,
+        stage: "product_post",
+        error: productResp.error,
+        status: productResp.status,
+        payloadPreview: payload,
+        mapped,
+        schemaSource: source,
+      });
+    }
+
+    // Persist the SKU mapping so subsequent operations can find it.
+    if (mapped.source.shopify_product_id) {
+      const variantId =
+        (variant && body.product.variants?.find((v) => v.sku === variant.vendor_sku)?.id) ??
+        mapped.source.shopify_variant_ids[0];
+      storage.upsertSkuMapping({
+        shopifyVariantId: String(variantId ?? variant?.vendor_sku ?? mapped.vendor_sku),
+        shopifyProductId: String(mapped.source.shopify_product_id),
+        shopifySku: String(variant?.vendor_sku ?? mapped.vendor_sku),
+        jomashopSku: String(payload.vendor_sku),
+        jomashopProductId: null,
+        categoryKey: mapped.category.toLowerCase(),
+        status: "active",
+        lastError: null,
+        updatedAt: Date.now(),
+      });
+    }
+
+    // Optionally push inventory for this SKU.
+    let inventoryResp: { ok: boolean; status: number; data?: unknown; error?: string } | null = null;
+    if (body.pushInventory !== false && variant) {
+      const invBody = {
+        price: variant.jomashop_price ?? mapped.jomashop_price,
+        status: variant.status,
+        quantity: variant.quantity,
+      };
+      inventoryResp = await jomashopRequest({
+        method: "PUT",
+        path: `/v1/inventory/${encodeURIComponent(variant.vendor_sku)}`,
+        body: invBody,
+      });
+      storage.appendLog({
+        jobId: job.id,
+        level: inventoryResp.ok ? "info" : "warn",
+        message: inventoryResp.ok
+          ? `PUT /v1/inventory/${variant.vendor_sku} ok`
+          : `PUT /v1/inventory/${variant.vendor_sku} failed (${inventoryResp.status})`,
+        detailsJson: JSON.stringify({ body: invBody, error: inventoryResp.error }),
+        createdAt: Date.now(),
+      });
+    }
+
+    storage.updateSyncJob(job.id, {
+      status: "success",
+      finishedAt: Date.now(),
+      successItems: 1,
+      summary: inventoryResp
+        ? `Product POST ok; inventory PUT ${inventoryResp.ok ? "ok" : "failed"}`
+        : "Product POST ok",
+    });
+
+    return res.json({
+      ok: true,
+      jobId: job.id,
+      schemaSource: source,
+      mapped,
+      payloadPreview: payload,
+      product: { status: productResp.status, data: productResp.data },
+      inventory: inventoryResp
+        ? { status: inventoryResp.status, ok: inventoryResp.ok, data: inventoryResp.data, error: inventoryResp.error }
+        : null,
+      warnings: mapped.warnings,
+    });
   });
 
   // ---------- DB-backed read endpoints used by the UI ----------
