@@ -29,7 +29,14 @@ export type ShopifyProduct = {
   images?: Array<{ src: string; alt?: string | null }>;
   options?: Array<{ name: string; values: string[] }>;
   variants?: ShopifyVariant[];
-  metafields?: Array<{ namespace: string; key: string; value: string }>;
+  metafields?: Array<{
+    namespace?: string;
+    key?: string;
+    value?: string | number | null;
+    name?: string;
+    label?: string;
+    description?: string;
+  }>;
 };
 
 export type MappedProduct = {
@@ -40,11 +47,14 @@ export type MappedProduct = {
   brand: string;
   price: number | null;
   msrp: number | null;
+  commercial_discount: number;
+  jomashop_price: number | null;
   images: string[];
   properties: Record<string, string | number | boolean | null>;
   variants: Array<{
     vendor_sku: string;
     price: number | null;
+    jomashop_price: number | null;
     quantity: number;
     status: "active" | "out_of_stock" | "inactive";
     options: Record<string, string>;
@@ -91,8 +101,67 @@ function resolveOption(p: ShopifyProduct, names: string[]): "option1" | "option2
 }
 
 function readMetafield(p: ShopifyProduct, key: string): string | undefined {
-  const mf = (p.metafields || []).find((m) => m.key === key || `${m.namespace}.${m.key}` === key);
-  return mf?.value;
+  const mf = (p.metafields || []).find(
+    (m) => m.key === key || `${m.namespace ?? ""}.${m.key ?? ""}` === key,
+  );
+  if (mf?.value === undefined || mf?.value === null) return undefined;
+  return String(mf.value);
+}
+
+const DISCOUNT_KEY_CANDIDATES = [
+  "custom.commercial_discount",
+  "commercial_discount",
+  "commercialDiscount",
+  "commercial-discount",
+];
+const DISCOUNT_LABEL_PATTERN = /^\s*commercial[\s_-]*discount\s*$/i;
+
+/**
+ * Locate the Commercial Discount metafield on a Shopify product across the
+ * common shapes Shopify returns (namespaced key, bare key, camelCase, or
+ * human-readable name/label/description). Returns the raw string value or
+ * undefined when nothing usable is present.
+ */
+function readCommercialDiscountRaw(p: ShopifyProduct): string | undefined {
+  const mfs = p.metafields || [];
+  for (const candidate of DISCOUNT_KEY_CANDIDATES) {
+    const hit = readMetafield(p, candidate);
+    if (hit !== undefined && hit !== "") return hit;
+  }
+  for (const m of mfs) {
+    const labelish = m.name || m.label || m.description;
+    if (labelish && DISCOUNT_LABEL_PATTERN.test(labelish)) {
+      if (m.value !== undefined && m.value !== null && String(m.value) !== "") {
+        return String(m.value);
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Normalize a Commercial Discount value into a 0..1 decimal fraction.
+ * - Blank / missing / non-numeric → 0
+ * - Values > 1 are interpreted as percentages (30 → 0.30)
+ * - Values between 0 and 1 are kept as decimals (0.3 → 0.30)
+ * - Result is clamped to [0, 1].
+ */
+export function normalizeCommercialDiscount(raw: string | number | null | undefined): number {
+  if (raw === null || raw === undefined) return 0;
+  const s = typeof raw === "string" ? raw.trim().replace(/%$/, "") : raw;
+  if (s === "" || s === undefined || s === null) return 0;
+  const n = typeof s === "number" ? s : parseFloat(String(s));
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  const fraction = n > 1 ? n / 100 : n;
+  if (!Number.isFinite(fraction) || fraction <= 0) return 0;
+  return Math.min(fraction, 1);
+}
+
+/** Compute Jomashop price = shopify_price * (1 - discount), rounded to 2 decimals. */
+export function computeJomashopPrice(shopifyPrice: number | null, discountFraction: number): number | null {
+  if (shopifyPrice === null || !Number.isFinite(shopifyPrice)) return null;
+  const raw = shopifyPrice * (1 - discountFraction);
+  return Math.round(raw * 100) / 100;
 }
 
 function inventoryStatus(qty: number | undefined): "active" | "out_of_stock" | "inactive" {
@@ -195,6 +264,15 @@ export function mapShopifyToJomashop(
     }
   }
 
+  // Commercial discount: Jomashop price = Shopify price * (1 - discount).
+  const discountRaw = readCommercialDiscountRaw(product);
+  const commercialDiscount = normalizeCommercialDiscount(discountRaw);
+  if (discountRaw !== undefined && commercialDiscount === 0 && String(discountRaw).trim() !== "" && String(discountRaw).trim() !== "0") {
+    warnings.push(
+      `Commercial Discount value "${discountRaw}" could not be parsed — treating as 0%.`,
+    );
+  }
+
   // Variants
   const mappedVariants = (product.variants || []).map((v) => {
     const options: Record<string, string> = {};
@@ -203,14 +281,18 @@ export function mapShopifyToJomashop(
       const val = v[key];
       if (val) options[opt.name] = String(val);
     });
+    const variantPrice = parsePrice(v.price);
     return {
       vendor_sku: v.sku || `${vendorSku}-V${v.id ?? ""}`,
-      price: parsePrice(v.price),
+      price: variantPrice,
+      jomashop_price: computeJomashopPrice(variantPrice, commercialDiscount),
       quantity: v.inventory_quantity ?? 0,
       status: inventoryStatus(v.inventory_quantity),
       options,
     };
   });
+
+  const shopifyPrice = parsePrice(firstVariant?.price);
 
   return {
     category,
@@ -218,8 +300,10 @@ export function mapShopifyToJomashop(
     name: product.title || "Untitled product",
     description: (product.body_html || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim(),
     brand: (properties.brand as string | null) || product.vendor || "Unknown",
-    price: parsePrice(firstVariant?.price),
+    price: shopifyPrice,
     msrp: parsePrice(firstVariant?.compare_at_price),
+    commercial_discount: commercialDiscount,
+    jomashop_price: computeJomashopPrice(shopifyPrice, commercialDiscount),
     images: (product.images || []).map((i) => i.src).filter(Boolean),
     properties,
     variants: mappedVariants,
@@ -254,6 +338,7 @@ export const SAMPLE_SHOPIFY_PRODUCTS: ShopifyProduct[] = [
       { namespace: "luxe", key: "size_system", value: "US" },
       { namespace: "luxe", key: "material", value: "Calfskin leather" },
       { namespace: "luxe", key: "country_of_origin", value: "Italy" },
+      { namespace: "custom", key: "commercial_discount", value: "30" },
     ],
   },
   {
@@ -273,6 +358,7 @@ export const SAMPLE_SHOPIFY_PRODUCTS: ShopifyProduct[] = [
       { namespace: "luxe", key: "style", value: "Shoulder" },
       { namespace: "luxe", key: "hardware", value: "Gold" },
       { namespace: "luxe", key: "country_of_origin", value: "Italy" },
+      { namespace: "custom", key: "commercial_discount", value: "0.25" },
     ],
   },
   {

@@ -54,11 +54,14 @@ export type MappedProduct = {
   brand: string;
   price: number | null;
   msrp: number | null;
+  commercial_discount: number;
+  jomashop_price: number | null;
   images: string[];
   properties: Record<string, string | number | boolean | null>;
   variants: Array<{
     vendor_sku: string;
     price: number | null;
+    jomashop_price: number | null;
     quantity: number;
     status: "active" | "out_of_stock" | "inactive";
     options: Record<string, string>;

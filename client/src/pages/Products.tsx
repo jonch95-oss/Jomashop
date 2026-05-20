@@ -66,12 +66,22 @@ export default function Products() {
                 <div>
                   <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Brand</div>
                   <div className="mt-1 text-sm">{p.brand}</div>
-                  <div className="mt-3 text-[10px] uppercase tracking-wider text-muted-foreground">Price</div>
+                  <div className="mt-3 text-[10px] uppercase tracking-wider text-muted-foreground">Shopify price</div>
                   <div className="mt-1 text-sm tabular-nums">
                     {p.price !== null ? `$${p.price.toFixed(2)}` : "—"}
                     {p.msrp && (
                       <span className="ml-2 text-xs text-muted-foreground line-through">${p.msrp.toFixed(2)}</span>
                     )}
+                  </div>
+                  <div className="mt-3 text-[10px] uppercase tracking-wider text-muted-foreground">Commercial discount</div>
+                  <div className="mt-1 text-sm tabular-nums" data-testid={`text-discount-${p.vendor_sku}`}>
+                    {p.commercial_discount > 0
+                      ? `${(p.commercial_discount * 100).toFixed(p.commercial_discount * 100 % 1 === 0 ? 0 : 2)}%`
+                      : "—"}
+                  </div>
+                  <div className="mt-3 text-[10px] uppercase tracking-wider text-muted-foreground">Jomashop price</div>
+                  <div className="mt-1 text-sm font-medium tabular-nums" data-testid={`text-jomashop-price-${p.vendor_sku}`}>
+                    {p.jomashop_price !== null ? `$${p.jomashop_price.toFixed(2)}` : "—"}
                   </div>
                   <div className="mt-3 text-[10px] uppercase tracking-wider text-muted-foreground">Variants</div>
                   <div className="mt-1 text-sm tabular-nums">{p.variants.length}</div>
@@ -117,7 +127,8 @@ export default function Products() {
                         <tr>
                           <th className="px-3 py-1.5 text-left font-medium">Vendor SKU</th>
                           <th className="px-3 py-1.5 text-left font-medium">Options</th>
-                          <th className="px-3 py-1.5 text-right font-medium">Price</th>
+                          <th className="px-3 py-1.5 text-right font-medium">Shopify price</th>
+                          <th className="px-3 py-1.5 text-right font-medium">Jomashop price</th>
                           <th className="px-3 py-1.5 text-right font-medium">Qty</th>
                           <th className="px-3 py-1.5 text-right font-medium">Status</th>
                         </tr>
@@ -131,6 +142,9 @@ export default function Products() {
                             </td>
                             <td className="px-3 py-1.5 text-right tabular-nums">
                               {v.price !== null ? `$${v.price.toFixed(2)}` : "—"}
+                            </td>
+                            <td className="px-3 py-1.5 text-right font-medium tabular-nums" data-testid={`variant-jomashop-price-${v.vendor_sku}`}>
+                              {v.jomashop_price !== null ? `$${v.jomashop_price.toFixed(2)}` : "—"}
                             </td>
                             <td className="px-3 py-1.5 text-right tabular-nums">{v.quantity}</td>
                             <td className="px-3 py-1.5 text-right">
