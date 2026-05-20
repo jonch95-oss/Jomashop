@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useEffect, useState, useMemo } from "react";
 import { useSearch } from "wouter";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { useToast } from "@/hooks/use-toast";
@@ -70,7 +70,30 @@ export default function Setup() {
     }
     return list.find((s) => s.oauthStatus === "connected") || null;
   }, [stores.data, installedShop]);
-  const [shop, setShop] = useState(installedShop || "luxesupply.myshopify.com");
+  // Default to the operator's primary store. If the user already installed or
+  // has a stored shop domain, prefer that; otherwise fall back to the known
+  // default so they don't have to retype it every session.
+  const DEFAULT_SHOP_DOMAIN = "herbiemissry.myshopify.com";
+  const initialShop =
+    installedShop ||
+    connectedStore?.shopDomain ||
+    (stores.data && stores.data[0]?.shopDomain) ||
+    DEFAULT_SHOP_DOMAIN;
+  const [shop, setShop] = useState(initialShop);
+  const [shopEdited, setShopEdited] = useState(false);
+
+  // If stores load after first render, upgrade the input from the hard-coded
+  // default to the stored/installed shop without clobbering user edits.
+  useEffect(() => {
+    if (shopEdited) return;
+    const next =
+      installedShop ||
+      connectedStore?.shopDomain ||
+      (stores.data && stores.data[0]?.shopDomain) ||
+      DEFAULT_SHOP_DOMAIN;
+    if (next && next !== shop) setShop(next);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stores.data, installedShop, connectedStore]);
 
   const test = useMutation<SessionTestResult>({
     mutationFn: async () => {
@@ -172,8 +195,11 @@ export default function Setup() {
                 id="shop-domain"
                 data-testid="input-shop-domain"
                 value={shop}
-                onChange={(e) => setShop(e.target.value)}
-                placeholder="luxesupply.myshopify.com"
+                onChange={(e) => {
+                  setShopEdited(true);
+                  setShop(e.target.value);
+                }}
+                placeholder="herbiemissry.myshopify.com"
                 className="font-mono text-sm"
               />
               <div className="flex flex-wrap gap-2">

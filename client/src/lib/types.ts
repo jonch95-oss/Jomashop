@@ -47,6 +47,10 @@ export type CategorySchema = {
 };
 
 export type MappedProduct = {
+  /** Required category property names that came back null/empty (e.g. ["color", "material"]). */
+  missing_required?: string[];
+  /** Required top-level field names that are missing (e.g. ["sku", "manufacturer_number"]). */
+  missing_top_level?: string[];
   category: "Shoes" | "Handbags" | "Clothing";
   is_sample?: boolean;
   raw_category?: string | null;

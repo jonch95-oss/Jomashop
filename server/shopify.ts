@@ -280,59 +280,167 @@ function normalizeProduct(p: ShopifyGraphProduct): ShopifyProduct {
 }
 
 export type FetchProductsResult =
-  | { ok: true; products: ShopifyProduct[]; shopDomain: string; count: number }
+  | {
+      ok: true;
+      products: ShopifyProduct[];
+      shopDomain: string;
+      count: number;
+      pageCount: number;
+      hasMore: boolean;
+      partialError?: string;
+      partialStatus?: number;
+    }
   | { ok: false; error: string; status?: number; shopDomain?: string };
 
+export type FetchProductsOptions = {
+  /** Per-request GraphQL page size. Shopify caps at 250 for products. */
+  pageSize?: number;
+  /** Optional hard cap on total products. Omit to fetch all pages. */
+  maxProducts?: number;
+  /** Safety guard so we never spin forever on bad cursors. */
+  maxPages?: number;
+};
+
+const DEFAULT_PAGE_SIZE = 100;
+const SHOPIFY_MAX_PAGE_SIZE = 250;
+const DEFAULT_MAX_PAGES = 200;
+
 /**
- * Fetch up to `limit` live products from the connected Shopify store using
- * the Admin GraphQL API. Returns a normalized payload that mapping.ts can
- * consume directly.
+ * Fetch live products from the connected Shopify store using the Admin
+ * GraphQL API, paginating through ALL pages until hasNextPage is false (or
+ * the optional caps are reached). Returns normalized products plus
+ * fetchedCount, pageCount, and hasMore so callers can show progress.
+ *
+ * If a single page fails mid-walk we return the products we already have
+ * along with `partialError`/`partialStatus` so the UI can show partial data.
  */
-export async function fetchShopifyProducts(limit = 25): Promise<FetchProductsResult> {
+export async function fetchShopifyProducts(
+  options: FetchProductsOptions = {},
+): Promise<FetchProductsResult> {
   const conn = getActiveShopifyConnection();
   if (!conn) {
     return { ok: false, error: "No connected Shopify store with an access token." };
   }
   const endpoint = `https://${conn.shopDomain}/admin/api/${ADMIN_API_VERSION}/graphql.json`;
-  const pageSize = Math.min(limit, 50);
-  const { query, variables } = buildProductsQuery(pageSize, null);
+  const pageSize = Math.min(
+    Math.max(options.pageSize ?? DEFAULT_PAGE_SIZE, 1),
+    SHOPIFY_MAX_PAGE_SIZE,
+  );
+  const maxProducts = options.maxProducts ?? Number.POSITIVE_INFINITY;
+  const maxPages = Math.max(options.maxPages ?? DEFAULT_MAX_PAGES, 1);
 
-  let res: Response;
-  try {
-    res = await fetch(endpoint, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Shopify-Access-Token": conn.accessToken,
-      },
-      body: JSON.stringify({ query, variables }),
-    });
-  } catch (err) {
-    return { ok: false, error: (err as Error).message, shopDomain: conn.shopDomain };
+  const products: ShopifyProduct[] = [];
+  let cursor: string | null = null;
+  let hasMore = false;
+  let pageCount = 0;
+  let partialError: string | undefined;
+  let partialStatus: number | undefined;
+
+  while (pageCount < maxPages && products.length < maxProducts) {
+    const remaining = maxProducts - products.length;
+    const thisPageSize = Math.min(pageSize, Number.isFinite(remaining) ? remaining : pageSize);
+    const { query, variables } = buildProductsQuery(thisPageSize, cursor);
+
+    let res: Response;
+    try {
+      res = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Shopify-Access-Token": conn.accessToken,
+        },
+        body: JSON.stringify({ query, variables }),
+      });
+    } catch (err) {
+      const msg = (err as Error).message;
+      if (products.length === 0) {
+        return { ok: false, error: msg, shopDomain: conn.shopDomain };
+      }
+      partialError = msg;
+      hasMore = true;
+      break;
+    }
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      const msg = `Shopify Admin API ${res.status}: ${text.slice(0, 500)}`;
+      if (products.length === 0) {
+        return { ok: false, status: res.status, error: msg, shopDomain: conn.shopDomain };
+      }
+      partialError = msg;
+      partialStatus = res.status;
+      hasMore = true;
+      break;
+    }
+
+    const body = (await res.json().catch(() => null)) as GraphQLResponse | null;
+    if (!body) {
+      if (products.length === 0) {
+        return {
+          ok: false,
+          status: res.status,
+          error: "Shopify Admin API returned non-JSON.",
+          shopDomain: conn.shopDomain,
+        };
+      }
+      partialError = "Shopify Admin API returned non-JSON.";
+      partialStatus = res.status;
+      hasMore = true;
+      break;
+    }
+    if (body.errors && body.errors.length > 0) {
+      const msg = `Shopify GraphQL errors: ${body.errors.map((e) => e.message).join("; ")}`;
+      if (products.length === 0) {
+        return {
+          ok: false,
+          status: res.status,
+          error: msg,
+          shopDomain: conn.shopDomain,
+        };
+      }
+      partialError = msg;
+      partialStatus = res.status;
+      hasMore = true;
+      break;
+    }
+
+    pageCount += 1;
+    const edges = body.data?.products?.edges ?? [];
+    for (const edge of edges) {
+      products.push(normalizeProduct(edge.node));
+      if (products.length >= maxProducts) break;
+    }
+    const pageInfo = body.data?.products?.pageInfo;
+    if (!pageInfo || !pageInfo.hasNextPage || !pageInfo.endCursor) {
+      hasMore = false;
+      break;
+    }
+    if (products.length >= maxProducts) {
+      hasMore = true;
+      break;
+    }
+    if (pageInfo.endCursor === cursor) {
+      partialError = "Shopify returned a repeating cursor — aborting to avoid infinite loop.";
+      hasMore = true;
+      break;
+    }
+    cursor = pageInfo.endCursor;
   }
 
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    return {
-      ok: false,
-      status: res.status,
-      error: `Shopify Admin API ${res.status}: ${text.slice(0, 500)}`,
-      shopDomain: conn.shopDomain,
-    };
+  if (pageCount >= maxPages && hasMore) {
+    partialError =
+      partialError ??
+      `Stopped after ${pageCount} pages (safety cap). Increase maxPages to fetch more.`;
   }
-  const body = (await res.json().catch(() => null)) as GraphQLResponse | null;
-  if (!body) {
-    return { ok: false, status: res.status, error: "Shopify Admin API returned non-JSON.", shopDomain: conn.shopDomain };
-  }
-  if (body.errors && body.errors.length > 0) {
-    return {
-      ok: false,
-      status: res.status,
-      error: `Shopify GraphQL errors: ${body.errors.map((e) => e.message).join("; ")}`,
-      shopDomain: conn.shopDomain,
-    };
-  }
-  const edges = body.data?.products?.edges ?? [];
-  const products = edges.slice(0, limit).map((e) => normalizeProduct(e.node));
-  return { ok: true, products, shopDomain: conn.shopDomain, count: products.length };
+
+  return {
+    ok: true,
+    products,
+    shopDomain: conn.shopDomain,
+    count: products.length,
+    pageCount,
+    hasMore,
+    ...(partialError ? { partialError } : {}),
+    ...(partialStatus !== undefined ? { partialStatus } : {}),
+  };
 }

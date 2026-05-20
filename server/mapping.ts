@@ -40,6 +40,10 @@ export type ShopifyProduct = {
 };
 
 export type MappedProduct = {
+  /** Names of required category properties that are missing/empty (e.g. "color", "material"). */
+  missing_required?: string[];
+  /** Names of required top-level fields that are missing (e.g. "sku", "manufacturer_number"). */
+  missing_top_level?: string[];
   category: SupportedCategory;
   /** True when this mapping was produced from a built-in demo fixture rather
    *  than a real Shopify product. The UI uses this to block pushes and label
@@ -307,6 +311,7 @@ export function mapShopifyToJomashop(
   // property we look first at metafields (namespaced), then at common Shopify
   // fields, then leave it null and emit a warning if required.
   const properties: Record<string, string | number | boolean | null> = {};
+  const missingRequiredProps: string[] = [];
   for (const prop of schemaProperties) {
     let value: string | undefined | null = readMetafield(product, prop.field);
 
@@ -376,6 +381,7 @@ export function mapShopifyToJomashop(
     if (!value && prop.required) {
       warnings.push(`Missing required ${category} field "${prop.field}" — add via metafield, product option, or vendor field.`);
       properties[prop.field] = null;
+      missingRequiredProps.push(prop.field);
     } else {
       properties[prop.field] = value ?? null;
     }
@@ -418,7 +424,20 @@ export function mapShopifyToJomashop(
 
   const brand = (properties.brand as string | null) || product.vendor || "";
 
+  const missingTopLevelFields: string[] = [];
+  if (!category) missingTopLevelFields.push("category");
+  if (!brand || String(brand).trim() === "") missingTopLevelFields.push("brand");
+  if (!vendorSku || vendorSku.trim() === "") {
+    missingTopLevelFields.push("sku");
+    missingTopLevelFields.push("vendor_sku");
+  }
+  if (!manufacturerNumber || String(manufacturerNumber).trim() === "") {
+    missingTopLevelFields.push("manufacturer_number");
+  }
+
   return {
+    missing_required: missingRequiredProps,
+    missing_top_level: missingTopLevelFields,
     category,
     is_sample: sampleFixture,
     raw_category: rawCategory,

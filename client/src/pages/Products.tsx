@@ -63,15 +63,27 @@ type PreviewData = {
   dataSource?: "live" | "sample";
   shopDomain?: string | null;
   fetchedCount?: number;
+  pageCount?: number;
+  hasMore?: boolean;
   fallbackReason?: string | null;
   fetchError?: string | null;
   note?: string;
 };
 
+type ProductFilter = "all" | "ready" | "missing" | "sample";
+
+function missingFieldsFor(p: MappedProduct): string[] {
+  const out = new Set<string>();
+  for (const f of p.missing_top_level || []) out.add(f);
+  for (const f of p.missing_required || []) out.add(f);
+  return Array.from(out);
+}
+
 export default function Products() {
   const [data, setData] = useState<PreviewData | null>(null);
   const [pushTarget, setPushTarget] = useState<PushTarget | null>(null);
   const [pushResult, setPushResult] = useState<PushResult | null>(null);
+  const [filter, setFilter] = useState<ProductFilter>("all");
   const [overrides, setOverrides] = useState<OverrideFields>({
     category: "",
     brand: "",
@@ -177,6 +189,32 @@ export default function Products() {
     !push.isPending &&
     !targetIsSample;
 
+  const filterCounts = useMemo(() => {
+    const mapped = data?.mapped ?? [];
+    let ready = 0;
+    let missing = 0;
+    let sample = 0;
+    for (const p of mapped) {
+      if (p.is_sample) sample += 1;
+      const miss = missingFieldsFor(p);
+      if (miss.length > 0) missing += 1;
+      else if (!p.is_sample) ready += 1;
+    }
+    return { all: mapped.length, ready, missing, sample };
+  }, [data]);
+
+  const filteredProducts = useMemo<MappedProduct[]>(() => {
+    const mapped = data?.mapped ?? [];
+    return mapped.filter((p) => {
+      const miss = missingFieldsFor(p);
+      if (filter === "all") return true;
+      if (filter === "ready") return miss.length === 0 && !p.is_sample;
+      if (filter === "missing") return miss.length > 0;
+      if (filter === "sample") return p.is_sample === true;
+      return true;
+    });
+  }, [data, filter]);
+
   const categorySelected = overrides.category.trim();
   const categoryInLiveList =
     categorySelected !== "" &&
@@ -242,8 +280,12 @@ export default function Products() {
                 </span>
               )}
               {data.dataSource === "live" && typeof data.fetchedCount === "number" && data.fetchedCount > 0 && (
-                <span className="text-[11px] opacity-80">
+                <span className="text-[11px] opacity-80" data-testid="text-fetched-count">
                   · {data.fetchedCount} product{data.fetchedCount === 1 ? "" : "s"} fetched
+                  {typeof data.pageCount === "number" && data.pageCount > 0
+                    ? ` across ${data.pageCount} page${data.pageCount === 1 ? "" : "s"}`
+                    : ""}
+                  {data.hasMore ? " · more available" : data.dataSource === "live" ? " · complete" : ""}
                 </span>
               )}
               <span className="ml-auto text-[11px] opacity-70">
@@ -269,7 +311,56 @@ export default function Products() {
               </div>
             )}
           </div>
-          {data.mapped.map((p, idx) => (
+
+          <div
+            data-testid="product-filter-controls"
+            className="flex flex-wrap items-center gap-2 rounded-md border border-border bg-card/40 p-2 text-xs"
+          >
+            <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
+              Filter
+            </span>
+            {(
+              [
+                { key: "all" as const, label: "All", count: filterCounts.all },
+                { key: "ready" as const, label: "Ready to push", count: filterCounts.ready },
+                { key: "missing" as const, label: "Missing required", count: filterCounts.missing },
+                ...(filterCounts.sample > 0
+                  ? [{ key: "sample" as const, label: "Sample only", count: filterCounts.sample }]
+                  : []),
+              ]
+            ).map((f) => (
+              <Button
+                key={f.key}
+                data-testid={`button-filter-${f.key}`}
+                size="sm"
+                variant={filter === f.key ? "default" : "outline"}
+                className="h-7 px-2 text-[11px]"
+                onClick={() => setFilter(f.key)}
+              >
+                {f.label}
+                <Badge
+                  variant="outline"
+                  className="ml-2 h-4 px-1 font-mono text-[9px] tabular-nums"
+                >
+                  {f.count}
+                </Badge>
+              </Button>
+            ))}
+            <span className="ml-auto text-[10px] text-muted-foreground" data-testid="text-filtered-count">
+              Showing {filteredProducts.length} of {filterCounts.all}
+            </span>
+          </div>
+
+          {filteredProducts.length === 0 ? (
+            <EmptyState
+              title="No products match this filter"
+              description="Try the All filter, or load more products from Shopify."
+            />
+          ) : (
+            filteredProducts.map((p) => {
+            const idx = data.mapped.indexOf(p);
+            const missing = missingFieldsFor(p);
+            return (
             <Card
               key={`${p.vendor_sku}-${p.source.shopify_product_id}`}
               data-testid={`card-product-${p.vendor_sku}`}
@@ -279,6 +370,16 @@ export default function Products() {
                 <div className="flex items-center gap-3">
                   <CardTitle className="text-sm">{p.name}</CardTitle>
                   <Badge variant="outline" className="text-[10px] uppercase">{p.category}</Badge>
+                  {missing.length > 0 && (
+                    <Badge
+                      data-testid={`badge-missing-${p.vendor_sku}`}
+                      variant="outline"
+                      className="bg-red-500/10 text-[10px] uppercase text-red-600 dark:text-red-400"
+                      title={`Missing: ${missing.join(", ")}`}
+                    >
+                      Missing: {missing.join(", ")}
+                    </Badge>
+                  )}
                   {p.is_sample ? (
                     <Badge
                       data-testid={`badge-sample-${p.vendor_sku}`}
@@ -450,7 +551,9 @@ export default function Products() {
                 </div>
               </CardContent>
             </Card>
-          ))}
+            );
+            })
+          )}
         </div>
       )}
 

@@ -19,7 +19,6 @@ import {
 import {
   mapShopifyToJomashop,
   buildJomashopProductPayload,
-  suggestJomashopCategory,
   isSampleProduct,
   SAMPLE_SHOPIFY_PRODUCTS,
   type PushOverrides,
@@ -163,7 +162,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // ---------- Shopify OAuth ----------
   // /auth/shopify/start?shop=luxesupply.myshopify.com
   app.get("/auth/shopify/start", (req, res) => {
-    const shop = String(req.query.shop || "luxesupply.myshopify.com");
+    const shop = String(req.query.shop || "herbiemissry.myshopify.com");
     if (!/^[a-z0-9][a-z0-9-]*\.myshopify\.com$/i.test(shop)) {
       return res.status(400).json({ error: "Invalid shop domain" });
     }
@@ -401,9 +400,16 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // ---------- Sync previews ----------
   app.post("/api/sync/preview-products", async (req, res) => {
     const supplied = req.body?.products as ShopifyProduct[] | undefined;
-    const limit = Math.min(
-      Math.max(parseInt(String(req.body?.limit ?? "25"), 10) || 25, 1),
-      50,
+    // Allow callers to optionally cap product count or page size. By default
+    // we fetch ALL products (no maxProducts cap) using a 100/page request.
+    const rawLimit = req.body?.limit;
+    const maxProducts =
+      rawLimit === undefined || rawLimit === null || rawLimit === "" || rawLimit === "all"
+        ? undefined
+        : Math.max(parseInt(String(rawLimit), 10) || 0, 1);
+    const pageSize = Math.min(
+      Math.max(parseInt(String(req.body?.pageSize ?? "100"), 10) || 100, 1),
+      250,
     );
 
     // Resolve the Shopify connection (DB-persisted OAuth token preferred,
@@ -422,20 +428,38 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     let fallbackReason: string | null = null;
     let fetchError: string | null = null;
     let fetchedCount = 0;
+    let pageCount = 0;
+    let hasMore = false;
 
     if (Array.isArray(supplied) && supplied.length > 0) {
       products = supplied;
       dataSource = "live";
+      fetchedCount = supplied.length;
     } else if (conn) {
-      const result = await fetchShopifyProducts(limit);
+      const result = await fetchShopifyProducts({ pageSize, maxProducts });
       if (result.ok && result.products.length > 0) {
         products = result.products;
         dataSource = "live";
         fetchedCount = result.count;
+        pageCount = result.pageCount;
+        hasMore = result.hasMore;
+        if (result.partialError) {
+          fetchError = result.partialError;
+          storage.appendLog({
+            level: "warn",
+            message: `Partial Shopify product fetch from ${result.shopDomain}: ${result.partialError}`,
+            detailsJson: JSON.stringify({
+              fetchedCount: result.count,
+              pageCount: result.pageCount,
+              status: result.partialStatus,
+            }),
+            createdAt: Date.now(),
+          });
+        }
         storage.appendLog({
           level: "info",
-          message: `Fetched ${result.count} live Shopify products from ${result.shopDomain}`,
-          detailsJson: null,
+          message: `Fetched ${result.count} live Shopify products from ${result.shopDomain} across ${result.pageCount} page(s)`,
+          detailsJson: JSON.stringify({ hasMore: result.hasMore }),
           createdAt: Date.now(),
         });
       } else if (result.ok) {
@@ -489,6 +513,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       dataSource,
       shopDomain,
       fetchedCount,
+      pageCount,
+      hasMore,
       fallbackReason,
       fetchError,
       note: usingSamples
@@ -499,10 +525,16 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   // Direct live Shopify product fetch (debug / admin use). Returns the
   // normalized ShopifyProduct[] without running through Jomashop mapping.
+  // Paginates through ALL products by default; pass ?limit=N to cap.
   app.get("/api/shopify/products", async (req, res) => {
-    const limit = Math.min(
-      Math.max(parseInt(String(req.query.limit ?? "25"), 10) || 25, 1),
-      50,
+    const rawLimit = req.query.limit;
+    const maxProducts =
+      rawLimit === undefined || rawLimit === "" || rawLimit === "all"
+        ? undefined
+        : Math.max(parseInt(String(rawLimit), 10) || 0, 1);
+    const pageSize = Math.min(
+      Math.max(parseInt(String(req.query.pageSize ?? "100"), 10) || 100, 1),
+      250,
     );
     const conn = getActiveShopifyConnection();
     if (!conn) {
@@ -511,7 +543,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         error: "No connected Shopify store with an access token. Complete OAuth install first.",
       });
     }
-    const result = await fetchShopifyProducts(limit);
+    const result = await fetchShopifyProducts({ pageSize, maxProducts });
     if (!result.ok) {
       return res.status(502).json({
         ok: false,
@@ -524,6 +556,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       ok: true,
       shopDomain: result.shopDomain,
       count: result.count,
+      pageCount: result.pageCount,
+      hasMore: result.hasMore,
+      partialError: result.partialError ?? null,
       products: result.products,
     });
   });
