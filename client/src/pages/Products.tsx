@@ -60,6 +60,11 @@ type PreviewData = {
   schemas: any;
   usingSamples?: boolean;
   shopifyConnected?: boolean;
+  dataSource?: "live" | "sample";
+  shopDomain?: string | null;
+  fetchedCount?: number;
+  fallbackReason?: string | null;
+  fetchError?: string | null;
   note?: string;
 };
 
@@ -208,22 +213,62 @@ export default function Products() {
         />
       ) : (
         <div className="space-y-4">
-          {(data.usingSamples || !data.shopifyConnected) && (
-            <div
-              data-testid="banner-shopify-not-connected"
-              className="rounded-md border border-amber-500/50 bg-amber-500/10 p-3 text-xs text-amber-600 dark:text-amber-400"
-            >
-              <div className="flex items-center gap-2 font-medium">
+          <div
+            data-testid="banner-data-source"
+            className={`rounded-md border p-3 text-xs ${
+              data.dataSource === "live"
+                ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
+                : "border-amber-500/50 bg-amber-500/10 text-amber-700 dark:text-amber-400"
+            }`}
+          >
+            <div className="flex flex-wrap items-center gap-2 font-medium">
+              {data.dataSource === "live" ? (
+                <CheckCircle2 className="h-3.5 w-3.5" />
+              ) : (
                 <AlertTriangle className="h-3.5 w-3.5" />
-                Connect Shopify / load live products before pushing to Jomashop.
-              </div>
-              <div className="mt-1 text-[11px] text-amber-700/80 dark:text-amber-300/80">
-                {data.usingSamples
-                  ? "The rows below are SAMPLE FIXTURE products built into the app — the push button is disabled for them."
-                  : "No live Shopify products are loaded yet. Push will be disabled until at least one real product is fetched."}
-              </div>
+              )}
+              <span data-testid="text-data-source">
+                Data source:{" "}
+                {data.dataSource === "live"
+                  ? "LIVE SHOPIFY"
+                  : "SAMPLE FALLBACK"}
+              </span>
+              {data.shopDomain && (
+                <span
+                  data-testid="text-shop-domain"
+                  className="font-mono text-[11px] opacity-80"
+                >
+                  · {data.shopDomain}
+                </span>
+              )}
+              {data.dataSource === "live" && typeof data.fetchedCount === "number" && data.fetchedCount > 0 && (
+                <span className="text-[11px] opacity-80">
+                  · {data.fetchedCount} product{data.fetchedCount === 1 ? "" : "s"} fetched
+                </span>
+              )}
+              <span className="ml-auto text-[11px] opacity-70">
+                Shopify {data.shopifyConnected ? "connected" : "not connected"}
+              </span>
             </div>
-          )}
+            {data.fetchError && (
+              <div
+                data-testid="text-fetch-error"
+                className="mt-1 text-[11px] text-red-500"
+              >
+                Fetch error: {data.fetchError}
+              </div>
+            )}
+            {data.fallbackReason && data.dataSource === "sample" && (
+              <div className="mt-1 text-[11px] opacity-80">
+                {data.fallbackReason}
+              </div>
+            )}
+            {data.dataSource === "sample" && (
+              <div className="mt-1 text-[11px] opacity-80">
+                The rows below are SAMPLE FIXTURE products built into the app — the push button is disabled for them.
+              </div>
+            )}
+          </div>
           {data.mapped.map((p, idx) => (
             <Card
               key={`${p.vendor_sku}-${p.source.shopify_product_id}`}
@@ -269,8 +314,24 @@ export default function Products() {
               </CardHeader>
               <CardContent className="grid grid-cols-1 gap-4 p-5 md:grid-cols-3">
                 <div>
-                  <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Brand</div>
-                  <div className="mt-1 text-sm">{p.brand}</div>
+                  <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Brand / Designer</div>
+                  <div className="mt-1 text-sm" data-testid={`text-brand-${p.vendor_sku}`}>
+                    {p.brand || "—"}
+                  </div>
+                  {p.manufacturer_number && (
+                    <div className="mt-1 text-[10px] text-muted-foreground">
+                      Designer Id:{" "}
+                      <code className="font-mono text-[11px]" data-testid={`text-designer-id-${p.vendor_sku}`}>
+                        {p.manufacturer_number}
+                      </code>
+                    </div>
+                  )}
+                  <div className="mt-2 text-[10px] uppercase tracking-wider text-muted-foreground">Category mapping</div>
+                  <div className="mt-1 text-[11px]" data-testid={`text-category-mapping-${p.vendor_sku}`}>
+                    <code className="font-mono">{p.raw_category || "—"}</code>
+                    {" → "}
+                    <code className="font-mono">{p.suggested_category || p.category}</code>
+                  </div>
                   <div className="mt-3 text-[10px] uppercase tracking-wider text-muted-foreground">Shopify price</div>
                   <div className="mt-1 text-sm tabular-nums">
                     {p.price !== null ? `$${p.price.toFixed(2)}` : "—"}

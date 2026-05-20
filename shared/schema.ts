@@ -15,9 +15,12 @@ export const stores = sqliteTable("stores", {
   scopes: text("scopes"),
   // Last installed timestamp (epoch ms)
   installedAt: integer("installed_at"),
-  // Access token storage policy: "env" | "db_encrypted" | "none"
+  // Access token storage policy: "env" | "db_encrypted" | "db_plain" | "none"
   // The scaffold prefers env vars. If user opts in to DB storage we encrypt at rest.
   tokenStorage: text("token_storage").notNull().default("env"),
+  // Encrypted Shopify Admin API access token (AES-256-GCM keyed off SESSION_SECRET).
+  // Empty/null when not yet captured. Required for live product fetch.
+  accessTokenEnc: text("access_token_enc"),
 });
 
 // ---------- Credential status (no raw secrets unless explicitly env-backed) ----------

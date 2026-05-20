@@ -25,6 +25,11 @@ import {
   type PushOverrides,
   type ShopifyProduct,
 } from "./mapping";
+import {
+  encryptToken,
+  fetchShopifyProducts,
+  getActiveShopifyConnection,
+} from "./shopify";
 
 // -------------------- helpers --------------------
 
@@ -253,15 +258,19 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         return res.status(502).send("Shopify token exchange failed.");
       }
       const body = (await tokenRes.json()) as { access_token: string; scope: string };
-      // SECURITY NOTE: the scaffold does not persist the raw access_token by default.
-      // Configure a secret manager or DB encryption before storing.
+      // Persist the access token encrypted at rest (AES-256-GCM keyed off
+      // SESSION_SECRET) so the Products preview can query the Shopify Admin
+      // API on subsequent requests. The plaintext token is never written to
+      // disk and never leaves this process in a response body.
+      const encrypted = encryptToken(body.access_token);
       storage.upsertStore({
         shopDomain: shop,
         displayName: "LuxeSupply",
         oauthStatus: "connected",
         scopes: body.scope,
         installedAt: Date.now(),
-        tokenStorage: "env",
+        tokenStorage: "db_encrypted",
+        accessTokenEnc: encrypted,
       });
       storage.appendLog({
         level: "info",
@@ -392,19 +401,67 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // ---------- Sync previews ----------
   app.post("/api/sync/preview-products", async (req, res) => {
     const supplied = req.body?.products as ShopifyProduct[] | undefined;
-    const usingSamples = !Array.isArray(supplied) || supplied.length === 0;
-    const products = usingSamples ? SAMPLE_SHOPIFY_PRODUCTS : supplied!;
+    const limit = Math.min(
+      Math.max(parseInt(String(req.body?.limit ?? "25"), 10) || 25, 1),
+      50,
+    );
 
-    // Heuristic: a Shopify shop is considered "connected" when at least one
-    // store has an oauth status other than `pending` / `not_connected`.
+    // Resolve the Shopify connection (DB-persisted OAuth token preferred,
+    // env-var fallback for private-app setups). Used both to label the data
+    // source and to drive the live Admin API fetch.
+    const conn = getActiveShopifyConnection();
     const stores = storage.listStores();
-    const shopifyConnected =
-      stores.some(
-        (s) =>
-          s.oauthStatus &&
-          s.oauthStatus !== "pending" &&
-          s.oauthStatus !== "not_connected",
-      );
+    const connectedStore = stores.find(
+      (s) => s.oauthStatus === "connected" && s.accessTokenEnc,
+    );
+    const shopifyConnected = conn !== null || Boolean(connectedStore);
+    const shopDomain = conn?.shopDomain ?? connectedStore?.shopDomain ?? null;
+
+    let products: ShopifyProduct[];
+    let dataSource: "live" | "sample" = "sample";
+    let fallbackReason: string | null = null;
+    let fetchError: string | null = null;
+    let fetchedCount = 0;
+
+    if (Array.isArray(supplied) && supplied.length > 0) {
+      products = supplied;
+      dataSource = "live";
+    } else if (conn) {
+      const result = await fetchShopifyProducts(limit);
+      if (result.ok && result.products.length > 0) {
+        products = result.products;
+        dataSource = "live";
+        fetchedCount = result.count;
+        storage.appendLog({
+          level: "info",
+          message: `Fetched ${result.count} live Shopify products from ${result.shopDomain}`,
+          detailsJson: null,
+          createdAt: Date.now(),
+        });
+      } else if (result.ok) {
+        products = SAMPLE_SHOPIFY_PRODUCTS;
+        dataSource = "sample";
+        fallbackReason =
+          "Shopify Admin API returned 0 products. Make sure the connected store has at least one published product in scope.";
+      } else {
+        products = SAMPLE_SHOPIFY_PRODUCTS;
+        dataSource = "sample";
+        fetchError = result.error;
+        fallbackReason = `Shopify Admin API call failed${result.status ? ` (${result.status})` : ""}: ${result.error}`;
+        storage.appendLog({
+          level: "error",
+          message: "Live Shopify product fetch failed; serving sample fixtures",
+          detailsJson: JSON.stringify({ error: result.error, status: result.status }),
+          createdAt: Date.now(),
+        });
+      }
+    } else {
+      products = SAMPLE_SHOPIFY_PRODUCTS;
+      dataSource = "sample";
+      fallbackReason = shopifyConnected
+        ? "Shopify store is connected but the access token could not be decrypted. Re-run the OAuth install."
+        : "No Shopify store is connected yet. Complete /#/setup → Begin install to load live products.";
+    }
 
     // Pull schemas (live if available) for the three supported categories.
     const schemas: Record<SupportedCategory, any> = { Shoes: null, Handbags: null, Clothing: null };
@@ -422,15 +479,52 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       return mapShopifyToJomashop(p, props);
     });
 
+    const usingSamples = dataSource === "sample";
     res.json({
       schemas,
       mapped,
       count: mapped.length,
       usingSamples,
       shopifyConnected,
+      dataSource,
+      shopDomain,
+      fetchedCount,
+      fallbackReason,
+      fetchError,
       note: usingSamples
         ? "Sample fixtures only — connect Shopify and load live products before pushing to Jomashop."
-        : "Preview only. No data was sent to Jomashop.",
+        : `Live Shopify products from ${shopDomain ?? "connected store"}. No data sent to Jomashop.`,
+    });
+  });
+
+  // Direct live Shopify product fetch (debug / admin use). Returns the
+  // normalized ShopifyProduct[] without running through Jomashop mapping.
+  app.get("/api/shopify/products", async (req, res) => {
+    const limit = Math.min(
+      Math.max(parseInt(String(req.query.limit ?? "25"), 10) || 25, 1),
+      50,
+    );
+    const conn = getActiveShopifyConnection();
+    if (!conn) {
+      return res.status(503).json({
+        ok: false,
+        error: "No connected Shopify store with an access token. Complete OAuth install first.",
+      });
+    }
+    const result = await fetchShopifyProducts(limit);
+    if (!result.ok) {
+      return res.status(502).json({
+        ok: false,
+        shopDomain: conn.shopDomain,
+        status: result.status,
+        error: result.error,
+      });
+    }
+    res.json({
+      ok: true,
+      shopDomain: result.shopDomain,
+      count: result.count,
+      products: result.products,
     });
   });
 

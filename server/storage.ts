@@ -41,7 +41,8 @@ sqlite.exec(`
     oauth_status TEXT NOT NULL DEFAULT 'pending',
     scopes TEXT,
     installed_at INTEGER,
-    token_storage TEXT NOT NULL DEFAULT 'env'
+    token_storage TEXT NOT NULL DEFAULT 'env',
+    access_token_enc TEXT
   );
   CREATE TABLE IF NOT EXISTS credential_status (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -99,6 +100,17 @@ sqlite.exec(`
   );
 `);
 
+// Lightweight migration: add access_token_enc to stores if it's missing
+// (table may exist from a pre-token-storage build).
+try {
+  const cols = sqlite.prepare("PRAGMA table_info(stores)").all() as Array<{ name: string }>;
+  if (!cols.some((c) => c.name === "access_token_enc")) {
+    sqlite.exec("ALTER TABLE stores ADD COLUMN access_token_enc TEXT");
+  }
+} catch {
+  // ignore — fresh installs already have the column via CREATE TABLE above
+}
+
 export interface IStorage {
   // Stores
   getStore(shopDomain: string): Store | undefined;
@@ -136,9 +148,15 @@ export class DatabaseStorage implements IStorage {
   upsertStore(input: InsertStore): Store {
     const existing = this.getStore(input.shopDomain);
     if (existing) {
+      // Preserve any persisted column (notably accessTokenEnc) when the
+      // caller did not supply a new value. Treat undefined as "leave alone".
+      const patch: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(input)) {
+        if (v !== undefined) patch[k] = v;
+      }
       return db
         .update(stores)
-        .set({ ...input })
+        .set(patch)
         .where(eq(stores.id, existing.id))
         .returning()
         .get();
