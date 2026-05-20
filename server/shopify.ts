@@ -122,10 +122,13 @@ export function getActiveShopifyConnection(): ShopifyConnection | null {
 
 // ---------- GraphQL fetch ----------
 
+// Cap on metafields pulled per product. We fetch the full set and then filter
+// to METAFIELD_IDENTIFIERS client-side because the `metafields(identifiers:)`
+// argument is not available on Product in all Shopify Admin API schemas and
+// fails GraphQL validation when it isn't.
+const METAFIELDS_PER_PRODUCT = 100;
+
 function buildProductsQuery(first: number, after: string | null): { query: string; variables: Record<string, unknown> } {
-  const identifierLiteral = METAFIELD_IDENTIFIERS.map(
-    (m) => `{namespace: "${m.namespace}", key: "${m.key}"}`,
-  ).join(", ");
   const query = `
     query Products($first: Int!, $after: String) {
       products(first: $first, after: $after) {
@@ -142,11 +145,15 @@ function buildProductsQuery(first: number, after: string | null): { query: strin
             tags
             options { id name values }
             images(first: 10) { edges { node { url altText } } }
-            metafields(identifiers: [${identifierLiteral}]) {
-              namespace
-              key
-              value
-              type
+            metafields(first: ${METAFIELDS_PER_PRODUCT}) {
+              edges {
+                node {
+                  namespace
+                  key
+                  value
+                  type
+                }
+              }
             }
             variants(first: 100) {
               edges {
@@ -191,7 +198,11 @@ type ShopifyGraphProduct = {
   tags: string[];
   options: Array<{ id: string; name: string; values: string[] }>;
   images: { edges: Array<{ node: { url: string; altText: string | null } }> };
-  metafields: Array<{ namespace: string; key: string; value: string; type: string } | null>;
+  metafields: {
+    edges: Array<{
+      node: { namespace: string; key: string; value: string; type: string } | null;
+    }>;
+  };
   variants: {
     edges: Array<{
       node: {
@@ -234,8 +245,18 @@ function normalizeProduct(p: ShopifyGraphProduct): ShopifyProduct {
     };
   });
 
-  const metafields = (p.metafields || [])
+  const wantedNamespaceKey = new Set(
+    METAFIELD_IDENTIFIERS.map((m) => `${m.namespace}.${m.key}`.toLowerCase()),
+  );
+  const wantedKey = new Set(METAFIELD_IDENTIFIERS.map((m) => m.key.toLowerCase()));
+  const metafields = (p.metafields?.edges ?? [])
+    .map((e) => e.node)
     .filter((m): m is { namespace: string; key: string; value: string; type: string } => m !== null)
+    .filter((m) => {
+      const ns = (m.namespace ?? "").toLowerCase();
+      const key = (m.key ?? "").toLowerCase();
+      return wantedNamespaceKey.has(`${ns}.${key}`) || wantedKey.has(key);
+    })
     .map((m) => ({
       namespace: m.namespace,
       key: m.key,
