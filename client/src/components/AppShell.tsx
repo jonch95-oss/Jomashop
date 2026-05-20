@@ -11,6 +11,7 @@ import {
   ShieldAlert,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { AdminTokenGate } from "./AdminTokenGate";
 
 const NAV: Array<{ href: string; label: string; icon: React.ComponentType<{ className?: string }>; group?: string }> = [
   { href: "/", label: "Overview", icon: LayoutDashboard, group: "Operate" },
@@ -115,9 +116,14 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         style={{ overscrollBehavior: "contain" }}
       >
         {/* Mobile header (compact) */}
-        <header className="sticky top-0 z-10 flex h-12 items-center border-b border-border bg-background/95 px-4 backdrop-blur md:hidden">
+        <header className="sticky top-0 z-10 flex h-12 items-center justify-between border-b border-border bg-background/95 px-4 backdrop-blur md:hidden">
           <Logo />
+          <AdminTokenGate />
         </header>
+        {/* Desktop top bar */}
+        <div className="sticky top-0 z-10 hidden h-12 items-center justify-end border-b border-border bg-background/95 px-8 backdrop-blur md:flex">
+          <AdminTokenGate />
+        </div>
         <div className="mx-auto w-full max-w-[1400px] px-5 py-6 md:px-8 md:py-8">
           {children}
         </div>
