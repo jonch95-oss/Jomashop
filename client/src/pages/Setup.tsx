@@ -1,7 +1,8 @@
-import { useState } from "react";
+import { useState, useMemo } from "react";
+import { useSearch } from "wouter";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { useToast } from "@/hooks/use-toast";
-import { Copy, ExternalLink, Loader2, Check, X, Info, ShieldAlert } from "lucide-react";
+import { Copy, ExternalLink, Loader2, Check, X, Info, ShieldAlert, CheckCircle2 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -10,7 +11,7 @@ import { Label } from "@/components/ui/label";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { PageHeader, LoadingRows, ErrorBlock } from "@/components/AppShell";
 import { apiRequest, queryClient } from "@/lib/queryClient";
-import type { ConfigStatus, SessionTestResult } from "@/lib/types";
+import type { ConfigStatus, SessionTestResult, Store } from "@/lib/types";
 
 function CopyableUrl({ value, label }: { value: string; label: string }) {
   const { toast } = useToast();
@@ -54,8 +55,22 @@ function StatusPill({ ok }: { ok: boolean }) {
 
 export default function Setup() {
   const cfg = useQuery<ConfigStatus>({ queryKey: ["/api/config/status"] });
+  const stores = useQuery<Store[]>({ queryKey: ["/api/stores"] });
   const { toast } = useToast();
-  const [shop, setShop] = useState("luxesupply.myshopify.com");
+  const search = useSearch();
+  const installedShop = useMemo(() => {
+    const v = new URLSearchParams(search).get("installed");
+    return v ? v.trim() : "";
+  }, [search]);
+  const connectedStore = useMemo(() => {
+    const list = stores.data || [];
+    if (installedShop) {
+      const match = list.find((s) => s.shopDomain === installedShop);
+      if (match) return match;
+    }
+    return list.find((s) => s.oauthStatus === "connected") || null;
+  }, [stores.data, installedShop]);
+  const [shop, setShop] = useState(installedShop || "luxesupply.myshopify.com");
 
   const test = useMutation<SessionTestResult>({
     mutationFn: async () => {
@@ -86,6 +101,25 @@ export default function Setup() {
         title="Setup"
         description="Connect Shopify and Jomashop credentials, then verify the integration is live."
       />
+
+      {installedShop && (
+        <Alert
+          variant="default"
+          className="mb-4 border-emerald-500/40 bg-emerald-500/5"
+          data-testid="alert-installed"
+        >
+          <CheckCircle2 className="h-4 w-4 text-emerald-500" />
+          <AlertTitle className="text-sm">Shopify install complete</AlertTitle>
+          <AlertDescription className="text-xs">
+            Connected to <code className="font-mono">{installedShop}</code>
+            {connectedStore?.scopes ? (
+              <> with scopes <code className="font-mono">{connectedStore.scopes}</code>.</>
+            ) : (
+              <>.</>
+            )}
+          </AlertDescription>
+        </Alert>
+      )}
 
       <Alert variant="default" className="mb-6 border-amber-500/40 bg-amber-500/5">
         <ShieldAlert className="h-4 w-4 text-amber-500" />
