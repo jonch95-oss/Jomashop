@@ -16,6 +16,7 @@ import {
 } from "@/components/ui/dialog";
 import { PageHeader, EmptyState, LoadingRows } from "@/components/AppShell";
 import { apiRequest } from "@/lib/queryClient";
+import { BulkRepairCard } from "@/components/BulkRepair";
 import type { MappedProduct } from "@/lib/types";
 
 type OverrideFields = {
@@ -311,6 +312,8 @@ export default function Products() {
               </div>
             )}
           </div>
+
+          <BulkRepairCard onAfterApply={() => preview.mutate()} />
 
           <div
             data-testid="product-filter-controls"

@@ -29,6 +29,7 @@ import {
   fetchShopifyProducts,
   getActiveShopifyConnection,
 } from "./shopify";
+import { registerBulkRepairRoutes } from "./bulk_repair";
 
 // -------------------- helpers --------------------
 
@@ -843,6 +844,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       warnings: mapped.warnings,
     });
   });
+
+  // ---------- Bulk repair workflow (XLSX export/import/apply/push) ----------
+  registerBulkRepairRoutes(app);
 
   // ---------- DB-backed read endpoints used by the UI ----------
   app.get("/api/sku-mappings", (_req, res) => res.json(storage.listSkuMappings()));
