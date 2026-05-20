@@ -109,7 +109,7 @@ export type JomashopRequestOptions = {
 
 export async function jomashopRequest<T = unknown>(
   opts: JomashopRequestOptions,
-): Promise<{ ok: boolean; status: number; data?: T; error?: string }> {
+): Promise<{ ok: boolean; status: number; data?: T; error?: string; errorData?: unknown }> {
   const cfg = getJomashopConfig();
   if (!cfg) {
     return { ok: false, status: 0, error: "Jomashop credentials not configured" };
@@ -165,6 +165,7 @@ export async function jomashopRequest<T = unknown>(
       ok: false,
       status: res.status,
       error: typeof data === "object" ? JSON.stringify(data) : String(data || res.statusText),
+      errorData: data,
     };
   }
   return { ok: true, status: res.status, data: data as T };

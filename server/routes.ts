@@ -19,7 +19,9 @@ import {
 import {
   mapShopifyToJomashop,
   buildJomashopProductPayload,
+  suggestJomashopCategory,
   SAMPLE_SHOPIFY_PRODUCTS,
+  type PushOverrides,
   type ShopifyProduct,
 } from "./mapping";
 
@@ -490,6 +492,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       confirm?: boolean;
       pushInventory?: boolean;
       forcedCategory?: SupportedCategory;
+      overrides?: PushOverrides;
     };
 
     if (!body.confirm) {
@@ -522,9 +525,11 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }));
 
     const mapped = mapShopifyToJomashop(body.product, props, body.forcedCategory);
-    const { payload, variant, missingRequired } = buildJomashopProductPayload(
+    const overrides: PushOverrides = body.overrides || {};
+    const { payload, variant, missingRequired, missingTopLevel } = buildJomashopProductPayload(
       mapped,
       body.variantSku,
+      overrides,
     );
 
     const startedAt = Date.now();
@@ -539,24 +544,25 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       summary: `Push ${mapped.vendor_sku} (${mapped.category})`,
     });
 
-    if (missingRequired.length > 0) {
+    if (missingRequired.length > 0 || missingTopLevel.length > 0) {
       storage.updateSyncJob(job.id, {
         status: "failed",
         finishedAt: Date.now(),
         errorItems: 1,
-        summary: `Validation failed: ${missingRequired.length} required field(s) missing`,
+        summary: `Validation failed: ${missingRequired.length + missingTopLevel.length} field(s) missing`,
       });
       storage.appendLog({
         jobId: job.id,
         level: "error",
-        message: `Push aborted before API call: missing required fields for ${mapped.vendor_sku}`,
-        detailsJson: JSON.stringify({ missingRequired, schemaSource: source }),
+        message: `Push aborted before API call: missing fields for ${payload.sku ?? mapped.vendor_sku}`,
+        detailsJson: JSON.stringify({ missingRequired, missingTopLevel, schemaSource: source }),
         createdAt: Date.now(),
       });
       return res.status(422).json({
         ok: false,
-        error: "Required category fields are missing. Fix the mapping and retry.",
+        error: "Required fields are missing. Fix the mapping or supply overrides and retry.",
         missingRequired,
+        missingTopLevel,
         warnings: mapped.warnings,
         payloadPreview: payload,
         mapped,
@@ -579,6 +585,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     });
 
     if (!productResp.ok) {
+      const errBody = productResp.errorData as
+        | { error?: string; errors?: string[]; invalid_params?: string[] }
+        | undefined;
       storage.updateSyncJob(job.id, {
         status: "failed",
         finishedAt: Date.now(),
@@ -589,14 +598,17 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         jobId: job.id,
         level: "error",
         message: `Jomashop product push failed (${productResp.status})`,
-        detailsJson: JSON.stringify({ error: productResp.error, payload }),
+        detailsJson: JSON.stringify({ error: productResp.error, errorData: errBody, payload }),
         createdAt: Date.now(),
       });
       return res.status(502).json({
         ok: false,
         stage: "product_post",
-        error: productResp.error,
+        error: errBody?.error || productResp.error,
+        errors: errBody?.errors,
+        invalidParams: errBody?.invalid_params,
         status: productResp.status,
+        payloadSent: payload,
         payloadPreview: payload,
         mapped,
         schemaSource: source,

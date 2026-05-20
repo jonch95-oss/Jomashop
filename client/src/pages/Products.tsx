@@ -1,9 +1,11 @@
-import { useMutation } from "@tanstack/react-query";
-import { useState, useEffect } from "react";
+import { useMutation, useQuery } from "@tanstack/react-query";
+import { useState, useEffect, useMemo } from "react";
 import { AlertTriangle, RefreshCcw, Loader2, Send, CheckCircle2, XCircle } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import {
   Dialog,
   DialogContent,
@@ -15,6 +17,15 @@ import {
 import { PageHeader, EmptyState, LoadingRows } from "@/components/AppShell";
 import { apiRequest } from "@/lib/queryClient";
 import type { MappedProduct } from "@/lib/types";
+
+type OverrideFields = {
+  category: string;
+  brand: string;
+  sku: string;
+  manufacturer_number: string;
+};
+
+const TOP_LEVEL_FIELDS = ["category", "brand", "sku", "manufacturer_number"] as const;
 
 // The shape of the body POSTed to /api/jomashop/push-product. We use the
 // SAMPLE_SHOPIFY_PRODUCTS payload (echoed back through /api/sync/preview-products)
@@ -30,10 +41,14 @@ type PushResult = {
   jobId?: number;
   schemaSource?: "live" | "fallback";
   payloadPreview?: Record<string, unknown>;
+  payloadSent?: Record<string, unknown>;
   product?: { status: number; data: unknown };
   inventory?: { status: number; ok: boolean; data?: unknown; error?: string } | null;
   warnings?: string[];
   missingRequired?: string[];
+  missingTopLevel?: string[];
+  errors?: string[];
+  invalidParams?: string[];
   error?: string;
   status?: number;
   stage?: string;
@@ -43,6 +58,37 @@ export default function Products() {
   const [data, setData] = useState<{ mapped: MappedProduct[]; count: number; schemas: any } | null>(null);
   const [pushTarget, setPushTarget] = useState<PushTarget | null>(null);
   const [pushResult, setPushResult] = useState<PushResult | null>(null);
+  const [overrides, setOverrides] = useState<OverrideFields>({
+    category: "",
+    brand: "",
+    sku: "",
+    manufacturer_number: "",
+  });
+
+  // Live Jomashop categories — used to populate a datalist for the category
+  // override so the operator can pick a name Jomashop actually accepts
+  // instead of shipping a raw Shopify code.
+  const categoriesQ = useQuery<{
+    source: "live" | "fallback";
+    categories?: Array<{ name: string }>;
+    data?: unknown;
+  }>({
+    queryKey: ["/api/jomashop/categories"],
+  });
+
+  const categoryOptions = useMemo<string[]>(() => {
+    const raw = categoriesQ.data;
+    if (!raw) return ["Shoes", "Handbags", "Clothing"];
+    const liveList =
+      (Array.isArray((raw as any).data) ? (raw as any).data : null) ||
+      (Array.isArray((raw as any).data?.categories) ? (raw as any).data.categories : null) ||
+      raw.categories ||
+      [];
+    const names = (liveList as Array<{ name?: string } | string>)
+      .map((c) => (typeof c === "string" ? c : c?.name))
+      .filter((s): s is string => Boolean(s));
+    return names.length > 0 ? names : ["Shoes", "Handbags", "Clothing"];
+  }, [categoriesQ.data]);
 
   const preview = useMutation({
     mutationFn: async () => {
@@ -54,17 +100,17 @@ export default function Products() {
 
   const push = useMutation({
     mutationFn: async (target: PushTarget): Promise<PushResult> => {
-      // Reconstruct a minimal ShopifyProduct body for the backend by sending
-      // the index — the backend re-runs the full mapping using its sample
-      // catalog. For real Shopify products this object would come from the
-      // raw fetch. For now the preview endpoint is sample-driven so we send
-      // the mapped result back; the backend uses the embedded source product_id
-      // to re-locate it in SAMPLE_SHOPIFY_PRODUCTS.
+      const trimmedOverrides = Object.fromEntries(
+        TOP_LEVEL_FIELDS.map((k) => [k, overrides[k].trim()]).filter(
+          ([, v]) => v !== "",
+        ),
+      );
       const res = await apiRequest("POST", "/api/jomashop/push-product", {
         confirm: true,
         variantSku: target.variantSku,
         pushInventory: true,
         product: shopifyProductFromMapped(target.mapped),
+        overrides: trimmedOverrides,
       });
       return res.json();
     },
@@ -93,13 +139,24 @@ export default function Products() {
   function openPushModal(productIndex: number, mapped: MappedProduct, variantSku?: string) {
     setPushResult(null);
     setPushTarget({ productIndex, variantSku, mapped });
+    setOverrides({
+      category: mapped.suggested_category || mapped.category || "",
+      brand: mapped.brand || "",
+      sku: variantSku || mapped.sku || mapped.vendor_sku || "",
+      manufacturer_number:
+        mapped.manufacturer_number || variantSku || mapped.sku || mapped.vendor_sku || "",
+    });
   }
 
   function closePushModal() {
     setPushTarget(null);
     setPushResult(null);
+    setOverrides({ category: "", brand: "", sku: "", manufacturer_number: "" });
     push.reset();
   }
+
+  const overrideBlanks = TOP_LEVEL_FIELDS.filter((k) => overrides[k].trim() === "");
+  const canConfirm = pushTarget !== null && overrideBlanks.length === 0 && !push.isPending;
 
   return (
     <>
@@ -295,7 +352,10 @@ export default function Products() {
                 </div>
                 <div className="font-medium">{pushTarget.mapped.name}</div>
                 <div className="mt-1 text-muted-foreground">
-                  {pushTarget.mapped.category} • SKU {pushTarget.variantSku || pushTarget.mapped.vendor_sku}
+                  Shopify product_type:{" "}
+                  <code className="rounded bg-muted px-1 font-mono">
+                    {pushTarget.mapped.raw_category || "—"}
+                  </code>
                 </div>
                 <div className="mt-2 grid grid-cols-2 gap-2">
                   <div>
@@ -318,6 +378,107 @@ export default function Products() {
                   </div>
                 </div>
               </div>
+
+              <div className="rounded border border-border bg-card/40 p-3">
+                <div className="mb-2 text-[10px] uppercase tracking-wider text-muted-foreground">
+                  Required Jomashop fields (editable)
+                </div>
+                <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
+                  <div>
+                    <Label htmlFor="ovr-category" className="text-[10px] uppercase">
+                      Category
+                    </Label>
+                    <Input
+                      id="ovr-category"
+                      list="jomashop-categories"
+                      data-testid="input-override-category"
+                      value={overrides.category}
+                      onChange={(e) =>
+                        setOverrides((o) => ({ ...o, category: e.target.value }))
+                      }
+                      placeholder="e.g. Sneakers"
+                      className="h-8 font-mono text-xs"
+                    />
+                    <datalist id="jomashop-categories">
+                      {categoryOptions.map((c) => (
+                        <option key={c} value={c} />
+                      ))}
+                    </datalist>
+                  </div>
+                  <div>
+                    <Label htmlFor="ovr-brand" className="text-[10px] uppercase">
+                      Brand
+                    </Label>
+                    <Input
+                      id="ovr-brand"
+                      data-testid="input-override-brand"
+                      value={overrides.brand}
+                      onChange={(e) =>
+                        setOverrides((o) => ({ ...o, brand: e.target.value }))
+                      }
+                      placeholder="e.g. Off-White"
+                      className="h-8 font-mono text-xs"
+                    />
+                  </div>
+                  <div>
+                    <Label htmlFor="ovr-sku" className="text-[10px] uppercase">
+                      SKU
+                    </Label>
+                    <Input
+                      id="ovr-sku"
+                      data-testid="input-override-sku"
+                      value={overrides.sku}
+                      onChange={(e) => setOverrides((o) => ({ ...o, sku: e.target.value }))}
+                      placeholder="Shopify variant SKU"
+                      className="h-8 font-mono text-xs"
+                    />
+                  </div>
+                  <div>
+                    <Label htmlFor="ovr-mfg" className="text-[10px] uppercase">
+                      Manufacturer Number
+                    </Label>
+                    <Input
+                      id="ovr-mfg"
+                      data-testid="input-override-mfg"
+                      value={overrides.manufacturer_number}
+                      onChange={(e) =>
+                        setOverrides((o) => ({ ...o, manufacturer_number: e.target.value }))
+                      }
+                      placeholder="ff_designer_id"
+                      className="h-8 font-mono text-xs"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div className="rounded border border-border bg-card/40 p-3">
+                <div className="mb-2 text-[10px] uppercase tracking-wider text-muted-foreground">
+                  Pre-flight checklist
+                </div>
+                <ul className="space-y-1">
+                  {TOP_LEVEL_FIELDS.map((k) => {
+                    const ok = overrides[k].trim() !== "";
+                    return (
+                      <li
+                        key={k}
+                        className={`flex items-center gap-2 ${ok ? "text-emerald-500" : "text-red-500"}`}
+                        data-testid={`checklist-${k}`}
+                      >
+                        {ok ? (
+                          <CheckCircle2 className="h-3.5 w-3.5" />
+                        ) : (
+                          <XCircle className="h-3.5 w-3.5" />
+                        )}
+                        <span className="font-mono">{k}</span>
+                        <span className="ml-auto truncate text-muted-foreground">
+                          {ok ? overrides[k] : "blank — will be rejected"}
+                        </span>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </div>
+
               {pushTarget.mapped.warnings.length > 0 && (
                 <div className="rounded border border-amber-500/40 bg-amber-500/5 p-2 text-amber-500">
                   <div className="font-medium">Mapping warnings:</div>
@@ -362,6 +523,49 @@ export default function Products() {
                 </div>
               )}
 
+              {pushResult.missingTopLevel && pushResult.missingTopLevel.length > 0 && (
+                <div className="rounded border border-red-500/40 bg-red-500/5 p-2 text-red-500">
+                  <div className="font-medium">Missing top-level fields:</div>
+                  <ul className="ml-4 list-disc">
+                    {pushResult.missingTopLevel.map((m, i) => (
+                      <li key={i} className="font-mono">{m}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {(pushResult.errors && pushResult.errors.length > 0) ||
+              (pushResult.invalidParams && pushResult.invalidParams.length > 0) ? (
+                <div className="rounded border border-red-500/40 bg-red-500/5 p-2 text-red-500">
+                  <div className="font-medium">Jomashop validation errors:</div>
+                  {pushResult.errors && (
+                    <ul className="ml-4 list-disc">
+                      {pushResult.errors.map((m, i) => (
+                        <li key={`e-${i}`}>{m}</li>
+                      ))}
+                    </ul>
+                  )}
+                  {pushResult.invalidParams && pushResult.invalidParams.length > 0 && (
+                    <div className="mt-1 text-[10px] uppercase tracking-wider">
+                      invalid_params:{" "}
+                      <span className="font-mono">{pushResult.invalidParams.join(", ")}</span>
+                    </div>
+                  )}
+                </div>
+              ) : null}
+
+              {pushResult.payloadSent && (
+                <details className="rounded border border-border bg-card/40 p-2" open>
+                  <summary className="cursor-pointer font-medium">Exact payload sent</summary>
+                  <pre
+                    className="mt-2 max-h-48 overflow-auto rounded bg-background p-2 font-mono text-[10px]"
+                    data-testid="text-payload-sent"
+                  >
+                    {JSON.stringify(pushResult.payloadSent, null, 2)}
+                  </pre>
+                </details>
+              )}
+
               {pushResult.product && (
                 <details className="rounded border border-border bg-card/40 p-2">
                   <summary className="cursor-pointer font-medium">
@@ -402,7 +606,7 @@ export default function Products() {
             {!pushResult && pushTarget && (
               <Button
                 onClick={() => push.mutate(pushTarget)}
-                disabled={push.isPending}
+                disabled={!canConfirm}
                 data-testid="button-confirm-push"
               >
                 {push.isPending ? (

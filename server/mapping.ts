@@ -41,7 +41,20 @@ export type ShopifyProduct = {
 
 export type MappedProduct = {
   category: SupportedCategory;
+  /** Free-form category label resolved from Shopify (raw vendor type/tag/metafield).
+   *  Distinct from `category`, which is one of the SUPPORTED_CATEGORIES enum
+   *  values. Surfaced so the UI can show what Shopify provided before the user
+   *  picks a Jomashop category name. */
+  raw_category: string | null;
+  /** Heuristic mapping from raw_category → plausible Jomashop category name
+   *  (e.g. "SNEK" → "Sneakers"). The UI uses this as the prefilled value of
+   *  the category override field. */
+  suggested_category: string;
   vendor_sku: string;
+  /** SKU used for the product/variant on Jomashop side. Currently equals
+   *  vendor_sku, but kept separate so the UI can override it independently. */
+  sku: string;
+  manufacturer_number: string | null;
   name: string;
   description: string;
   brand: string;
@@ -61,6 +74,13 @@ export type MappedProduct = {
   }>;
   warnings: string[];
   source: { shopify_product_id?: string | number; shopify_variant_ids: Array<string | number> };
+};
+
+export type PushOverrides = {
+  category?: string;
+  brand?: string;
+  sku?: string;
+  manufacturer_number?: string;
 };
 
 /** Infer the Jomashop category for a Shopify product. */
@@ -100,12 +120,39 @@ function resolveOption(p: ShopifyProduct, names: string[]): "option1" | "option2
   return null;
 }
 
+/**
+ * Normalize a metafield identifier into a single comparable token so that
+ * "ff_designer_id", "Designer Id", "designer-id", and "ff.designer_id" all
+ * collapse to the same string. Used by readMetafieldAny to look up Shopify
+ * metafields by any of the common shapes the admin UI exposes.
+ */
+function normKey(s: string | undefined | null): string {
+  if (!s) return "";
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
 function readMetafield(p: ShopifyProduct, key: string): string | undefined {
-  const mf = (p.metafields || []).find(
-    (m) => m.key === key || `${m.namespace ?? ""}.${m.key ?? ""}` === key,
-  );
+  const target = normKey(key);
+  const mf = (p.metafields || []).find((m) => {
+    if (!m) return false;
+    if (normKey(m.key) === target) return true;
+    if (normKey(`${m.namespace ?? ""}.${m.key ?? ""}`) === target) return true;
+    if (normKey(m.name) === target) return true;
+    if (normKey(m.label) === target) return true;
+    return false;
+  });
   if (mf?.value === undefined || mf?.value === null) return undefined;
-  return String(mf.value);
+  const v = String(mf.value).trim();
+  return v === "" ? undefined : v;
+}
+
+/** First non-empty metafield value across the given candidate keys/labels. */
+function readMetafieldAny(p: ShopifyProduct, keys: string[]): string | undefined {
+  for (const k of keys) {
+    const v = readMetafield(p, k);
+    if (v !== undefined && v !== "") return v;
+  }
+  return undefined;
 }
 
 const DISCOUNT_KEY_CANDIDATES = [
@@ -192,9 +239,31 @@ export function mapShopifyToJomashop(
   const colorOpt = resolveOption(product, ["color", "colour"]);
 
   const firstVariant = product.variants?.[0];
+  // SKU precedence: variant.sku → product/variant metafield ff_sku →
+  // generic sku/vendor_sku/manufacturer-style metafields → LX-<id> fallback.
   const vendorSku =
-    firstVariant?.sku ||
+    (firstVariant?.sku && firstVariant.sku.trim()) ||
+    readMetafieldAny(product, [
+      "ff_sku",
+      "luxe.ff_sku",
+      "custom.ff_sku",
+      "sku",
+      "vendor_sku",
+      "manufacturer_number",
+    ]) ||
     (product.id ? `LX-${product.id}` : `LX-${Date.now()}`);
+
+  // manufacturer_number precedence: ff_designer_id (Shopify metafield used
+  // for designer/style numbers) → manufacturer_number → designer_id → SKU.
+  const manufacturerNumber =
+    readMetafieldAny(product, [
+      "ff_designer_id",
+      "luxe.ff_designer_id",
+      "custom.ff_designer_id",
+      "manufacturer_number",
+      "designer_id",
+      "Designer Id",
+    ]) || vendorSku;
 
   // Build a properties object using the category schema. For each schema
   // property we look first at metafields (namespaced), then at common Shopify
@@ -207,7 +276,17 @@ export function mapShopifyToJomashop(
       // Common mappings
       switch (prop.field) {
         case "brand":
-          value = product.vendor || readMetafield(product, "brand");
+          // Prefer designer-style metafields ("Designer Id", "designer_id")
+          // over Shopify vendor — the vendor field is often a generic code
+          // (e.g. "SNEK") that Jomashop will not recognize.
+          value =
+            readMetafieldAny(product, [
+              "Designer Id",
+              "designer_id",
+              "ff_designer",
+              "brand",
+            ]) ||
+            product.vendor;
           break;
         case "model":
           value = product.title;
@@ -294,12 +373,23 @@ export function mapShopifyToJomashop(
 
   const shopifyPrice = parsePrice(firstVariant?.price);
 
+  const rawCategory =
+    readMetafieldAny(product, ["category", "Category", "ff_category"]) ||
+    product.product_type ||
+    null;
+
+  const brand = (properties.brand as string | null) || product.vendor || "";
+
   return {
     category,
+    raw_category: rawCategory,
+    suggested_category: suggestJomashopCategory(rawCategory, category),
     vendor_sku: vendorSku,
+    sku: vendorSku,
+    manufacturer_number: manufacturerNumber,
     name: product.title || "Untitled product",
     description: (product.body_html || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim(),
-    brand: (properties.brand as string | null) || product.vendor || "Unknown",
+    brand,
     price: shopifyPrice,
     msrp: parsePrice(firstVariant?.compare_at_price),
     commercial_discount: commercialDiscount,
@@ -330,10 +420,12 @@ export function mapShopifyToJomashop(
 export function buildJomashopProductPayload(
   mapped: MappedProduct,
   variantSku?: string,
+  overrides: PushOverrides = {},
 ): {
   payload: Record<string, unknown>;
   variant: MappedProduct["variants"][number] | null;
   missingRequired: string[];
+  missingTopLevel: string[];
 } {
   const variant =
     (variantSku && mapped.variants.find((v) => v.vendor_sku === variantSku)) ||
@@ -344,7 +436,6 @@ export function buildJomashopProductPayload(
   for (const [k, v] of Object.entries(mapped.properties)) {
     if (v !== null && v !== undefined && v !== "") properties[k] = v;
   }
-  // If variant has size/color, surface them in properties (override product-level)
   if (variant) {
     for (const [k, v] of Object.entries(variant.options)) {
       const key = k.toLowerCase();
@@ -357,12 +448,31 @@ export function buildJomashopProductPayload(
   const price = variant?.jomashop_price ?? mapped.jomashop_price;
   const msrp = mapped.msrp ?? null;
 
+  const sku =
+    (overrides.sku && overrides.sku.trim()) ||
+    variant?.vendor_sku ||
+    mapped.sku ||
+    mapped.vendor_sku;
+
+  const manufacturerNumber =
+    (overrides.manufacturer_number && overrides.manufacturer_number.trim()) ||
+    mapped.manufacturer_number ||
+    sku;
+
+  const category =
+    (overrides.category && overrides.category.trim()) || mapped.category;
+
+  const brand =
+    (overrides.brand && overrides.brand.trim()) || mapped.brand;
+
   const payload: Record<string, unknown> = {
-    category: mapped.category,
-    vendor_sku: variant?.vendor_sku || mapped.vendor_sku,
+    category,
+    sku,
+    vendor_sku: sku,
+    manufacturer_number: manufacturerNumber,
     name: mapped.name,
     description: mapped.description,
-    brand: mapped.brand,
+    brand,
     price,
     msrp,
     images: mapped.images,
@@ -371,7 +481,64 @@ export function buildJomashopProductPayload(
   };
 
   const missingRequired = mapped.warnings.filter((w) => /Missing required/.test(w));
-  return { payload, variant, missingRequired };
+  const missingTopLevel: string[] = [];
+  for (const k of ["category", "brand", "sku", "manufacturer_number"] as const) {
+    const v = payload[k];
+    if (v === null || v === undefined || String(v).trim() === "") missingTopLevel.push(k);
+  }
+  return { payload, variant, missingRequired, missingTopLevel };
+}
+
+/**
+ * Heuristic Shopify-category-code → Jomashop category-name layer. Most
+ * Shopify product types are short codes (SNEK, HBAG, CLTH) or the noun
+ * itself ("Sneakers"). This maps the common shoe/handbag/clothing codes to
+ * plausible Jomashop category names so the push payload doesn't ship the
+ * raw vendor code. The UI still lets the operator override before push.
+ */
+const CATEGORY_CODE_MAP: Record<string, string> = {
+  snek: "Sneakers",
+  sneakers: "Sneakers",
+  sneaker: "Sneakers",
+  shoes: "Shoes",
+  shoe: "Shoes",
+  boot: "Boots",
+  boots: "Boots",
+  loafer: "Loafers",
+  loafers: "Loafers",
+  heel: "Heels",
+  heels: "Heels",
+  sandal: "Sandals",
+  sandals: "Sandals",
+  hbag: "Handbags",
+  handbag: "Handbags",
+  handbags: "Handbags",
+  bag: "Handbags",
+  tote: "Handbags",
+  clutch: "Handbags",
+  crossbody: "Handbags",
+  clth: "Clothing",
+  clothing: "Clothing",
+  apparel: "Clothing",
+  shirt: "Clothing",
+  pant: "Clothing",
+  pants: "Clothing",
+  jacket: "Clothing",
+  coat: "Clothing",
+  dress: "Clothing",
+};
+
+export function suggestJomashopCategory(
+  rawCategory: string | null | undefined,
+  fallback: SupportedCategory,
+): string {
+  if (!rawCategory) return fallback;
+  const norm = rawCategory.toLowerCase().trim();
+  if (CATEGORY_CODE_MAP[norm]) return CATEGORY_CODE_MAP[norm];
+  for (const [code, name] of Object.entries(CATEGORY_CODE_MAP)) {
+    if (norm.includes(code)) return name;
+  }
+  return fallback;
 }
 
 /** Sample fixtures used by /api/sync/preview-products when no real Shopify products are available. */
