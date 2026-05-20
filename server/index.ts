@@ -14,8 +14,12 @@ declare module "http" {
   }
 }
 
+// Capture the raw request body for HMAC verification (Shopify webhooks) and
+// for any other route that needs to inspect bytes the JSON parser already
+// consumed.
 app.use(
   express.json({
+    limit: "5mb",
     verify: (req, _res, buf) => {
       req.rawBody = buf;
     },

@@ -77,6 +77,18 @@ export type MappedProduct = {
   }>;
   warnings: string[];
   source: { shopify_product_id?: string | number; shopify_variant_ids: Array<string | number> };
+  /** Server-side push state for this Shopify variant SKU. "not_pushed" when
+   *  the SKU has never been sent to Jomashop. "pushed" after a successful
+   *  POST /v1/products. "rejected" when the last push returned a validation
+   *  error like "Brand must exist". "failed" for non-validation errors. */
+  push_state?: "not_pushed" | "pushed" | "rejected" | "failed";
+  jomashop_sku?: string | null;
+  last_push_error?: string | null;
+  last_pushed_at?: number | null;
+  /** Stricter readiness signal computed by the server. UI uses this for the
+   *  "Ready to push" filter so products with missing fields, unverified
+   *  categories, or known-rejected pushes never show as ready. */
+  readiness?: "ready" | "missing" | "needs-category-verification" | "rejected" | "sample";
 };
 
 export type SyncJob = {

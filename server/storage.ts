@@ -6,6 +6,9 @@ import {
   syncJobs,
   syncLogs,
   importedOrders,
+  pushStatuses,
+  productCache,
+  webhookEvents,
 } from "@shared/schema";
 import type {
   Store,
@@ -22,10 +25,16 @@ import type {
   InsertSyncLog,
   ImportedOrder,
   InsertImportedOrder,
+  PushStatus,
+  InsertPushStatus,
+  ProductCache,
+  InsertProductCache,
+  WebhookEvent,
+  InsertWebhookEvent,
 } from "@shared/schema";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import Database from "better-sqlite3";
-import { eq, desc } from "drizzle-orm";
+import { eq, desc, and } from "drizzle-orm";
 
 const sqlite = new Database("data.db");
 sqlite.pragma("journal_mode = WAL");
@@ -98,6 +107,42 @@ sqlite.exec(`
     imported_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS push_statuses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    shop_domain TEXT NOT NULL,
+    shopify_product_id TEXT NOT NULL,
+    shopify_variant_id TEXT,
+    shopify_sku TEXT NOT NULL,
+    jomashop_sku TEXT,
+    state TEXT NOT NULL DEFAULT 'pushed',
+    last_status INTEGER,
+    last_error TEXT,
+    last_payload_json TEXT,
+    last_pushed_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE (shop_domain, shopify_sku)
+  );
+  CREATE INDEX IF NOT EXISTS push_statuses_sku_idx ON push_statuses (shopify_sku);
+  CREATE TABLE IF NOT EXISTS product_cache (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    shop_domain TEXT NOT NULL UNIQUE,
+    fetched_count INTEGER NOT NULL DEFAULT 0,
+    page_count INTEGER NOT NULL DEFAULT 0,
+    has_more INTEGER NOT NULL DEFAULT 0,
+    payload_json TEXT NOT NULL,
+    fetched_at INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS webhook_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    topic TEXT NOT NULL,
+    shop_domain TEXT,
+    body_hash TEXT,
+    hmac_verified INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL,
+    message TEXT,
+    details_json TEXT,
+    received_at INTEGER NOT NULL
+  );
 `);
 
 // Lightweight migration: add access_token_enc to stores if it's missing
@@ -139,6 +184,20 @@ export interface IStorage {
   // Orders
   upsertImportedOrder(input: InsertImportedOrder): ImportedOrder;
   listImportedOrders(): ImportedOrder[];
+
+  // Push status tracking
+  listPushStatuses(shopDomain?: string): PushStatus[];
+  getPushStatusBySku(shopDomain: string, shopifySku: string): PushStatus | undefined;
+  upsertPushStatus(input: InsertPushStatus): PushStatus;
+
+  // Product cache
+  getProductCache(shopDomain: string): ProductCache | undefined;
+  upsertProductCache(input: InsertProductCache): ProductCache;
+  clearProductCache(shopDomain: string): void;
+
+  // Webhook events
+  appendWebhookEvent(input: InsertWebhookEvent): WebhookEvent;
+  listWebhookEvents(limit?: number): WebhookEvent[];
 }
 
 export class DatabaseStorage implements IStorage {
@@ -261,6 +320,69 @@ export class DatabaseStorage implements IStorage {
   }
   listImportedOrders(): ImportedOrder[] {
     return db.select().from(importedOrders).orderBy(desc(importedOrders.updatedAt)).all();
+  }
+
+  listPushStatuses(shopDomain?: string): PushStatus[] {
+    const q = db.select().from(pushStatuses).orderBy(desc(pushStatuses.updatedAt));
+    if (shopDomain) {
+      return db
+        .select()
+        .from(pushStatuses)
+        .where(eq(pushStatuses.shopDomain, shopDomain))
+        .orderBy(desc(pushStatuses.updatedAt))
+        .all();
+    }
+    return q.all();
+  }
+  getPushStatusBySku(shopDomain: string, shopifySku: string): PushStatus | undefined {
+    return db
+      .select()
+      .from(pushStatuses)
+      .where(and(eq(pushStatuses.shopDomain, shopDomain), eq(pushStatuses.shopifySku, shopifySku)))
+      .get();
+  }
+  upsertPushStatus(input: InsertPushStatus): PushStatus {
+    const existing = this.getPushStatusBySku(input.shopDomain, input.shopifySku);
+    if (existing) {
+      return db
+        .update(pushStatuses)
+        .set({ ...input })
+        .where(eq(pushStatuses.id, existing.id))
+        .returning()
+        .get();
+    }
+    return db.insert(pushStatuses).values(input).returning().get();
+  }
+
+  getProductCache(shopDomain: string): ProductCache | undefined {
+    return db.select().from(productCache).where(eq(productCache.shopDomain, shopDomain)).get();
+  }
+  upsertProductCache(input: InsertProductCache): ProductCache {
+    const existing = this.getProductCache(input.shopDomain);
+    if (existing) {
+      return db
+        .update(productCache)
+        .set({ ...input })
+        .where(eq(productCache.id, existing.id))
+        .returning()
+        .get();
+    }
+    return db.insert(productCache).values(input).returning().get();
+  }
+  clearProductCache(shopDomain: string): void {
+    db.delete(productCache).where(eq(productCache.shopDomain, shopDomain)).run();
+  }
+
+  appendWebhookEvent(input: InsertWebhookEvent): WebhookEvent {
+    return db.insert(webhookEvents).values(input).returning().get();
+  }
+  listWebhookEvents(limit = 50): WebhookEvent[] {
+    return db
+      .select()
+      .from(webhookEvents)
+      .orderBy(desc(webhookEvents.receivedAt))
+      .limit(limit)
+      .all();
   }
 }
 

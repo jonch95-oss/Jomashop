@@ -1,6 +1,6 @@
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState, useEffect, useMemo } from "react";
-import { AlertTriangle, RefreshCcw, Loader2, Send, CheckCircle2, XCircle } from "lucide-react";
+import { AlertTriangle, RefreshCcw, Loader2, Send, CheckCircle2, XCircle, Search } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -27,10 +27,8 @@ type OverrideFields = {
 };
 
 const TOP_LEVEL_FIELDS = ["category", "brand", "sku", "manufacturer_number"] as const;
+const PAGE_SIZE = 50;
 
-// The shape of the body POSTed to /api/jomashop/push-product. We use the
-// SAMPLE_SHOPIFY_PRODUCTS payload (echoed back through /api/sync/preview-products)
-// to drive a single test push without having to refetch raw Shopify objects.
 type PushTarget = {
   productIndex: number;
   variantSku?: string;
@@ -68,10 +66,21 @@ type PreviewData = {
   hasMore?: boolean;
   fallbackReason?: string | null;
   fetchError?: string | null;
+  liveCategoryNames?: string[] | null;
   note?: string;
+  fromCache?: boolean;
+  lastRefreshedAt?: number | null;
+  cached?: boolean;
 };
 
-type ProductFilter = "all" | "ready" | "missing" | "sample";
+type ProductFilter =
+  | "all"
+  | "ready"
+  | "missing"
+  | "pushed"
+  | "not_pushed"
+  | "rejected"
+  | "sample";
 
 function missingFieldsFor(p: MappedProduct): string[] {
   const out = new Set<string>();
@@ -80,11 +89,29 @@ function missingFieldsFor(p: MappedProduct): string[] {
   return Array.from(out);
 }
 
+function pushStateOf(p: MappedProduct): "pushed" | "rejected" | "failed" | "not_pushed" {
+  return (p.push_state as any) || "not_pushed";
+}
+
+function isReady(p: MappedProduct): boolean {
+  // Server-side readiness is the single source of truth. UI just reflects it.
+  return p.readiness === "ready";
+}
+
+function formatTime(ts?: number | null): string {
+  if (!ts) return "never";
+  const d = new Date(ts);
+  return d.toLocaleString();
+}
+
 export default function Products() {
+  const queryClient = useQueryClient();
   const [data, setData] = useState<PreviewData | null>(null);
   const [pushTarget, setPushTarget] = useState<PushTarget | null>(null);
   const [pushResult, setPushResult] = useState<PushResult | null>(null);
   const [filter, setFilter] = useState<ProductFilter>("all");
+  const [query, setQuery] = useState("");
+  const [page, setPage] = useState(0);
   const [overrides, setOverrides] = useState<OverrideFields>({
     category: "",
     brand: "",
@@ -92,15 +119,26 @@ export default function Products() {
     manufacturer_number: "",
   });
 
-  // Live Jomashop categories — used to populate a datalist for the category
-  // override so the operator can pick a name Jomashop actually accepts
-  // instead of shipping a raw Shopify code.
+  // On mount: try to render from cache (instant). Only refresh from Shopify
+  // when the user clicks "Refresh from Shopify".
+  const cacheQ = useQuery<PreviewData & { cached?: boolean }>({
+    queryKey: ["/api/products/cache"],
+    refetchOnWindowFocus: false,
+  });
+
+  useEffect(() => {
+    if (cacheQ.data && (cacheQ.data.cached === true || Array.isArray((cacheQ.data as any).mapped))) {
+      setData(cacheQ.data);
+    }
+  }, [cacheQ.data]);
+
   const categoriesQ = useQuery<{
     source: "live" | "fallback";
     categories?: Array<{ name: string }>;
     data?: unknown;
   }>({
     queryKey: ["/api/jomashop/categories"],
+    refetchOnWindowFocus: false,
   });
 
   const categoryOptions = useMemo<string[]>(() => {
@@ -117,12 +155,16 @@ export default function Products() {
     return names.length > 0 ? names : ["Shoes", "Handbags", "Clothing"];
   }, [categoriesQ.data]);
 
-  const preview = useMutation({
+  const refresh = useMutation({
     mutationFn: async () => {
-      const res = await apiRequest("POST", "/api/sync/preview-products", {});
+      const res = await apiRequest("POST", "/api/products/refresh", {});
       return res.json();
     },
-    onSuccess: (d) => setData(d),
+    onSuccess: (d: PreviewData) => {
+      setData(d);
+      queryClient.invalidateQueries({ queryKey: ["/api/products/cache"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/push-statuses"] });
+    },
   });
 
   const push = useMutation({
@@ -141,7 +183,11 @@ export default function Products() {
       });
       return res.json();
     },
-    onSuccess: (r) => setPushResult(r),
+    onSuccess: (r) => {
+      setPushResult(r);
+      queryClient.invalidateQueries({ queryKey: ["/api/products/cache"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/push-statuses"] });
+    },
     onError: (e: Error) => {
       try {
         const msg = e.message;
@@ -156,12 +202,6 @@ export default function Products() {
       }
     },
   });
-
-  // Auto-run on mount
-  useEffect(() => {
-    preview.mutate();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
   function openPushModal(productIndex: number, mapped: MappedProduct, variantSku?: string) {
     setPushResult(null);
@@ -192,29 +232,63 @@ export default function Products() {
 
   const filterCounts = useMemo(() => {
     const mapped = data?.mapped ?? [];
-    let ready = 0;
-    let missing = 0;
-    let sample = 0;
+    const counts = { all: mapped.length, ready: 0, missing: 0, pushed: 0, not_pushed: 0, rejected: 0, sample: 0 };
     for (const p of mapped) {
-      if (p.is_sample) sample += 1;
+      if (p.is_sample) counts.sample += 1;
       const miss = missingFieldsFor(p);
-      if (miss.length > 0) missing += 1;
-      else if (!p.is_sample) ready += 1;
+      const state = pushStateOf(p);
+      if (state === "pushed") counts.pushed += 1;
+      else if (state === "rejected" || state === "failed") counts.rejected += 1;
+      else if (!p.is_sample) counts.not_pushed += 1;
+      if (isReady(p)) counts.ready += 1;
+      else if (miss.length > 0 && !p.is_sample) counts.missing += 1;
     }
-    return { all: mapped.length, ready, missing, sample };
+    return counts;
   }, [data]);
 
+  // Memoize the filter+search results so each keystroke doesn't re-walk the
+  // whole list when there are thousands of products.
   const filteredProducts = useMemo<MappedProduct[]>(() => {
     const mapped = data?.mapped ?? [];
+    const q = query.trim().toLowerCase();
     return mapped.filter((p) => {
+      if (q !== "") {
+        const haystack = [
+          p.name,
+          p.brand,
+          p.vendor_sku,
+          p.sku,
+          p.manufacturer_number,
+          ...(p.variants?.map((v) => v.vendor_sku) ?? []),
+        ]
+          .filter(Boolean)
+          .join(" ")
+          .toLowerCase();
+        if (!haystack.includes(q)) return false;
+      }
       const miss = missingFieldsFor(p);
+      const state = pushStateOf(p);
       if (filter === "all") return true;
-      if (filter === "ready") return miss.length === 0 && !p.is_sample;
-      if (filter === "missing") return miss.length > 0;
+      if (filter === "ready") return isReady(p);
+      if (filter === "missing") return miss.length > 0 && !p.is_sample;
+      if (filter === "pushed") return state === "pushed";
+      if (filter === "not_pushed") return state === "not_pushed" && !p.is_sample;
+      if (filter === "rejected") return state === "rejected" || state === "failed";
       if (filter === "sample") return p.is_sample === true;
       return true;
     });
-  }, [data, filter]);
+  }, [data, filter, query]);
+
+  // Reset to page 0 whenever filter or search changes.
+  useEffect(() => {
+    setPage(0);
+  }, [filter, query, data]);
+
+  const pageCount = Math.max(1, Math.ceil(filteredProducts.length / PAGE_SIZE));
+  const pageProducts = useMemo(
+    () => filteredProducts.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE),
+    [filteredProducts, page],
+  );
 
   const categorySelected = overrides.category.trim();
   const categoryInLiveList =
@@ -224,338 +298,424 @@ export default function Products() {
     );
   const categoriesAreLive = (categoriesQ.data as any)?.source === "live";
 
+  const banner = data && (
+    <div
+      data-testid="banner-data-source"
+      className={`rounded-md border p-3 text-xs ${
+        data.dataSource === "live"
+          ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
+          : "border-amber-500/50 bg-amber-500/10 text-amber-700 dark:text-amber-400"
+      }`}
+    >
+      <div className="flex flex-wrap items-center gap-2 font-medium">
+        {data.dataSource === "live" ? (
+          <CheckCircle2 className="h-3.5 w-3.5" />
+        ) : (
+          <AlertTriangle className="h-3.5 w-3.5" />
+        )}
+        <span data-testid="text-data-source">
+          Data source: {data.dataSource === "live" ? "LIVE SHOPIFY" : "SAMPLE FALLBACK"}
+        </span>
+        {data.shopDomain && (
+          <span data-testid="text-shop-domain" className="font-mono text-[11px] opacity-80">
+            · {data.shopDomain}
+          </span>
+        )}
+        {typeof data.fetchedCount === "number" && data.fetchedCount > 0 && (
+          <span className="text-[11px] opacity-80" data-testid="text-fetched-count">
+            · {data.fetchedCount} product{data.fetchedCount === 1 ? "" : "s"}
+            {typeof data.pageCount === "number" && data.pageCount > 0
+              ? ` across ${data.pageCount} page${data.pageCount === 1 ? "" : "s"}`
+              : ""}
+            {data.hasMore ? " · more available" : data.dataSource === "live" ? " · complete" : ""}
+          </span>
+        )}
+        <span className="text-[11px] opacity-80" data-testid="text-last-refreshed">
+          · Last refreshed {formatTime(data.lastRefreshedAt)}
+          {data.fromCache ? " (cached)" : ""}
+        </span>
+        <span className="ml-auto text-[11px] opacity-70">
+          Shopify {data.shopifyConnected ? "connected" : "not connected"}
+        </span>
+      </div>
+      {data.fetchError && (
+        <div data-testid="text-fetch-error" className="mt-1 text-[11px] text-red-500">
+          Fetch error: {data.fetchError}
+        </div>
+      )}
+      {data.fallbackReason && data.dataSource === "sample" && (
+        <div className="mt-1 text-[11px] opacity-80">{data.fallbackReason}</div>
+      )}
+    </div>
+  );
+
+  const filters: Array<{ key: ProductFilter; label: string; count: number }> = [
+    { key: "all", label: "All", count: filterCounts.all },
+    { key: "ready", label: "Ready to push", count: filterCounts.ready },
+    { key: "missing", label: "Missing required", count: filterCounts.missing },
+    { key: "pushed", label: "Pushed", count: filterCounts.pushed },
+    { key: "not_pushed", label: "Not pushed", count: filterCounts.not_pushed },
+    { key: "rejected", label: "Rejected / Needs fix", count: filterCounts.rejected },
+  ];
+  if (filterCounts.sample > 0) {
+    filters.push({ key: "sample", label: "Sample only", count: filterCounts.sample });
+  }
+
   return (
     <>
       <PageHeader
         title="Products"
-        description="Preview Shopify → Jomashop product mapping, then push a single test product when ready."
+        description="Preview Shopify → Jomashop product mapping, then push one when ready. Initial load uses the cached preview — click Refresh from Shopify to re-paginate."
         actions={
           <Button
-            data-testid="button-rerun-preview"
-            onClick={() => preview.mutate()}
-            disabled={preview.isPending}
+            data-testid="button-refresh-from-shopify"
+            onClick={() => refresh.mutate()}
+            disabled={refresh.isPending}
             variant="outline"
             size="sm"
           >
-            {preview.isPending ? <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" /> : <RefreshCcw className="mr-2 h-3.5 w-3.5" />}
-            Re-run preview
+            {refresh.isPending ? <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" /> : <RefreshCcw className="mr-2 h-3.5 w-3.5" />}
+            Refresh from Shopify
           </Button>
         }
       />
 
-      {preview.isPending && !data ? (
+      {cacheQ.isLoading && !data ? (
         <LoadingRows count={3} />
       ) : !data ? (
         <EmptyState
-          title="No mapping preview yet"
-          description="Run a preview to see how Shopify product fields translate to Jomashop payloads."
+          title="No cached preview yet"
+          description="Click Refresh from Shopify to paginate all products and cache the result for fast page loads."
         />
       ) : (
         <div className="space-y-4">
-          <div
-            data-testid="banner-data-source"
-            className={`rounded-md border p-3 text-xs ${
-              data.dataSource === "live"
-                ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
-                : "border-amber-500/50 bg-amber-500/10 text-amber-700 dark:text-amber-400"
-            }`}
-          >
-            <div className="flex flex-wrap items-center gap-2 font-medium">
-              {data.dataSource === "live" ? (
-                <CheckCircle2 className="h-3.5 w-3.5" />
-              ) : (
-                <AlertTriangle className="h-3.5 w-3.5" />
-              )}
-              <span data-testid="text-data-source">
-                Data source:{" "}
-                {data.dataSource === "live"
-                  ? "LIVE SHOPIFY"
-                  : "SAMPLE FALLBACK"}
-              </span>
-              {data.shopDomain && (
-                <span
-                  data-testid="text-shop-domain"
-                  className="font-mono text-[11px] opacity-80"
-                >
-                  · {data.shopDomain}
-                </span>
-              )}
-              {data.dataSource === "live" && typeof data.fetchedCount === "number" && data.fetchedCount > 0 && (
-                <span className="text-[11px] opacity-80" data-testid="text-fetched-count">
-                  · {data.fetchedCount} product{data.fetchedCount === 1 ? "" : "s"} fetched
-                  {typeof data.pageCount === "number" && data.pageCount > 0
-                    ? ` across ${data.pageCount} page${data.pageCount === 1 ? "" : "s"}`
-                    : ""}
-                  {data.hasMore ? " · more available" : data.dataSource === "live" ? " · complete" : ""}
-                </span>
-              )}
-              <span className="ml-auto text-[11px] opacity-70">
-                Shopify {data.shopifyConnected ? "connected" : "not connected"}
-              </span>
+          {banner}
+
+          <BulkRepairCard onAfterApply={() => refresh.mutate()} />
+
+          <div className="rounded-md border border-border bg-card/40 p-3">
+            <div className="flex flex-wrap items-end gap-3">
+              <div className="min-w-[220px] flex-1">
+                <Label className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                  Search title, SKU, brand
+                </Label>
+                <div className="relative mt-1">
+                  <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+                  <Input
+                    data-testid="input-search"
+                    value={query}
+                    onChange={(e) => setQuery(e.target.value)}
+                    placeholder="Search…"
+                    className="h-8 pl-7 text-xs"
+                  />
+                </div>
+              </div>
+              <div className="text-[11px] text-muted-foreground" data-testid="text-filtered-count">
+                {filteredProducts.length} match{filteredProducts.length === 1 ? "" : "es"} of {filterCounts.all}
+              </div>
             </div>
-            {data.fetchError && (
-              <div
-                data-testid="text-fetch-error"
-                className="mt-1 text-[11px] text-red-500"
-              >
-                Fetch error: {data.fetchError}
-              </div>
-            )}
-            {data.fallbackReason && data.dataSource === "sample" && (
-              <div className="mt-1 text-[11px] opacity-80">
-                {data.fallbackReason}
-              </div>
-            )}
-            {data.dataSource === "sample" && (
-              <div className="mt-1 text-[11px] opacity-80">
-                The rows below are SAMPLE FIXTURE products built into the app — the push button is disabled for them.
-              </div>
-            )}
-          </div>
 
-          <BulkRepairCard onAfterApply={() => preview.mutate()} />
-
-          <div
-            data-testid="product-filter-controls"
-            className="flex flex-wrap items-center gap-2 rounded-md border border-border bg-card/40 p-2 text-xs"
-          >
-            <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
-              Filter
-            </span>
-            {(
-              [
-                { key: "all" as const, label: "All", count: filterCounts.all },
-                { key: "ready" as const, label: "Ready to push", count: filterCounts.ready },
-                { key: "missing" as const, label: "Missing required", count: filterCounts.missing },
-                ...(filterCounts.sample > 0
-                  ? [{ key: "sample" as const, label: "Sample only", count: filterCounts.sample }]
-                  : []),
-              ]
-            ).map((f) => (
-              <Button
-                key={f.key}
-                data-testid={`button-filter-${f.key}`}
-                size="sm"
-                variant={filter === f.key ? "default" : "outline"}
-                className="h-7 px-2 text-[11px]"
-                onClick={() => setFilter(f.key)}
-              >
-                {f.label}
-                <Badge
-                  variant="outline"
-                  className="ml-2 h-4 px-1 font-mono text-[9px] tabular-nums"
+            <div
+              data-testid="product-filter-controls"
+              className="mt-2 flex flex-wrap items-center gap-2 text-xs"
+            >
+              <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                Filter
+              </span>
+              {filters.map((f) => (
+                <Button
+                  key={f.key}
+                  data-testid={`button-filter-${f.key}`}
+                  size="sm"
+                  variant={filter === f.key ? "default" : "outline"}
+                  className="h-7 px-2 text-[11px]"
+                  onClick={() => setFilter(f.key)}
                 >
-                  {f.count}
-                </Badge>
-              </Button>
-            ))}
-            <span className="ml-auto text-[10px] text-muted-foreground" data-testid="text-filtered-count">
-              Showing {filteredProducts.length} of {filterCounts.all}
-            </span>
+                  {f.label}
+                  <Badge variant="outline" className="ml-2 h-4 px-1 font-mono text-[9px] tabular-nums">
+                    {f.count}
+                  </Badge>
+                </Button>
+              ))}
+            </div>
           </div>
 
           {filteredProducts.length === 0 ? (
             <EmptyState
               title="No products match this filter"
-              description="Try the All filter, or load more products from Shopify."
+              description="Try the All filter or clear the search."
             />
           ) : (
-            filteredProducts.map((p) => {
-            const idx = data.mapped.indexOf(p);
-            const missing = missingFieldsFor(p);
-            return (
-            <Card
-              key={`${p.vendor_sku}-${p.source.shopify_product_id}`}
-              data-testid={`card-product-${p.vendor_sku}`}
-              className={p.is_sample ? "border-amber-500/40" : undefined}
-            >
-              <CardHeader className="flex flex-row items-center justify-between border-b border-card-border">
-                <div className="flex items-center gap-3">
-                  <CardTitle className="text-sm">{p.name}</CardTitle>
-                  <Badge variant="outline" className="text-[10px] uppercase">{p.category}</Badge>
-                  {missing.length > 0 && (
-                    <Badge
-                      data-testid={`badge-missing-${p.vendor_sku}`}
-                      variant="outline"
-                      className="bg-red-500/10 text-[10px] uppercase text-red-600 dark:text-red-400"
-                      title={`Missing: ${missing.join(", ")}`}
-                    >
-                      Missing: {missing.join(", ")}
-                    </Badge>
-                  )}
-                  {p.is_sample ? (
-                    <Badge
-                      data-testid={`badge-sample-${p.vendor_sku}`}
-                      className="bg-amber-500/15 text-[10px] uppercase text-amber-700 hover:bg-amber-500/20 dark:text-amber-400"
-                      variant="outline"
-                    >
-                      Sample data — push disabled
-                    </Badge>
-                  ) : (
-                    <Badge
-                      data-testid={`badge-live-${p.vendor_sku}`}
-                      className="bg-emerald-500/15 text-[10px] uppercase text-emerald-700 hover:bg-emerald-500/20 dark:text-emerald-400"
-                      variant="outline"
-                    >
-                      Live Shopify product
-                    </Badge>
-                  )}
-                </div>
-                <div className="flex items-center gap-3">
-                  <code className="font-mono text-[11px] text-muted-foreground tabular-nums">{p.vendor_sku}</code>
-                  <Button
-                    data-testid={`button-push-product-${p.vendor_sku}`}
-                    onClick={() => openPushModal(idx, p)}
-                    size="sm"
-                    variant="default"
-                    disabled={p.is_sample}
-                    title={p.is_sample ? "Sample/demo product — cannot be pushed" : undefined}
+            <>
+              {pageProducts.map((p) => {
+                const idx = data.mapped.indexOf(p);
+                const missing = missingFieldsFor(p);
+                const state = pushStateOf(p);
+                return (
+                  <Card
+                    key={`${p.vendor_sku}-${p.source.shopify_product_id}`}
+                    data-testid={`card-product-${p.vendor_sku}`}
+                    className={p.is_sample ? "border-amber-500/40" : undefined}
                   >
-                    <Send className="mr-2 h-3.5 w-3.5" />
-                    {p.is_sample ? "Push disabled (sample)" : "Push test product to Jomashop"}
-                  </Button>
-                </div>
-              </CardHeader>
-              <CardContent className="grid grid-cols-1 gap-4 p-5 md:grid-cols-3">
-                <div>
-                  <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Brand / Designer</div>
-                  <div className="mt-1 text-sm" data-testid={`text-brand-${p.vendor_sku}`}>
-                    {p.brand || "—"}
-                  </div>
-                  {p.manufacturer_number && (
-                    <div className="mt-1 text-[10px] text-muted-foreground">
-                      Designer Id:{" "}
-                      <code className="font-mono text-[11px]" data-testid={`text-designer-id-${p.vendor_sku}`}>
-                        {p.manufacturer_number}
-                      </code>
-                    </div>
-                  )}
-                  <div className="mt-2 text-[10px] uppercase tracking-wider text-muted-foreground">Category mapping</div>
-                  <div className="mt-1 text-[11px]" data-testid={`text-category-mapping-${p.vendor_sku}`}>
-                    <code className="font-mono">{p.raw_category || "—"}</code>
-                    {" → "}
-                    <code className="font-mono">{p.suggested_category || p.category}</code>
-                  </div>
-                  <div className="mt-3 text-[10px] uppercase tracking-wider text-muted-foreground">Shopify price</div>
-                  <div className="mt-1 text-sm tabular-nums">
-                    {p.price !== null ? `$${p.price.toFixed(2)}` : "—"}
-                    {p.msrp && (
-                      <span className="ml-2 text-xs text-muted-foreground line-through">${p.msrp.toFixed(2)}</span>
-                    )}
-                  </div>
-                  <div className="mt-3 text-[10px] uppercase tracking-wider text-muted-foreground">Commercial discount</div>
-                  <div className="mt-1 text-sm tabular-nums" data-testid={`text-discount-${p.vendor_sku}`}>
-                    {p.commercial_discount > 0
-                      ? `${(p.commercial_discount * 100).toFixed(p.commercial_discount * 100 % 1 === 0 ? 0 : 2)}%`
-                      : "—"}
-                  </div>
-                  <div className="mt-3 text-[10px] uppercase tracking-wider text-muted-foreground">Jomashop price</div>
-                  <div className="mt-1 text-sm font-medium tabular-nums" data-testid={`text-jomashop-price-${p.vendor_sku}`}>
-                    {p.jomashop_price !== null ? `$${p.jomashop_price.toFixed(2)}` : "—"}
-                  </div>
-                  <div className="mt-3 text-[10px] uppercase tracking-wider text-muted-foreground">Variants</div>
-                  <div className="mt-1 text-sm tabular-nums">{p.variants.length}</div>
-                </div>
-
-                <div className="md:col-span-2">
-                  <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Category properties</div>
-                  <div className="mt-2 grid grid-cols-1 gap-1.5 md:grid-cols-2">
-                    {Object.entries(p.properties).map(([k, v]) => (
-                      <div
-                        key={k}
-                        className="flex items-center justify-between rounded border border-border bg-card/40 px-2.5 py-1.5 text-xs"
-                      >
-                        <span className="font-mono text-muted-foreground">{k}</span>
-                        <span className={`ml-2 truncate font-mono ${v === null ? "text-amber-500/80" : ""}`}>
-                          {v === null ? "missing" : String(v)}
-                        </span>
+                    <CardHeader className="flex flex-row items-center justify-between border-b border-card-border">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <CardTitle className="text-sm">{p.name}</CardTitle>
+                        <Badge variant="outline" className="text-[10px] uppercase">{p.category}</Badge>
+                        {state === "pushed" && (
+                          <Badge
+                            data-testid={`badge-pushed-${p.vendor_sku}`}
+                            variant="outline"
+                            className="bg-emerald-500/15 text-[10px] uppercase text-emerald-700 dark:text-emerald-400"
+                            title={p.last_pushed_at ? `Pushed ${formatTime(p.last_pushed_at)}` : undefined}
+                          >
+                            Pushed
+                          </Badge>
+                        )}
+                        {state === "rejected" && (
+                          <Badge
+                            data-testid={`badge-rejected-${p.vendor_sku}`}
+                            variant="outline"
+                            className="bg-red-500/15 text-[10px] uppercase text-red-700 dark:text-red-400"
+                            title={p.last_push_error || "Last push was rejected"}
+                          >
+                            Rejected / Needs fix
+                          </Badge>
+                        )}
+                        {state === "failed" && (
+                          <Badge
+                            variant="outline"
+                            className="bg-red-500/15 text-[10px] uppercase text-red-700 dark:text-red-400"
+                            title={p.last_push_error || "Last push failed"}
+                          >
+                            Push failed
+                          </Badge>
+                        )}
+                        {state === "not_pushed" && !p.is_sample && (
+                          <Badge
+                            data-testid={`badge-not-pushed-${p.vendor_sku}`}
+                            variant="outline"
+                            className="text-[10px] uppercase"
+                          >
+                            Not pushed
+                          </Badge>
+                        )}
+                        {p.readiness === "needs-category-verification" && (
+                          <Badge
+                            variant="outline"
+                            className="bg-amber-500/15 text-[10px] uppercase text-amber-700 dark:text-amber-400"
+                            title="Live Jomashop category list unavailable — verify before pushing"
+                          >
+                            Needs category verification
+                          </Badge>
+                        )}
+                        {missing.length > 0 && (
+                          <Badge
+                            data-testid={`badge-missing-${p.vendor_sku}`}
+                            variant="outline"
+                            className="bg-red-500/10 text-[10px] uppercase text-red-600 dark:text-red-400"
+                            title={`Missing: ${missing.join(", ")}`}
+                          >
+                            Missing: {missing.join(", ")}
+                          </Badge>
+                        )}
+                        {p.is_sample && (
+                          <Badge
+                            data-testid={`badge-sample-${p.vendor_sku}`}
+                            className="bg-amber-500/15 text-[10px] uppercase text-amber-700 dark:text-amber-400"
+                            variant="outline"
+                          >
+                            Sample — push disabled
+                          </Badge>
+                        )}
                       </div>
-                    ))}
-                  </div>
-                </div>
-
-                {p.warnings.length > 0 && (
-                  <div className="md:col-span-3">
-                    <div className="rounded-md border border-amber-500/40 bg-amber-500/5 p-3 text-xs text-amber-500">
-                      <div className="mb-1 flex items-center gap-1.5 font-medium">
-                        <AlertTriangle className="h-3 w-3" /> {p.warnings.length} warning(s)
+                      <div className="flex items-center gap-3">
+                        <code className="font-mono text-[11px] text-muted-foreground tabular-nums">{p.vendor_sku}</code>
+                        <Button
+                          data-testid={`button-push-product-${p.vendor_sku}`}
+                          onClick={() => openPushModal(idx, p)}
+                          size="sm"
+                          variant="default"
+                          disabled={p.is_sample}
+                          title={p.is_sample ? "Sample/demo product — cannot be pushed" : undefined}
+                        >
+                          <Send className="mr-2 h-3.5 w-3.5" />
+                          {p.is_sample
+                            ? "Push disabled (sample)"
+                            : state === "pushed"
+                              ? "Update on Jomashop"
+                              : "Push to Jomashop"}
+                        </Button>
                       </div>
-                      <ul className="ml-4 list-disc space-y-0.5">
-                        {p.warnings.map((w, i) => (
-                          <li key={i}>{w}</li>
-                        ))}
-                      </ul>
-                    </div>
-                  </div>
-                )}
+                    </CardHeader>
+                    <CardContent className="grid grid-cols-1 gap-4 p-5 md:grid-cols-3">
+                      <div>
+                        <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Brand / Designer</div>
+                        <div className="mt-1 text-sm" data-testid={`text-brand-${p.vendor_sku}`}>
+                          {p.brand || "—"}
+                        </div>
+                        {p.manufacturer_number && (
+                          <div className="mt-1 text-[10px] text-muted-foreground">
+                            Designer Id: <code className="font-mono text-[11px]">{p.manufacturer_number}</code>
+                          </div>
+                        )}
+                        <div className="mt-2 text-[10px] uppercase tracking-wider text-muted-foreground">Category mapping</div>
+                        <div className="mt-1 text-[11px]">
+                          <code className="font-mono">{p.raw_category || "—"}</code>
+                          {" → "}
+                          <code className="font-mono">{p.suggested_category || p.category}</code>
+                        </div>
+                        <div className="mt-3 text-[10px] uppercase tracking-wider text-muted-foreground">Shopify price</div>
+                        <div className="mt-1 text-sm tabular-nums">
+                          {p.price !== null ? `$${p.price.toFixed(2)}` : "—"}
+                          {p.msrp && (
+                            <span className="ml-2 text-xs text-muted-foreground line-through">${p.msrp.toFixed(2)}</span>
+                          )}
+                        </div>
+                        <div className="mt-3 text-[10px] uppercase tracking-wider text-muted-foreground">Jomashop price</div>
+                        <div className="mt-1 text-sm font-medium tabular-nums">
+                          {p.jomashop_price !== null ? `$${p.jomashop_price.toFixed(2)}` : "—"}
+                        </div>
+                        {p.last_push_error && (
+                          <div className="mt-3 text-[10px] uppercase tracking-wider text-red-500">
+                            Last push error
+                          </div>
+                        )}
+                        {p.last_push_error && (
+                          <div
+                            className="mt-1 break-words text-[11px] text-red-500"
+                            data-testid={`text-last-push-error-${p.vendor_sku}`}
+                          >
+                            {p.last_push_error}
+                          </div>
+                        )}
+                      </div>
 
-                <div className="md:col-span-3">
-                  <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Variants</div>
-                  <div className="mt-2 overflow-hidden rounded border border-border">
-                    <table className="w-full text-xs">
-                      <thead className="bg-card/60 text-[10px] uppercase text-muted-foreground">
-                        <tr>
-                          <th className="px-3 py-1.5 text-left font-medium">Vendor SKU</th>
-                          <th className="px-3 py-1.5 text-left font-medium">Options</th>
-                          <th className="px-3 py-1.5 text-right font-medium">Shopify price</th>
-                          <th className="px-3 py-1.5 text-right font-medium">Jomashop price</th>
-                          <th className="px-3 py-1.5 text-right font-medium">Qty</th>
-                          <th className="px-3 py-1.5 text-right font-medium">Status</th>
-                          <th className="px-3 py-1.5 text-right font-medium">Push</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {p.variants.map((v) => (
-                          <tr key={v.vendor_sku} className="border-t border-border" data-testid={`variant-${v.vendor_sku}`}>
-                            <td className="px-3 py-1.5 font-mono">{v.vendor_sku}</td>
-                            <td className="px-3 py-1.5 text-muted-foreground">
-                              {Object.entries(v.options).map(([k, val]) => `${k}: ${val}`).join(" • ") || "—"}
-                            </td>
-                            <td className="px-3 py-1.5 text-right tabular-nums">
-                              {v.price !== null ? `$${v.price.toFixed(2)}` : "—"}
-                            </td>
-                            <td className="px-3 py-1.5 text-right font-medium tabular-nums" data-testid={`variant-jomashop-price-${v.vendor_sku}`}>
-                              {v.jomashop_price !== null ? `$${v.jomashop_price.toFixed(2)}` : "—"}
-                            </td>
-                            <td className="px-3 py-1.5 text-right tabular-nums">{v.quantity}</td>
-                            <td className="px-3 py-1.5 text-right">
-                              <Badge
-                                variant={
-                                  v.status === "active"
-                                    ? "default"
-                                    : v.status === "out_of_stock"
-                                      ? "secondary"
-                                      : "outline"
-                                }
-                                className="text-[9px] uppercase"
-                              >
-                                {v.status.replace("_", " ")}
-                              </Badge>
-                            </td>
-                            <td className="px-3 py-1.5 text-right">
-                              <Button
-                                data-testid={`button-push-variant-${v.vendor_sku}`}
-                                onClick={() => openPushModal(idx, p, v.vendor_sku)}
-                                size="sm"
-                                variant="ghost"
-                                className="h-6 px-2 text-[10px]"
-                                disabled={p.is_sample}
-                                title={p.is_sample ? "Sample/demo product — cannot be pushed" : undefined}
-                              >
-                                <Send className="mr-1 h-3 w-3" />
-                                Push
-                              </Button>
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
+                      <div className="md:col-span-2">
+                        <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Category properties</div>
+                        <div className="mt-2 grid grid-cols-1 gap-1.5 md:grid-cols-2">
+                          {Object.entries(p.properties).map(([k, v]) => (
+                            <div
+                              key={k}
+                              className="flex items-center justify-between rounded border border-border bg-card/40 px-2.5 py-1.5 text-xs"
+                            >
+                              <span className="font-mono text-muted-foreground">{k}</span>
+                              <span className={`ml-2 truncate font-mono ${v === null ? "text-amber-500/80" : ""}`}>
+                                {v === null ? "missing" : String(v)}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+
+                      {p.warnings.length > 0 && (
+                        <div className="md:col-span-3">
+                          <div className="rounded-md border border-amber-500/40 bg-amber-500/5 p-3 text-xs text-amber-500">
+                            <div className="mb-1 flex items-center gap-1.5 font-medium">
+                              <AlertTriangle className="h-3 w-3" /> {p.warnings.length} warning(s)
+                            </div>
+                            <ul className="ml-4 list-disc space-y-0.5">
+                              {p.warnings.map((w, i) => (
+                                <li key={i}>{w}</li>
+                              ))}
+                            </ul>
+                          </div>
+                        </div>
+                      )}
+
+                      <div className="md:col-span-3">
+                        <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Variants</div>
+                        <div className="mt-2 overflow-hidden rounded border border-border">
+                          <table className="w-full text-xs">
+                            <thead className="bg-card/60 text-[10px] uppercase text-muted-foreground">
+                              <tr>
+                                <th className="px-3 py-1.5 text-left font-medium">Vendor SKU</th>
+                                <th className="px-3 py-1.5 text-left font-medium">Options</th>
+                                <th className="px-3 py-1.5 text-right font-medium">Shopify price</th>
+                                <th className="px-3 py-1.5 text-right font-medium">Jomashop price</th>
+                                <th className="px-3 py-1.5 text-right font-medium">Qty</th>
+                                <th className="px-3 py-1.5 text-right font-medium">Status</th>
+                                <th className="px-3 py-1.5 text-right font-medium">Push</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {p.variants.map((v) => (
+                                <tr key={v.vendor_sku} className="border-t border-border">
+                                  <td className="px-3 py-1.5 font-mono">{v.vendor_sku}</td>
+                                  <td className="px-3 py-1.5 text-muted-foreground">
+                                    {Object.entries(v.options).map(([k, val]) => `${k}: ${val}`).join(" • ") || "—"}
+                                  </td>
+                                  <td className="px-3 py-1.5 text-right tabular-nums">
+                                    {v.price !== null ? `$${v.price.toFixed(2)}` : "—"}
+                                  </td>
+                                  <td className="px-3 py-1.5 text-right font-medium tabular-nums">
+                                    {v.jomashop_price !== null ? `$${v.jomashop_price.toFixed(2)}` : "—"}
+                                  </td>
+                                  <td className="px-3 py-1.5 text-right tabular-nums">{v.quantity}</td>
+                                  <td className="px-3 py-1.5 text-right">
+                                    <Badge
+                                      variant={
+                                        v.status === "active"
+                                          ? "default"
+                                          : v.status === "out_of_stock"
+                                            ? "secondary"
+                                            : "outline"
+                                      }
+                                      className="text-[9px] uppercase"
+                                    >
+                                      {v.status.replace("_", " ")}
+                                    </Badge>
+                                  </td>
+                                  <td className="px-3 py-1.5 text-right">
+                                    <Button
+                                      onClick={() => openPushModal(idx, p, v.vendor_sku)}
+                                      size="sm"
+                                      variant="ghost"
+                                      className="h-6 px-2 text-[10px]"
+                                      disabled={p.is_sample}
+                                    >
+                                      <Send className="mr-1 h-3 w-3" />
+                                      {state === "pushed" ? "Update" : "Push"}
+                                    </Button>
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+                );
+              })}
+
+              {pageCount > 1 && (
+                <div className="flex items-center justify-between rounded-md border border-border bg-card/40 p-2 text-xs">
+                  <span className="text-muted-foreground">
+                    Page {page + 1} of {pageCount} · showing {pageProducts.length} of {filteredProducts.length}
+                  </span>
+                  <div className="flex gap-2">
+                    <Button
+                      data-testid="button-prev-page"
+                      size="sm"
+                      variant="outline"
+                      onClick={() => setPage((p) => Math.max(0, p - 1))}
+                      disabled={page === 0}
+                    >
+                      Previous
+                    </Button>
+                    <Button
+                      data-testid="button-next-page"
+                      size="sm"
+                      variant="outline"
+                      onClick={() => setPage((p) => Math.min(pageCount - 1, p + 1))}
+                      disabled={page >= pageCount - 1}
+                    >
+                      Next
+                    </Button>
                   </div>
                 </div>
-              </CardContent>
-            </Card>
-            );
-            })
+              )}
+            </>
           )}
         </div>
       )}
@@ -577,7 +737,6 @@ export default function Products() {
           {pushTarget && !pushResult && (
             <div className="space-y-3 text-xs">
               <div
-                data-testid="banner-push-source"
                 className={`rounded border p-2 text-[11px] font-semibold uppercase tracking-wider ${
                   targetIsSample
                     ? "border-amber-500/50 bg-amber-500/10 text-amber-600 dark:text-amber-400"
@@ -586,7 +745,9 @@ export default function Products() {
               >
                 {targetIsSample
                   ? "Sample data — push disabled"
-                  : "Live Shopify product"}
+                  : pushTarget.mapped.push_state === "pushed"
+                    ? "Live Shopify product — already pushed (this will update Jomashop)"
+                    : "Live Shopify product"}
               </div>
               <div className="rounded border border-border bg-card/40 p-3">
                 <div className="mb-1 text-[10px] uppercase tracking-wider text-muted-foreground">
@@ -669,8 +830,8 @@ export default function Products() {
                         className="mt-1 text-[10px] text-amber-500"
                       >
                         {categoriesAreLive
-                          ? "Warning: this category is not in the live Jomashop category list."
-                          : "Note: live categories not fetched — using fallback list."}
+                          ? "Warning: this category is not in the live Jomashop category list. Push will likely fail."
+                          : "Note: live categories not fetched — using fallback list. Push may be rejected."}
                       </div>
                     )}
                   </div>
@@ -688,6 +849,9 @@ export default function Products() {
                       placeholder="e.g. Off-White"
                       className="h-8 font-mono text-xs"
                     />
+                    <div className="mt-1 text-[10px] text-amber-500">
+                      Warning: Brand must match Jomashop exactly. There is no brand lookup API, so this value cannot be verified before push.
+                    </div>
                   </div>
                   <div>
                     <Label htmlFor="ovr-sku" className="text-[10px] uppercase">
@@ -731,7 +895,6 @@ export default function Products() {
                       <li
                         key={k}
                         className={`flex items-center gap-2 ${ok ? "text-emerald-500" : "text-red-500"}`}
-                        data-testid={`checklist-${k}`}
                       >
                         {ok ? (
                           <CheckCircle2 className="h-3.5 w-3.5" />
@@ -826,10 +989,7 @@ export default function Products() {
               {pushResult.payloadSent && (
                 <details className="rounded border border-border bg-card/40 p-2" open>
                   <summary className="cursor-pointer font-medium">Exact payload sent</summary>
-                  <pre
-                    className="mt-2 max-h-48 overflow-auto rounded bg-background p-2 font-mono text-[10px]"
-                    data-testid="text-payload-sent"
-                  >
+                  <pre className="mt-2 max-h-48 overflow-auto rounded bg-background p-2 font-mono text-[10px]">
                     {JSON.stringify(pushResult.payloadSent, null, 2)}
                   </pre>
                 </details>
@@ -883,7 +1043,9 @@ export default function Products() {
                 ) : (
                   <Send className="mr-2 h-3.5 w-3.5" />
                 )}
-                Confirm — push to Jomashop
+                {pushTarget.mapped.push_state === "pushed"
+                  ? "Confirm — update on Jomashop"
+                  : "Confirm — push to Jomashop"}
               </Button>
             )}
           </DialogFooter>
@@ -895,8 +1057,7 @@ export default function Products() {
 
 /**
  * Reconstruct a ShopifyProduct-shaped object from the mapped preview so the
- * push endpoint can re-run mapping with the live category schema. This is a
- * stand-in until real Shopify products are fetched via the OAuth flow.
+ * push endpoint can re-run mapping with the live category schema.
  */
 function shopifyProductFromMapped(m: MappedProduct): Record<string, unknown> {
   return {
@@ -917,8 +1078,6 @@ function shopifyProductFromMapped(m: MappedProduct): Record<string, unknown> {
       option3: Object.values(v.options)[2],
     })),
     metafields: [
-      // Surface the commercial discount + properties so the backend mapping
-      // produces the same Jomashop price and properties.
       { namespace: "custom", key: "commercial_discount", value: m.commercial_discount },
       ...Object.entries(m.properties)
         .filter(([, v]) => v !== null && v !== undefined && v !== "")

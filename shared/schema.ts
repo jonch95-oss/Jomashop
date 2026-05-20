@@ -82,6 +82,66 @@ export const syncLogs = sqliteTable("sync_logs", {
   createdAt: integer("created_at").notNull(),
 });
 
+// ---------- Push status per Shopify product/variant ----------
+// Tracks whether a Shopify product/variant has been pushed to Jomashop, the
+// last push outcome, and the most recent payload for inventory webhook
+// updates. Used to:
+//  - hide already-pushed items from the "needs pushing" filter,
+//  - label the button "Update on Jomashop" instead of "Push",
+//  - decide whether an inventory webhook should call PUT /v1/inventory/:sku.
+export const pushStatuses = sqliteTable("push_statuses", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  shopDomain: text("shop_domain").notNull(),
+  shopifyProductId: text("shopify_product_id").notNull(),
+  shopifyVariantId: text("shopify_variant_id"),
+  shopifySku: text("shopify_sku").notNull(),
+  jomashopSku: text("jomashop_sku"),
+  // "pushed" — last push succeeded.
+  // "rejected" — last push call returned a validation error (e.g. "Brand must exist").
+  // "failed" — non-validation error (network, 5xx, etc).
+  state: text("state").notNull().default("pushed"),
+  lastStatus: integer("last_status"),
+  lastError: text("last_error"),
+  // Stored mapped product JSON used as the base for inventory updates when a
+  // Shopify webhook arrives without price/title context.
+  lastPayloadJson: text("last_payload_json"),
+  lastPushedAt: integer("last_pushed_at").notNull(),
+  updatedAt: integer("updated_at").notNull(),
+});
+
+// ---------- Cached Shopify product preview ----------
+// Caches /api/sync/preview-products responses by shop domain so the Products
+// page can load instantly without re-paginating Shopify on every visit.
+// A single row per shop domain is kept; "Refresh from Shopify" overwrites it.
+export const productCache = sqliteTable("product_cache", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  shopDomain: text("shop_domain").notNull().unique(),
+  fetchedCount: integer("fetched_count").notNull().default(0),
+  pageCount: integer("page_count").notNull().default(0),
+  hasMore: integer("has_more", { mode: "boolean" }).notNull().default(false),
+  // Full preview payload (mapped + schemas + flags) serialized as JSON so
+  // the products page can rehydrate without recomputing anything server-side.
+  payloadJson: text("payload_json").notNull(),
+  fetchedAt: integer("fetched_at").notNull(),
+});
+
+// ---------- Webhook events ----------
+// Append-only log of Shopify webhook deliveries we've processed (or refused).
+// Lets the operator audit auto-sync activity and see why a delivery was
+// dropped (HMAC mismatch, unknown SKU, etc.).
+export const webhookEvents = sqliteTable("webhook_events", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  topic: text("topic").notNull(),
+  shopDomain: text("shop_domain"),
+  // sha256 hash of the request body — used to dedupe Shopify retries.
+  bodyHash: text("body_hash"),
+  hmacVerified: integer("hmac_verified", { mode: "boolean" }).notNull().default(false),
+  status: text("status").notNull(), // received | applied | skipped | rejected
+  message: text("message"),
+  detailsJson: text("details_json"),
+  receivedAt: integer("received_at").notNull(),
+});
+
 // ---------- Imported orders (from Jomashop) ----------
 export const importedOrders = sqliteTable("imported_orders", {
   id: integer("id").primaryKey({ autoIncrement: true }),
@@ -102,6 +162,9 @@ export const insertCategoryMappingSchema = createInsertSchema(categoryMappings).
 export const insertSyncJobSchema = createInsertSchema(syncJobs).omit({ id: true });
 export const insertSyncLogSchema = createInsertSchema(syncLogs).omit({ id: true });
 export const insertImportedOrderSchema = createInsertSchema(importedOrders).omit({ id: true });
+export const insertPushStatusSchema = createInsertSchema(pushStatuses).omit({ id: true });
+export const insertProductCacheSchema = createInsertSchema(productCache).omit({ id: true });
+export const insertWebhookEventSchema = createInsertSchema(webhookEvents).omit({ id: true });
 
 // ---------- Types ----------
 export type Store = typeof stores.$inferSelect;
@@ -118,6 +181,12 @@ export type SyncLog = typeof syncLogs.$inferSelect;
 export type InsertSyncLog = z.infer<typeof insertSyncLogSchema>;
 export type ImportedOrder = typeof importedOrders.$inferSelect;
 export type InsertImportedOrder = z.infer<typeof insertImportedOrderSchema>;
+export type PushStatus = typeof pushStatuses.$inferSelect;
+export type InsertPushStatus = z.infer<typeof insertPushStatusSchema>;
+export type ProductCache = typeof productCache.$inferSelect;
+export type InsertProductCache = z.infer<typeof insertProductCacheSchema>;
+export type WebhookEvent = typeof webhookEvents.$inferSelect;
+export type InsertWebhookEvent = z.infer<typeof insertWebhookEventSchema>;
 
 // ---------- Shared domain constants ----------
 export const SUPPORTED_CATEGORIES = ["Shoes", "Handbags", "Clothing"] as const;

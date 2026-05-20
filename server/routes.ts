@@ -30,6 +30,7 @@ import {
   getActiveShopifyConnection,
 } from "./shopify";
 import { registerBulkRepairRoutes } from "./bulk_repair";
+import { registerWebhookRoutes, registerShopifyWebhooks } from "./webhooks";
 
 // -------------------- helpers --------------------
 
@@ -399,26 +400,25 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   // ---------- Sync previews ----------
-  app.post("/api/sync/preview-products", async (req, res) => {
-    const supplied = req.body?.products as ShopifyProduct[] | undefined;
-    // Allow callers to optionally cap product count or page size. By default
-    // we fetch ALL products (no maxProducts cap) using a 100/page request.
-    const rawLimit = req.body?.limit;
-    const maxProducts =
-      rawLimit === undefined || rawLimit === null || rawLimit === "" || rawLimit === "all"
-        ? undefined
-        : Math.max(parseInt(String(rawLimit), 10) || 0, 1);
-    const pageSize = Math.min(
-      Math.max(parseInt(String(req.body?.pageSize ?? "100"), 10) || 100, 1),
-      250,
-    );
-
-    // Resolve the Shopify connection (DB-persisted OAuth token preferred,
-    // env-var fallback for private-app setups). Used both to label the data
-    // source and to drive the live Admin API fetch.
+  //
+  // POST /api/sync/preview-products
+  //   body: { products?, limit?, pageSize?, useCache?, forceRefresh? }
+  //
+  // By default this returns the cached preview for the connected shop if
+  // available — that lets the Products page render instantly without
+  // paginating every Shopify product. Pass `forceRefresh: true` (or call the
+  // dedicated POST /api/products/refresh route) to re-fetch from Shopify and
+  // overwrite the cache.
+  async function buildPreview(opts: {
+    suppliedProducts?: ShopifyProduct[];
+    forceRefresh: boolean;
+    pageSize: number;
+    maxProducts: number | undefined;
+  }) {
+    const { suppliedProducts, forceRefresh, pageSize, maxProducts } = opts;
     const conn = getActiveShopifyConnection();
-    const stores = storage.listStores();
-    const connectedStore = stores.find(
+    const storesList = storage.listStores();
+    const connectedStore = storesList.find(
       (s) => s.oauthStatus === "connected" && s.accessTokenEnc,
     );
     const shopifyConnected = conn !== null || Boolean(connectedStore);
@@ -432,10 +432,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     let pageCount = 0;
     let hasMore = false;
 
-    if (Array.isArray(supplied) && supplied.length > 0) {
-      products = supplied;
+    if (Array.isArray(suppliedProducts) && suppliedProducts.length > 0) {
+      products = suppliedProducts;
       dataSource = "live";
-      fetchedCount = supplied.length;
+      fetchedCount = suppliedProducts.length;
     } else if (conn) {
       const result = await fetchShopifyProducts({ pageSize, maxProducts });
       if (result.ok && result.products.length > 0) {
@@ -460,7 +460,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         storage.appendLog({
           level: "info",
           message: `Fetched ${result.count} live Shopify products from ${result.shopDomain} across ${result.pageCount} page(s)`,
-          detailsJson: JSON.stringify({ hasMore: result.hasMore }),
+          detailsJson: JSON.stringify({ hasMore: result.hasMore, forceRefresh }),
           createdAt: Date.now(),
         });
       } else if (result.ok) {
@@ -488,11 +488,38 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         : "No Shopify store is connected yet. Complete /#/setup → Begin install to load live products.";
     }
 
-    // Pull schemas (live if available) for the three supported categories.
+    // Resolve live category schemas + the canonical category-name list so we
+    // can label readiness ("Needs category verification" when the live list
+    // isn't available, "Rejected" when previously failed).
     const schemas: Record<SupportedCategory, any> = { Shoes: null, Handbags: null, Clothing: null };
     for (const cat of SUPPORTED_CATEGORIES) {
       const { source, schema } = await resolveCategorySchema(cat);
       schemas[cat] = { source, schema };
+    }
+    const liveCategoriesResult = await getCategories();
+    const liveCategoryNames: string[] | null = (() => {
+      if (!liveCategoriesResult.ok) return null;
+      const raw = liveCategoriesResult.data as unknown;
+      const arr =
+        (Array.isArray(raw) ? raw : (raw as { data?: unknown }).data) ||
+        (raw as { categories?: unknown }).categories;
+      if (!Array.isArray(arr)) return null;
+      const names = arr
+        .map((c) => (typeof c === "string" ? c : (c as { name?: string }).name))
+        .filter((s): s is string => Boolean(s));
+      return names.length > 0 ? names : null;
+    })();
+
+    // Push-status index by Shopify SKU so we can attach pushed/rejected/etc
+    // metadata to each mapped product.
+    const pushIndex = new Map<string, { state: string; jomashopSku: string | null; lastError: string | null; lastPushedAt: number }>();
+    for (const ps of storage.listPushStatuses(shopDomain ?? undefined)) {
+      pushIndex.set(ps.shopifySku, {
+        state: ps.state,
+        jomashopSku: ps.jomashopSku,
+        lastError: ps.lastError,
+        lastPushedAt: ps.lastPushedAt,
+      });
     }
 
     const mapped = products.map((p) => {
@@ -501,11 +528,53 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const props =
         (schemaWrap?.schema?.properties as Array<any>) ||
         FALLBACK_CATEGORY_SCHEMAS[cat].map((f) => ({ field: f.field, required: f.required, type: f.type, options: f.options }));
-      return mapShopifyToJomashop(p, props);
+      const m = mapShopifyToJomashop(p, props);
+
+      // Attach push status + readiness flag. Readiness is the stricter
+      // signal the UI uses for the "Ready to push" filter:
+      //   - no missing top-level fields
+      //   - no missing required props
+      //   - not a sample fixture
+      //   - has a real SKU and category
+      //   - category appears in the live Jomashop category list (or, when
+      //     not available, surfaces a "Needs category verification" flag).
+      //   - no "undefined" category property values present.
+      const status = pushIndex.get(m.vendor_sku) || null;
+      const hasUndefinedProp = Object.values(m.properties).some(
+        (v) => v === undefined || (typeof v === "string" && v.trim().toLowerCase() === "undefined"),
+      );
+      const missingTopLevel = m.missing_top_level ?? [];
+      const missingRequired = m.missing_required ?? [];
+      const hasSku = Boolean(m.vendor_sku && m.vendor_sku.trim() !== "");
+      const hasCategory = Boolean(m.category);
+      let readiness: "ready" | "missing" | "needs-category-verification" | "rejected" | "sample" = "missing";
+      if (m.is_sample) readiness = "sample";
+      else if (status?.state === "rejected" || status?.state === "failed") readiness = "rejected";
+      else if (missingTopLevel.length > 0 || missingRequired.length > 0 || !hasSku || !hasCategory || hasUndefinedProp) {
+        readiness = "missing";
+      } else if (liveCategoryNames && liveCategoryNames.length > 0) {
+        // The category override sent at push time may differ from the
+        // inferred enum — but at preview time we only have m.category +
+        // m.suggested_category. Treat ready iff one of those is in the list.
+        const proposed = (m.suggested_category || m.category || "").toLowerCase();
+        const ok = liveCategoryNames.some((n) => n.toLowerCase() === proposed);
+        readiness = ok ? "ready" : "missing";
+      } else {
+        readiness = "needs-category-verification";
+      }
+
+      return {
+        ...m,
+        push_state: status?.state ?? "not_pushed",
+        jomashop_sku: status?.jomashopSku ?? null,
+        last_push_error: status?.lastError ?? null,
+        last_pushed_at: status?.lastPushedAt ?? null,
+        readiness,
+      };
     });
 
     const usingSamples = dataSource === "sample";
-    res.json({
+    return {
       schemas,
       mapped,
       count: mapped.length,
@@ -518,10 +587,139 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       hasMore,
       fallbackReason,
       fetchError,
+      liveCategoryNames,
       note: usingSamples
         ? "Sample fixtures only — connect Shopify and load live products before pushing to Jomashop."
         : `Live Shopify products from ${shopDomain ?? "connected store"}. No data sent to Jomashop.`,
+    };
+  }
+
+  app.post("/api/sync/preview-products", async (req, res) => {
+    const supplied = req.body?.products as ShopifyProduct[] | undefined;
+    const forceRefresh = req.body?.forceRefresh === true || req.body?.useCache === false;
+    const rawLimit = req.body?.limit;
+    const maxProducts =
+      rawLimit === undefined || rawLimit === null || rawLimit === "" || rawLimit === "all"
+        ? undefined
+        : Math.max(parseInt(String(rawLimit), 10) || 0, 1);
+    const pageSize = Math.min(
+      Math.max(parseInt(String(req.body?.pageSize ?? "100"), 10) || 100, 1),
+      250,
+    );
+
+    // Cache fast-path: when not forcing a refresh and no products were
+    // supplied, return the latest cached preview if one exists.
+    if (!forceRefresh && (!Array.isArray(supplied) || supplied.length === 0)) {
+      const conn = getActiveShopifyConnection();
+      const cacheDomain =
+        conn?.shopDomain ?? storage.listStores().find((s) => s.oauthStatus === "connected")?.shopDomain ?? null;
+      if (cacheDomain) {
+        const cached = storage.getProductCache(cacheDomain);
+        if (cached) {
+          try {
+            const payload = JSON.parse(cached.payloadJson);
+            return res.json({
+              ...payload,
+              fromCache: true,
+              lastRefreshedAt: cached.fetchedAt,
+            });
+          } catch {
+            // fall through and refetch below
+          }
+        }
+      }
+    }
+
+    const preview = await buildPreview({
+      suppliedProducts: supplied,
+      forceRefresh,
+      pageSize,
+      maxProducts,
     });
+
+    // Cache successful live previews so the next page load is instant.
+    // Sample/empty previews are not cached so we don't pin demo data.
+    if (preview.dataSource === "live" && preview.shopDomain) {
+      try {
+        storage.upsertProductCache({
+          shopDomain: preview.shopDomain,
+          fetchedCount: preview.fetchedCount,
+          pageCount: preview.pageCount,
+          hasMore: preview.hasMore,
+          payloadJson: JSON.stringify(preview),
+          fetchedAt: Date.now(),
+        });
+      } catch (err) {
+        storage.appendLog({
+          level: "warn",
+          message: `Failed to persist product cache: ${(err as Error).message}`,
+          detailsJson: null,
+          createdAt: Date.now(),
+        });
+      }
+    }
+
+    res.json({ ...preview, fromCache: false, lastRefreshedAt: Date.now() });
+  });
+
+  // Read-only fast path: return the cached preview without ever calling
+  // Shopify. The Products page calls this on mount so initial load is
+  // immediate. Returns null payload if no cache exists yet.
+  app.get("/api/products/cache", (_req, res) => {
+    const conn = getActiveShopifyConnection();
+    const shopDomain =
+      conn?.shopDomain ??
+      storage.listStores().find((s) => s.oauthStatus === "connected")?.shopDomain ??
+      null;
+    if (!shopDomain) return res.json({ cached: false, reason: "no-shopify-connection" });
+    const cached = storage.getProductCache(shopDomain);
+    if (!cached) return res.json({ cached: false, shopDomain });
+    try {
+      const payload = JSON.parse(cached.payloadJson);
+      return res.json({
+        cached: true,
+        shopDomain,
+        lastRefreshedAt: cached.fetchedAt,
+        fetchedCount: cached.fetchedCount,
+        pageCount: cached.pageCount,
+        hasMore: cached.hasMore,
+        ...payload,
+        fromCache: true,
+      });
+    } catch (err) {
+      return res.json({ cached: false, shopDomain, error: (err as Error).message });
+    }
+  });
+
+  // Force a full Shopify pagination + cache overwrite. The Products page
+  // wires this to the "Refresh from Shopify" button.
+  app.post("/api/products/refresh", async (req, res) => {
+    const rawLimit = req.body?.limit;
+    const maxProducts =
+      rawLimit === undefined || rawLimit === null || rawLimit === "" || rawLimit === "all"
+        ? undefined
+        : Math.max(parseInt(String(rawLimit), 10) || 0, 1);
+    const pageSize = Math.min(
+      Math.max(parseInt(String(req.body?.pageSize ?? "100"), 10) || 100, 1),
+      250,
+    );
+    const preview = await buildPreview({
+      suppliedProducts: undefined,
+      forceRefresh: true,
+      pageSize,
+      maxProducts,
+    });
+    if (preview.dataSource === "live" && preview.shopDomain) {
+      storage.upsertProductCache({
+        shopDomain: preview.shopDomain,
+        fetchedCount: preview.fetchedCount,
+        pageCount: preview.pageCount,
+        hasMore: preview.hasMore,
+        payloadJson: JSON.stringify(preview),
+        fetchedAt: Date.now(),
+      });
+    }
+    res.json({ ...preview, fromCache: false, lastRefreshedAt: Date.now() });
   });
 
   // Direct live Shopify product fetch (debug / admin use). Returns the
@@ -766,6 +964,46 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         detailsJson: JSON.stringify({ error: productResp.error, errorData: errBody, payload }),
         createdAt: Date.now(),
       });
+      // Record rejected state so the Products UI can show "Rejected — needs
+      // fix" and the user only sees this row on the "Rejected/Needs fix"
+      // filter until the next retry succeeds.
+      if (mapped.source.shopify_product_id) {
+        const errStr = [
+          errBody?.error,
+          ...(errBody?.errors ?? []),
+          ...(errBody?.invalid_params ?? []).map((p) => `invalid_param: ${p}`),
+        ]
+          .filter(Boolean)
+          .join("; ");
+        const shopDomainForPush =
+          getActiveShopifyConnection()?.shopDomain ??
+          storage.listStores().find((s) => s.oauthStatus === "connected")?.shopDomain ??
+          "unknown";
+        try {
+          storage.upsertPushStatus({
+            shopDomain: shopDomainForPush,
+            shopifyProductId: String(mapped.source.shopify_product_id),
+            shopifyVariantId: variant
+              ? String(body.product.variants?.find((v) => v.sku === variant.vendor_sku)?.id ?? mapped.source.shopify_variant_ids[0] ?? "")
+              : null,
+            shopifySku: String(variant?.vendor_sku ?? mapped.vendor_sku),
+            jomashopSku: String(payload.vendor_sku ?? mapped.vendor_sku),
+            state: "rejected",
+            lastStatus: productResp.status,
+            lastError: errStr || productResp.error || `HTTP ${productResp.status}`,
+            lastPayloadJson: JSON.stringify({
+              category: mapped.category,
+              price: mapped.jomashop_price,
+              msrp: mapped.msrp,
+              variants: mapped.variants,
+            }),
+            lastPushedAt: Date.now(),
+            updatedAt: Date.now(),
+          });
+        } catch {
+          // non-fatal
+        }
+      }
       return res.status(502).json({
         ok: false,
         stage: "product_post",
@@ -796,6 +1034,35 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         lastError: null,
         updatedAt: Date.now(),
       });
+      // Track pushed state so the Products UI can hide this row from the
+      // "Not pushed" filter, label its button "Update on Jomashop", and so
+      // the inventory webhook can target this SKU on future updates.
+      const shopDomainForPush =
+        getActiveShopifyConnection()?.shopDomain ??
+        storage.listStores().find((s) => s.oauthStatus === "connected")?.shopDomain ??
+        "unknown";
+      try {
+        storage.upsertPushStatus({
+          shopDomain: shopDomainForPush,
+          shopifyProductId: String(mapped.source.shopify_product_id),
+          shopifyVariantId: String(variantId ?? mapped.source.shopify_variant_ids[0] ?? ""),
+          shopifySku: String(variant?.vendor_sku ?? mapped.vendor_sku),
+          jomashopSku: String(payload.vendor_sku),
+          state: "pushed",
+          lastStatus: productResp.status,
+          lastError: null,
+          lastPayloadJson: JSON.stringify({
+            category: mapped.category,
+            price: mapped.jomashop_price,
+            msrp: mapped.msrp,
+            variants: mapped.variants,
+          }),
+          lastPushedAt: Date.now(),
+          updatedAt: Date.now(),
+        });
+      } catch {
+        // non-fatal
+      }
     }
 
     // Optionally push inventory for this SKU.
@@ -848,6 +1115,50 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // ---------- Bulk repair workflow (XLSX export/import/apply/push) ----------
   registerBulkRepairRoutes(app);
 
+  // ---------- Shopify webhooks (public, HMAC-verified) ----------
+  registerWebhookRoutes(app);
+
+  // ---------- Webhook registration (operator-triggered) ----------
+  //
+  // POST /api/shopify/register-webhooks
+  //   body: { confirm: true }
+  //
+  // Registers the inventory_levels/update and products/update webhooks
+  // against the connected store using the live APP_URL. Existing
+  // identical (topic, address) webhooks are detected and reported instead
+  // of duplicated.
+  app.post("/api/shopify/register-webhooks", async (req, res) => {
+    if (!req.body?.confirm) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "Missing confirmation. Set `confirm: true` to acknowledge this will register Shopify webhooks against the connected store.",
+      });
+    }
+    const result = await registerShopifyWebhooks({ appUrl: appBaseUrl(req) });
+    storage.appendLog({
+      level: result.ok ? "info" : "warn",
+      message: `Shopify webhook registration: ${result.created.length} created, ${result.existing.length} existing, ${result.errors.length} error(s)`,
+      detailsJson: JSON.stringify(result),
+      createdAt: Date.now(),
+    });
+    res.json(result);
+  });
+
+  // Surfaced for the Setup page so the operator can copy URLs / Powershell
+  // them into Shopify Partners if they prefer manual setup.
+  app.get("/api/shopify/webhook-urls", (req, res) => {
+    const base = appBaseUrl(req).replace(/\/$/, "");
+    res.json({
+      hmacEnvVar: "SHOPIFY_CLIENT_SECRET",
+      hmacHeader: "X-Shopify-Hmac-Sha256",
+      topics: [
+        { topic: "inventory_levels/update", url: `${base}/webhooks/shopify/inventory-levels-update` },
+        { topic: "products/update", url: `${base}/webhooks/shopify/products-update` },
+      ],
+    });
+  });
+
   // ---------- DB-backed read endpoints used by the UI ----------
   app.get("/api/sku-mappings", (_req, res) => res.json(storage.listSkuMappings()));
   app.get("/api/category-mappings", (_req, res) => res.json(storage.listCategoryMappings()));
@@ -855,6 +1166,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.get("/api/logs", (_req, res) => res.json(storage.listLogs()));
   app.get("/api/imported-orders", (_req, res) => res.json(storage.listImportedOrders()));
   app.get("/api/stores", (_req, res) => res.json(storage.listStores()));
+  app.get("/api/push-statuses", (_req, res) => res.json(storage.listPushStatuses()));
+  app.get("/api/webhook-events", (_req, res) => res.json(storage.listWebhookEvents()));
 
   return httpServer;
 }

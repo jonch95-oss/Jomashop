@@ -2,7 +2,7 @@ import { useEffect, useState, useMemo } from "react";
 import { useSearch } from "wouter";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { useToast } from "@/hooks/use-toast";
-import { Copy, ExternalLink, Loader2, Check, X, Info, ShieldAlert, CheckCircle2 } from "lucide-react";
+import { Copy, ExternalLink, Loader2, Check, X, Info, ShieldAlert, CheckCircle2, Webhook } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -290,6 +290,9 @@ export default function Setup() {
         </Card>
       </div>
 
+      {/* Webhook auto-sync */}
+      <WebhookAutoSyncCard />
+
       {/* Env reference */}
       <Card className="mt-6">
         <CardHeader className="border-b border-card-border">
@@ -319,5 +322,128 @@ export default function Setup() {
         </CardContent>
       </Card>
     </>
+  );
+}
+
+type WebhookUrls = {
+  hmacEnvVar: string;
+  hmacHeader: string;
+  topics: Array<{ topic: string; url: string }>;
+};
+
+type RegisterResult = {
+  ok: boolean;
+  shopDomain?: string;
+  created: Array<{ topic: string; address: string; id?: string | number }>;
+  existing: Array<{ topic: string; address: string; id?: string | number }>;
+  errors: Array<{ topic: string; error: string }>;
+};
+
+function WebhookAutoSyncCard() {
+  const { toast } = useToast();
+  const urlsQ = useQuery<WebhookUrls>({ queryKey: ["/api/shopify/webhook-urls"] });
+
+  const register = useMutation<RegisterResult>({
+    mutationFn: async () => {
+      const res = await apiRequest("POST", "/api/shopify/register-webhooks", { confirm: true });
+      return res.json();
+    },
+    onSuccess: (data) => {
+      toast({
+        title: data.ok ? "Webhooks registered" : "Webhook registration finished with errors",
+        description: `${data.created.length} created, ${data.existing.length} already existed, ${data.errors.length} error(s)`,
+        variant: data.ok ? "default" : "destructive",
+      });
+    },
+    onError: (err: Error) => {
+      toast({ title: "Webhook registration failed", description: err.message, variant: "destructive" });
+    },
+  });
+
+  return (
+    <Card className="mt-6">
+      <CardHeader className="flex flex-row items-center justify-between border-b border-card-border">
+        <CardTitle className="flex items-center gap-2 text-sm">
+          <Webhook className="h-4 w-4" /> Inventory auto-sync (Shopify webhooks)
+        </CardTitle>
+        <Badge variant="outline" className="text-[10px] uppercase">HMAC verified</Badge>
+      </CardHeader>
+      <CardContent className="space-y-4 p-5 text-xs">
+        <p className="text-muted-foreground">
+          When enabled, Shopify will push inventory updates here and we'll forward them to Jomashop
+          for SKUs that have already been pushed. Webhooks are <strong>not</strong> registered
+          automatically — click the button below when you're ready, or copy the URLs into the
+          Shopify Partner dashboard manually.
+        </p>
+
+        {urlsQ.isLoading && <LoadingRows count={1} />}
+        {urlsQ.data && (
+          <div className="space-y-2">
+            {urlsQ.data.topics.map((t) => (
+              <div key={t.topic} className="rounded-md border border-border bg-card/60 p-3">
+                <div className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                  Topic
+                </div>
+                <code className="font-mono text-xs">{t.topic}</code>
+                <div className="mt-2 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                  Delivery URL
+                </div>
+                <div className="mt-1 flex items-start justify-between gap-2">
+                  <code
+                    className="break-all font-mono text-xs"
+                    data-testid={`webhook-url-${t.topic.replace(/[^a-z]+/gi, "-")}`}
+                  >
+                    {t.url}
+                  </code>
+                </div>
+              </div>
+            ))}
+            <div className="rounded-md border border-border bg-card/40 p-3 text-[11px] text-muted-foreground">
+              HMAC verification uses <code className="font-mono">{urlsQ.data.hmacEnvVar}</code> against
+              the <code className="font-mono">{urlsQ.data.hmacHeader}</code> header. The webhook
+              endpoints are public (not behind the admin token) because Shopify must reach them
+              directly.
+            </div>
+          </div>
+        )}
+
+        <Button
+          data-testid="button-register-webhooks"
+          onClick={() => register.mutate()}
+          disabled={register.isPending}
+        >
+          {register.isPending ? <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" /> : <Webhook className="mr-2 h-3.5 w-3.5" />}
+          Register Shopify webhooks
+        </Button>
+
+        {register.data && (
+          <div
+            className={`rounded-md border p-3 text-xs ${
+              register.data.ok
+                ? "border-emerald-500/40 bg-emerald-500/5 text-emerald-500"
+                : "border-amber-500/40 bg-amber-500/5 text-amber-500"
+            }`}
+            data-testid="text-register-result"
+          >
+            {register.data.shopDomain && (
+              <div>Store: <code className="font-mono">{register.data.shopDomain}</code></div>
+            )}
+            <ul className="mt-1 ml-4 list-disc">
+              {register.data.created.map((c) => (
+                <li key={`c-${c.topic}`}>created: <code className="font-mono">{c.topic}</code></li>
+              ))}
+              {register.data.existing.map((c) => (
+                <li key={`e-${c.topic}`}>already exists: <code className="font-mono">{c.topic}</code></li>
+              ))}
+              {register.data.errors.map((c, i) => (
+                <li key={`x-${i}`} className="text-red-500">
+                  {c.topic}: {c.error}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </CardContent>
+    </Card>
   );
 }
