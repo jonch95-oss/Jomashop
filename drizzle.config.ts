@@ -1,22 +1,10 @@
-node_modules/
-dist/
-.vite/
+import { defineConfig } from "drizzle-kit";
 
-# SQLite database files — never commit; exposes demo data at rest
-data.db
-data.db-shm
-data.db-wal
-data.db-journal
-
-.env
-.env.*
-!.env.example
-
-*.log
-.DS_Store
-
-# App-generated
-data.db
-data.db-shm
-data.db-wal
-.env
+export default defineConfig({
+  out: "./migrations",
+  schema: "./shared/schema.ts",
+  dialect: "sqlite",
+  dbCredentials: {
+    url: "./data.db",
+  },
+});

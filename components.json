@@ -1,33 +1,20 @@
-# ----------------------------------------------------------------------------
-# LuxeSupply × Jomashop integration — environment variables
-# ----------------------------------------------------------------------------
-# Copy to .env and fill in. NEVER commit .env. NEVER paste secrets in chat.
-# After deploy, set the same values in your hosting platform's secret manager.
-# ----------------------------------------------------------------------------
-
-# App
-NODE_ENV=development
-PORT=5000
-# Public URL of this app. MUST be HTTPS in production. Used to derive the
-# Shopify redirect URL and to render copy-paste setup helpers.
-APP_URL=https://your-deployed-app.example.com
-# Random 32+ char string used for any future signed-cookie or HMAC helpers.
-SESSION_SECRET=replace-me-with-32-random-bytes
-# Random 32+ char string required to unlock /api/* routes in production.
-# Send requests with: Authorization: Bearer <ADMIN_TOKEN>
-ADMIN_TOKEN=
-
-# Shopify Dev Dashboard app (LuxeSupply / luxesupply.com)
-SHOPIFY_CLIENT_ID=
-SHOPIFY_CLIENT_SECRET=
-# Same value as APP_URL above — Shopify validates exact match against the
-# App URL field in the Dev Dashboard.
-SHOPIFY_APP_URL=https://your-deployed-app.example.com
-# Comma-separated list. Defaults to read/write across products, inventory,
-# orders, locations, and fulfillment.
-SHOPIFY_SCOPES=read_products,write_products,read_inventory,write_inventory,read_orders,write_orders,read_locations,read_fulfillments,write_fulfillments,read_assigned_fulfillment_orders,write_assigned_fulfillment_orders
-
-# Jomashop Vendor API
-JOMASHOP_API_BASE_URL=https://api.vendor.jomashop.com
-JOMASHOP_EMAIL=
-JOMASHOP_PASSWORD=
+{
+  "$schema": "https://ui.shadcn.com/schema.json",
+  "style": "new-york",
+  "rsc": false,
+  "tsx": true,
+  "tailwind": {
+    "config": "tailwind.config.ts",
+    "css": "client/src/index.css",
+    "baseColor": "neutral",
+    "cssVariables": true,
+    "prefix": ""
+  },
+  "aliases": {
+    "components": "@/components",
+    "utils": "@/lib/utils",
+    "ui": "@/components/ui",
+    "lib": "@/lib",
+    "hooks": "@/hooks"
+  }
+}
