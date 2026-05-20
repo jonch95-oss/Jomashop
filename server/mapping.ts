@@ -58,6 +58,11 @@ export type MappedProduct = {
    *  (e.g. "SNEK" → "Sneakers"). The UI uses this as the prefilled value of
    *  the category override field. */
   suggested_category: string;
+  /** True when the Shopify category code is ambiguous (e.g. "WALL" for
+   *  wallets) and must not be silently mapped to a Supported category. The
+   *  UI shows "Jomashop category: needs verification" until the operator
+   *  picks one. */
+  ambiguous_category: boolean;
   vendor_sku: string;
   /** SKU used for the product/variant on Jomashop side. Currently equals
    *  vendor_sku, but kept separate so the UI can override it independently. */
@@ -126,8 +131,15 @@ export function inferCategory(p: ShopifyProduct): SupportedCategory | null {
     .join(" ")
     .toLowerCase();
 
-  if (/(handbag|bag|tote|clutch|crossbody|satchel|backpack|hobo)/.test(haystack)) return "Handbags";
-  if (/(shoe|sneaker|boot|loafer|heel|sandal|pump|moccasin|oxford|derby)/.test(haystack)) return "Shoes";
+  // Shoes
+  if (/(\bshoe|sneaker|boot|loafer|heel|sandal|pump|moccasin|oxford|derby)/.test(haystack)) return "Shoes";
+  // Handbags — be conservative: match clear handbag nouns, but NOT "wallet"
+  // (which only superficially looks like a small leather good — Jomashop
+  // classifies wallets separately and the operator must confirm the target
+  // category before push).
+  if (/(handbag|tote|clutch|crossbody|satchel|backpack|hobo|shoulder bag|top.?handle|\bbag\b)/.test(haystack)) {
+    return "Handbags";
+  }
   if (
     /(shirt|dress|jacket|coat|pant|trouser|sweater|hoodie|t-shirt|tee|blouse|skirt|jean|short|clothing|apparel)/.test(
       haystack,
@@ -140,6 +152,32 @@ export function inferCategory(p: ShopifyProduct): SupportedCategory | null {
     if (haystack.includes(c.toLowerCase())) return c;
   }
   return null;
+}
+
+/**
+ * Categories that we recognize as "small leather goods" (wallets, card
+ * holders, belts, etc.) — these are NOT automatically mapped to Handbags
+ * even though the operator may later choose to push them as such. We track
+ * them so the UI can render "needs Jomashop category verification".
+ */
+const SMALL_LEATHER_GOODS_CODES = new Set([
+  "wall",
+  "wallet",
+  "wallets",
+  "card",
+  "cardholder",
+  "card-holder",
+  "card_holder",
+  "belt",
+  "belts",
+  "keychain",
+  "pouch",
+]);
+
+export function isAmbiguousCategoryCode(rawCategory: string | null | undefined): boolean {
+  if (!rawCategory) return false;
+  const norm = rawCategory.toLowerCase().trim();
+  return SMALL_LEATHER_GOODS_CODES.has(norm);
 }
 
 /** Resolve option index for a named option, e.g. "Size" → option2. */
@@ -257,6 +295,32 @@ function parsePrice(s: string | undefined | null): number | null {
 }
 
 /**
+ * Normalize Shopify "Size Scale" values to the Jomashop `size_system` enum.
+ * Shopify shops commonly use long names ("USA", "European") where Jomashop
+ * expects 2-letter codes ("US", "EU"). Anything we don't recognize is
+ * returned untouched so the UI can show the raw value.
+ */
+function normalizeSizeSystem(raw: string): string {
+  const v = raw.trim().toUpperCase();
+  if (v === "USA" || v === "US" || v === "AMERICAN") return "US";
+  if (v === "EUR" || v === "EU" || v === "EUROPEAN") return "EU";
+  if (v === "UK" || v === "BRITISH" || v === "GB") return "UK";
+  if (v === "IT" || v === "ITALIAN") return "IT";
+  if (v === "FR" || v === "FRENCH") return "FR";
+  return raw;
+}
+
+/** Normalize gender values: "MENS"/"Men's"/"male" → "Men", etc. */
+function normalizeGender(raw: string): string {
+  const v = raw.trim().toLowerCase().replace(/['']s$/, "").replace(/s$/, "");
+  if (v === "men" || v === "male" || v === "man") return "Men";
+  if (v === "women" || v === "female" || v === "woman") return "Women";
+  if (v === "uni" || v === "unisex") return "Unisex";
+  if (v === "kid" || v === "child" || v === "children") return "Kids";
+  return raw;
+}
+
+/**
  * Map a Shopify product to a Jomashop product payload.
  * `properties` schema is either fetched live or falls back to FALLBACK_CATEGORY_SCHEMAS.
  */
@@ -313,6 +377,12 @@ export function mapShopifyToJomashop(
   const properties: Record<string, string | number | boolean | null> = {};
   const missingRequiredProps: string[] = [];
   for (const prop of schemaProperties) {
+    // Defensive: schema entries with an empty/undefined field name are
+    // surfaced as "Needs category verification" rather than emitted as a
+    // property keyed "undefined".
+    if (!prop || typeof prop.field !== "string" || prop.field.trim() === "" || prop.field === "undefined") {
+      continue;
+    }
     let value: string | undefined | null = readMetafield(product, prop.field);
 
     if (!value) {
@@ -335,47 +405,97 @@ export function mapShopifyToJomashop(
           value = product.title;
           break;
         case "color":
-          if (colorOpt && firstVariant) {
+          value = readMetafieldAny(product, ["Color", "color", "colour", "custom.color", "luxe.color"]);
+          if (!value && colorOpt && firstVariant) {
             value = (firstVariant[colorOpt] as string | null) || undefined;
           }
           break;
         case "size":
-          if (sizeOpt && firstVariant) {
+          value = readMetafieldAny(product, ["Size", "size", "custom.size", "luxe.size"]);
+          if (!value && sizeOpt && firstVariant) {
             value = (firstVariant[sizeOpt] as string | null) || undefined;
           }
           break;
-        case "size_system":
-          value = readMetafield(product, "size_system") || "US";
+        case "size_system": {
+          const raw =
+            readMetafieldAny(product, [
+              "size_system",
+              "Size Scale",
+              "size_scale",
+              "custom.size_scale",
+              "luxe.size_scale",
+            ]) || "US";
+          value = normalizeSizeSystem(raw);
           break;
+        }
         case "gender":
           value =
-            readMetafield(product, "gender") ||
+            readMetafieldAny(product, ["Gender", "gender", "custom.gender", "luxe.gender"]) ||
             (Array.isArray(product.tags) ? product.tags : (product.tags || "").split(","))
               .map((t) => t.trim())
-              .find((t) => /^(Men|Women|Unisex|Kids)$/i.test(t));
+              .find((t) => /^(Men|Mens|Women|Womens|Unisex|Kids)$/i.test(t));
+          if (value) value = normalizeGender(value);
           break;
         case "material":
-          value = readMetafield(product, "material");
+          // Shopify often stores fabric/material under the "Composition"
+          // metafield label. Treat composition/material as interchangeable
+          // for the Jomashop "material" field.
+          value = readMetafieldAny(product, [
+            "material",
+            "Material",
+            "composition",
+            "Composition",
+            "custom.composition",
+            "luxe.composition",
+            "custom.material",
+            "luxe.material",
+          ]);
           break;
         case "style":
-          value = readMetafield(product, "style") || product.product_type;
+          value =
+            readMetafieldAny(product, ["style", "Style", "custom.style", "luxe.style"]) ||
+            product.product_type;
           break;
         case "category_type":
-          value = readMetafield(product, "category_type") || product.product_type;
+          value =
+            readMetafieldAny(product, ["category_type", "Category", "category"]) ||
+            product.product_type;
           break;
         case "country_of_origin":
-          value = readMetafield(product, "country_of_origin");
+          value = readMetafieldAny(product, [
+            "ff_country_of_origin",
+            "country_of_origin",
+            "Country of Origin",
+            "custom.ff_country_of_origin",
+            "luxe.ff_country_of_origin",
+            "custom.country_of_origin",
+            "luxe.country_of_origin",
+          ]);
           break;
         case "hardware":
-          value = readMetafield(product, "hardware");
+          value = readMetafieldAny(product, ["hardware", "Hardware"]);
           break;
         case "dimensions":
-          value = readMetafield(product, "dimensions");
+          value = readMetafieldAny(product, ["dimensions", "Dimensions"]);
           break;
         case "interior_material":
-          value = readMetafield(product, "interior_material");
+          value = readMetafieldAny(product, ["interior_material", "Interior Material"]);
+          break;
+        case "composition":
+          value = readMetafieldAny(product, [
+            "composition",
+            "Composition",
+            "material",
+            "Material",
+          ]);
           break;
       }
+    }
+
+    // Treat the literal string "undefined" as a missing value so the UI
+    // never renders e.g. `color: undefined missing`.
+    if (typeof value === "string" && value.trim().toLowerCase() === "undefined") {
+      value = undefined;
     }
 
     if (!value && prop.required) {
@@ -435,6 +555,13 @@ export function mapShopifyToJomashop(
     missingTopLevelFields.push("manufacturer_number");
   }
 
+  const ambiguousCategory = isAmbiguousCategoryCode(rawCategory);
+  if (ambiguousCategory) {
+    warnings.push(
+      `Shopify category code "${rawCategory}" is ambiguous (e.g. wallet/belt). Pick the correct Jomashop category before pushing.`,
+    );
+  }
+
   return {
     missing_required: missingRequiredProps,
     missing_top_level: missingTopLevelFields,
@@ -442,6 +569,7 @@ export function mapShopifyToJomashop(
     is_sample: sampleFixture,
     raw_category: rawCategory,
     suggested_category: suggestJomashopCategory(rawCategory, category),
+    ambiguous_category: ambiguousCategory,
     vendor_sku: vendorSku,
     sku: vendorSku,
     manufacturer_number: manufacturerNumber,
@@ -593,6 +721,9 @@ export function suggestJomashopCategory(
 ): string {
   if (!rawCategory) return fallback;
   const norm = rawCategory.toLowerCase().trim();
+  // Don't auto-classify ambiguous codes (wallets, belts, card holders) —
+  // surface the raw code so the operator picks the right Jomashop category.
+  if (SMALL_LEATHER_GOODS_CODES.has(norm)) return rawCategory;
   if (CATEGORY_CODE_MAP[norm]) return CATEGORY_CODE_MAP[norm];
   for (const [code, name] of Object.entries(CATEGORY_CODE_MAP)) {
     if (norm.includes(code)) return name;

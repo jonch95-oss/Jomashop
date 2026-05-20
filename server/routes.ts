@@ -539,18 +539,43 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       //   - category appears in the live Jomashop category list (or, when
       //     not available, surfaces a "Needs category verification" flag).
       //   - no "undefined" category property values present.
+      //   - category code is not flagged ambiguous (e.g. "WALL").
+      //   - category schema for this product was loaded from a live source
+      //     OR the fallback schema has known fields (never an empty/unknown
+      //     schema with undefined field names).
       const status = pushIndex.get(m.vendor_sku) || null;
-      const hasUndefinedProp = Object.values(m.properties).some(
-        (v) => v === undefined || (typeof v === "string" && v.trim().toLowerCase() === "undefined"),
+      const hasUndefinedProp = Object.entries(m.properties).some(
+        ([k, v]) =>
+          !k ||
+          k === "undefined" ||
+          v === undefined ||
+          (typeof v === "string" && v.trim().toLowerCase() === "undefined"),
       );
       const missingTopLevel = m.missing_top_level ?? [];
       const missingRequired = m.missing_required ?? [];
       const hasSku = Boolean(m.vendor_sku && m.vendor_sku.trim() !== "");
       const hasCategory = Boolean(m.category);
+      // A category schema is considered "loaded" when we have at least one
+      // schema property with a non-empty field name. Live schemas that come
+      // back malformed (or fallback schemas that haven't been seeded) end
+      // up as unknown and must not produce a "ready" verdict.
+      const schemaLoaded = Array.isArray(props) && props.some(
+        (p: any) => p && typeof p.field === "string" && p.field.trim() !== "" && p.field !== "undefined",
+      );
       let readiness: "ready" | "missing" | "needs-category-verification" | "rejected" | "sample" = "missing";
       if (m.is_sample) readiness = "sample";
       else if (status?.state === "rejected" || status?.state === "failed") readiness = "rejected";
-      else if (missingTopLevel.length > 0 || missingRequired.length > 0 || !hasSku || !hasCategory || hasUndefinedProp) {
+      else if (!schemaLoaded) {
+        readiness = "needs-category-verification";
+      } else if (m.ambiguous_category) {
+        readiness = "needs-category-verification";
+      } else if (
+        missingTopLevel.length > 0 ||
+        missingRequired.length > 0 ||
+        !hasSku ||
+        !hasCategory ||
+        hasUndefinedProp
+      ) {
         readiness = "missing";
       } else if (liveCategoryNames && liveCategoryNames.length > 0) {
         // The category override sent at push time may differ from the
@@ -558,7 +583,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         // m.suggested_category. Treat ready iff one of those is in the list.
         const proposed = (m.suggested_category || m.category || "").toLowerCase();
         const ok = liveCategoryNames.some((n) => n.toLowerCase() === proposed);
-        readiness = ok ? "ready" : "missing";
+        readiness = ok ? "ready" : "needs-category-verification";
       } else {
         readiness = "needs-category-verification";
       }

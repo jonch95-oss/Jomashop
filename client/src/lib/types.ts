@@ -55,6 +55,10 @@ export type MappedProduct = {
   is_sample?: boolean;
   raw_category?: string | null;
   suggested_category?: string;
+  /** True when the Shopify category code is ambiguous (e.g. "WALL"). UI
+   *  surfaces "Jomashop category: needs verification" until the operator
+   *  picks one. */
+  ambiguous_category?: boolean;
   vendor_sku: string;
   sku?: string;
   manufacturer_number?: string | null;

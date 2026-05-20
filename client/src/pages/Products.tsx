@@ -84,8 +84,12 @@ type ProductFilter =
 
 function missingFieldsFor(p: MappedProduct): string[] {
   const out = new Set<string>();
-  for (const f of p.missing_top_level || []) out.add(f);
-  for (const f of p.missing_required || []) out.add(f);
+  for (const f of p.missing_top_level || []) {
+    if (f && f !== "undefined") out.add(f);
+  }
+  for (const f of p.missing_required || []) {
+    if (f && f !== "undefined") out.add(f);
+  }
   return Array.from(out);
 }
 
@@ -96,6 +100,37 @@ function pushStateOf(p: MappedProduct): "pushed" | "rejected" | "failed" | "not_
 function isReady(p: MappedProduct): boolean {
   // Server-side readiness is the single source of truth. UI just reflects it.
   return p.readiness === "ready";
+}
+
+/**
+ * True when the product should NOT be pushable from the row-level button.
+ * Sample fixtures, products with missing fields, and products whose
+ * Jomashop category needs verification all block the row-level push so the
+ * operator must open the modal and supply overrides explicitly.
+ */
+function isPushBlocked(p: MappedProduct): boolean {
+  if (p.is_sample) return true;
+  if (p.readiness === "ready") return false;
+  // "rejected" rows can still be retried via the modal; we surface them
+  // through the modal flow rather than the row button so the operator has
+  // to acknowledge the prior failure first.
+  return true;
+}
+
+/** Human label for a property whose schema field name was missing. */
+function displayPropertyKey(k: string | null | undefined): string {
+  if (!k || k === "undefined" || k.trim() === "") return "needs category verification";
+  return k;
+}
+
+/** Human label for a property value (avoids ever showing "undefined missing"). */
+function displayPropertyValue(v: unknown): { label: string; tone: "ok" | "missing" } {
+  if (v === null || v === undefined) return { label: "missing", tone: "missing" };
+  if (typeof v === "string" && v.trim().toLowerCase() === "undefined") {
+    return { label: "missing", tone: "missing" };
+  }
+  if (typeof v === "string" && v.trim() === "") return { label: "missing", tone: "missing" };
+  return { label: String(v), tone: "ok" };
 }
 
 function formatTime(ts?: number | null): string {
@@ -535,15 +570,23 @@ export default function Products() {
                           onClick={() => openPushModal(idx, p)}
                           size="sm"
                           variant="default"
-                          disabled={p.is_sample}
-                          title={p.is_sample ? "Sample/demo product — cannot be pushed" : undefined}
+                          disabled={isPushBlocked(p)}
+                          title={
+                            p.is_sample
+                              ? "Sample/demo product — cannot be pushed"
+                              : p.readiness === "ready"
+                                ? undefined
+                                : "Fix mapping first — required fields, category, or schema missing"
+                          }
                         >
                           <Send className="mr-2 h-3.5 w-3.5" />
                           {p.is_sample
                             ? "Push disabled (sample)"
-                            : state === "pushed"
-                              ? "Update on Jomashop"
-                              : "Push to Jomashop"}
+                            : p.readiness !== "ready"
+                              ? "Fix mapping first"
+                              : state === "pushed"
+                                ? "Update on Jomashop"
+                                : "Push to Jomashop"}
                         </Button>
                       </div>
                     </CardHeader>
@@ -559,10 +602,37 @@ export default function Products() {
                           </div>
                         )}
                         <div className="mt-2 text-[10px] uppercase tracking-wider text-muted-foreground">Category mapping</div>
-                        <div className="mt-1 text-[11px]">
-                          <code className="font-mono">{p.raw_category || "—"}</code>
-                          {" → "}
-                          <code className="font-mono">{p.suggested_category || p.category}</code>
+                        <div className="mt-1 space-y-0.5 text-[11px]">
+                          <div>
+                            <span className="text-muted-foreground">Shopify code: </span>
+                            <code className="font-mono">{p.raw_category || "—"}</code>
+                          </div>
+                          <div>
+                            <span className="text-muted-foreground">Suggested: </span>
+                            <code className="font-mono">{p.suggested_category || p.category}</code>
+                          </div>
+                          <div>
+                            <span className="text-muted-foreground">Jomashop category: </span>
+                            {p.readiness === "ready" ? (
+                              <code
+                                className="font-mono text-emerald-600 dark:text-emerald-400"
+                                data-testid={`text-jomashop-category-${p.vendor_sku}`}
+                              >
+                                {p.suggested_category || p.category}
+                              </code>
+                            ) : (
+                              <span
+                                className="font-mono text-amber-600 dark:text-amber-400"
+                                data-testid={`text-jomashop-category-needs-verify-${p.vendor_sku}`}
+                              >
+                                {p.ambiguous_category
+                                  ? "needs verification (ambiguous code)"
+                                  : p.readiness === "needs-category-verification"
+                                    ? "needs verification (no schema loaded)"
+                                    : "needs verification"}
+                              </span>
+                            )}
+                          </div>
                         </div>
                         <div className="mt-3 text-[10px] uppercase tracking-wider text-muted-foreground">Shopify price</div>
                         <div className="mt-1 text-sm tabular-nums">
@@ -592,19 +662,35 @@ export default function Products() {
 
                       <div className="md:col-span-2">
                         <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Category properties</div>
-                        <div className="mt-2 grid grid-cols-1 gap-1.5 md:grid-cols-2">
-                          {Object.entries(p.properties).map(([k, v]) => (
-                            <div
-                              key={k}
-                              className="flex items-center justify-between rounded border border-border bg-card/40 px-2.5 py-1.5 text-xs"
-                            >
-                              <span className="font-mono text-muted-foreground">{k}</span>
-                              <span className={`ml-2 truncate font-mono ${v === null ? "text-amber-500/80" : ""}`}>
-                                {v === null ? "missing" : String(v)}
-                              </span>
-                            </div>
-                          ))}
-                        </div>
+                        {Object.entries(p.properties).filter(([k]) => k && k !== "undefined").length === 0 ? (
+                          <div className="mt-2 rounded border border-amber-500/40 bg-amber-500/5 px-2.5 py-1.5 text-xs text-amber-600 dark:text-amber-400">
+                            No Jomashop schema loaded for this category — needs category verification.
+                          </div>
+                        ) : (
+                          <div className="mt-2 grid grid-cols-1 gap-1.5 md:grid-cols-2">
+                            {Object.entries(p.properties)
+                              .filter(([k]) => k && k !== "undefined")
+                              .map(([k, v]) => {
+                                const display = displayPropertyValue(v);
+                                const isMissing = display.tone === "missing";
+                                return (
+                                  <div
+                                    key={k}
+                                    className="flex items-center justify-between rounded border border-border bg-card/40 px-2.5 py-1.5 text-xs"
+                                  >
+                                    <span className="font-mono text-muted-foreground">
+                                      {displayPropertyKey(k)}
+                                    </span>
+                                    <span
+                                      className={`ml-2 truncate font-mono ${isMissing ? "text-amber-500/80" : ""}`}
+                                    >
+                                      {display.label}
+                                    </span>
+                                  </div>
+                                );
+                              })}
+                          </div>
+                        )}
                       </div>
 
                       {p.warnings.length > 0 && (
@@ -671,10 +757,23 @@ export default function Products() {
                                       size="sm"
                                       variant="ghost"
                                       className="h-6 px-2 text-[10px]"
-                                      disabled={p.is_sample}
+                                      disabled={isPushBlocked(p)}
+                                      title={
+                                        p.is_sample
+                                          ? "Sample/demo — cannot be pushed"
+                                          : p.readiness === "ready"
+                                            ? undefined
+                                            : "Parent not ready — fix mapping first"
+                                      }
                                     >
                                       <Send className="mr-1 h-3 w-3" />
-                                      {state === "pushed" ? "Update" : "Push"}
+                                      {p.is_sample
+                                        ? "Disabled"
+                                        : p.readiness !== "ready"
+                                          ? "Fix first"
+                                          : state === "pushed"
+                                            ? "Update"
+                                            : "Push"}
                                     </Button>
                                   </td>
                                 </tr>
