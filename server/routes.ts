@@ -20,6 +20,7 @@ import {
   mapShopifyToJomashop,
   buildJomashopProductPayload,
   suggestJomashopCategory,
+  isSampleProduct,
   SAMPLE_SHOPIFY_PRODUCTS,
   type PushOverrides,
   type ShopifyProduct,
@@ -390,7 +391,20 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   // ---------- Sync previews ----------
   app.post("/api/sync/preview-products", async (req, res) => {
-    const products = (req.body?.products as ShopifyProduct[]) || SAMPLE_SHOPIFY_PRODUCTS;
+    const supplied = req.body?.products as ShopifyProduct[] | undefined;
+    const usingSamples = !Array.isArray(supplied) || supplied.length === 0;
+    const products = usingSamples ? SAMPLE_SHOPIFY_PRODUCTS : supplied!;
+
+    // Heuristic: a Shopify shop is considered "connected" when at least one
+    // store has an oauth status other than `pending` / `not_connected`.
+    const stores = storage.listStores();
+    const shopifyConnected =
+      stores.some(
+        (s) =>
+          s.oauthStatus &&
+          s.oauthStatus !== "pending" &&
+          s.oauthStatus !== "not_connected",
+      );
 
     // Pull schemas (live if available) for the three supported categories.
     const schemas: Record<SupportedCategory, any> = { Shoes: null, Handbags: null, Clothing: null };
@@ -412,7 +426,11 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       schemas,
       mapped,
       count: mapped.length,
-      note: "Preview only. No data was sent to Jomashop.",
+      usingSamples,
+      shopifyConnected,
+      note: usingSamples
+        ? "Sample fixtures only — connect Shopify and load live products before pushing to Jomashop."
+        : "Preview only. No data was sent to Jomashop.",
     });
   });
 
@@ -503,6 +521,23 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
     if (!body.product) {
       return res.status(400).json({ ok: false, error: "Missing `product` in request body." });
+    }
+    if (isSampleProduct(body.product)) {
+      storage.appendLog({
+        level: "warn",
+        message: "Push refused: sample/demo fixture cannot be pushed to Jomashop",
+        detailsJson: JSON.stringify({
+          productId: body.product.id,
+          variantSku: body.variantSku,
+        }),
+        createdAt: Date.now(),
+      });
+      return res.status(400).json({
+        ok: false,
+        error:
+          "This is sample/demo data. Connect Shopify and load a live product before pushing to Jomashop.",
+        isSample: true,
+      });
     }
     if (!jomashopConfigured()) {
       return res.status(503).json({

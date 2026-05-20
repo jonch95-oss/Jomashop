@@ -54,8 +54,17 @@ type PushResult = {
   stage?: string;
 };
 
+type PreviewData = {
+  mapped: MappedProduct[];
+  count: number;
+  schemas: any;
+  usingSamples?: boolean;
+  shopifyConnected?: boolean;
+  note?: string;
+};
+
 export default function Products() {
-  const [data, setData] = useState<{ mapped: MappedProduct[]; count: number; schemas: any } | null>(null);
+  const [data, setData] = useState<PreviewData | null>(null);
   const [pushTarget, setPushTarget] = useState<PushTarget | null>(null);
   const [pushResult, setPushResult] = useState<PushResult | null>(null);
   const [overrides, setOverrides] = useState<OverrideFields>({
@@ -156,7 +165,20 @@ export default function Products() {
   }
 
   const overrideBlanks = TOP_LEVEL_FIELDS.filter((k) => overrides[k].trim() === "");
-  const canConfirm = pushTarget !== null && overrideBlanks.length === 0 && !push.isPending;
+  const targetIsSample = pushTarget?.mapped.is_sample === true;
+  const canConfirm =
+    pushTarget !== null &&
+    overrideBlanks.length === 0 &&
+    !push.isPending &&
+    !targetIsSample;
+
+  const categorySelected = overrides.category.trim();
+  const categoryInLiveList =
+    categorySelected !== "" &&
+    categoryOptions.some(
+      (c) => c.toLowerCase() === categorySelected.toLowerCase(),
+    );
+  const categoriesAreLive = (categoriesQ.data as any)?.source === "live";
 
   return (
     <>
@@ -186,12 +208,49 @@ export default function Products() {
         />
       ) : (
         <div className="space-y-4">
+          {(data.usingSamples || !data.shopifyConnected) && (
+            <div
+              data-testid="banner-shopify-not-connected"
+              className="rounded-md border border-amber-500/50 bg-amber-500/10 p-3 text-xs text-amber-600 dark:text-amber-400"
+            >
+              <div className="flex items-center gap-2 font-medium">
+                <AlertTriangle className="h-3.5 w-3.5" />
+                Connect Shopify / load live products before pushing to Jomashop.
+              </div>
+              <div className="mt-1 text-[11px] text-amber-700/80 dark:text-amber-300/80">
+                {data.usingSamples
+                  ? "The rows below are SAMPLE FIXTURE products built into the app — the push button is disabled for them."
+                  : "No live Shopify products are loaded yet. Push will be disabled until at least one real product is fetched."}
+              </div>
+            </div>
+          )}
           {data.mapped.map((p, idx) => (
-            <Card key={`${p.vendor_sku}-${p.source.shopify_product_id}`} data-testid={`card-product-${p.vendor_sku}`}>
+            <Card
+              key={`${p.vendor_sku}-${p.source.shopify_product_id}`}
+              data-testid={`card-product-${p.vendor_sku}`}
+              className={p.is_sample ? "border-amber-500/40" : undefined}
+            >
               <CardHeader className="flex flex-row items-center justify-between border-b border-card-border">
                 <div className="flex items-center gap-3">
                   <CardTitle className="text-sm">{p.name}</CardTitle>
                   <Badge variant="outline" className="text-[10px] uppercase">{p.category}</Badge>
+                  {p.is_sample ? (
+                    <Badge
+                      data-testid={`badge-sample-${p.vendor_sku}`}
+                      className="bg-amber-500/15 text-[10px] uppercase text-amber-700 hover:bg-amber-500/20 dark:text-amber-400"
+                      variant="outline"
+                    >
+                      Sample data — push disabled
+                    </Badge>
+                  ) : (
+                    <Badge
+                      data-testid={`badge-live-${p.vendor_sku}`}
+                      className="bg-emerald-500/15 text-[10px] uppercase text-emerald-700 hover:bg-emerald-500/20 dark:text-emerald-400"
+                      variant="outline"
+                    >
+                      Live Shopify product
+                    </Badge>
+                  )}
                 </div>
                 <div className="flex items-center gap-3">
                   <code className="font-mono text-[11px] text-muted-foreground tabular-nums">{p.vendor_sku}</code>
@@ -200,9 +259,11 @@ export default function Products() {
                     onClick={() => openPushModal(idx, p)}
                     size="sm"
                     variant="default"
+                    disabled={p.is_sample}
+                    title={p.is_sample ? "Sample/demo product — cannot be pushed" : undefined}
                   >
                     <Send className="mr-2 h-3.5 w-3.5" />
-                    Push test product to Jomashop
+                    {p.is_sample ? "Push disabled (sample)" : "Push test product to Jomashop"}
                   </Button>
                 </div>
               </CardHeader>
@@ -313,6 +374,8 @@ export default function Products() {
                                 size="sm"
                                 variant="ghost"
                                 className="h-6 px-2 text-[10px]"
+                                disabled={p.is_sample}
+                                title={p.is_sample ? "Sample/demo product — cannot be pushed" : undefined}
                               >
                                 <Send className="mr-1 h-3 w-3" />
                                 Push
@@ -346,6 +409,18 @@ export default function Products() {
 
           {pushTarget && !pushResult && (
             <div className="space-y-3 text-xs">
+              <div
+                data-testid="banner-push-source"
+                className={`rounded border p-2 text-[11px] font-semibold uppercase tracking-wider ${
+                  targetIsSample
+                    ? "border-amber-500/50 bg-amber-500/10 text-amber-600 dark:text-amber-400"
+                    : "border-emerald-500/50 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+                }`}
+              >
+                {targetIsSample
+                  ? "Sample data — push disabled"
+                  : "Live Shopify product"}
+              </div>
               <div className="rounded border border-border bg-card/40 p-3">
                 <div className="mb-1 text-[10px] uppercase tracking-wider text-muted-foreground">
                   Product
@@ -386,24 +461,51 @@ export default function Products() {
                 <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
                   <div>
                     <Label htmlFor="ovr-category" className="text-[10px] uppercase">
-                      Category
+                      Category {categoriesAreLive ? "(live)" : "(fallback)"}
                     </Label>
-                    <Input
+                    <select
                       id="ovr-category"
-                      list="jomashop-categories"
+                      data-testid="select-override-category"
+                      value={
+                        categoryInLiveList || categorySelected === ""
+                          ? categorySelected
+                          : "__custom__"
+                      }
+                      onChange={(e) => {
+                        if (e.target.value === "__custom__") return;
+                        setOverrides((o) => ({ ...o, category: e.target.value }));
+                      }}
+                      className="flex h-8 w-full rounded-md border border-input bg-background px-2 font-mono text-xs"
+                    >
+                      <option value="">— select category —</option>
+                      {categoryOptions.map((c) => (
+                        <option key={c} value={c}>
+                          {c}
+                        </option>
+                      ))}
+                      {!categoryInLiveList && categorySelected !== "" && (
+                        <option value="__custom__">{categorySelected} (custom)</option>
+                      )}
+                    </select>
+                    <Input
                       data-testid="input-override-category"
                       value={overrides.category}
                       onChange={(e) =>
                         setOverrides((o) => ({ ...o, category: e.target.value }))
                       }
-                      placeholder="e.g. Sneakers"
-                      className="h-8 font-mono text-xs"
+                      placeholder="or type a category name"
+                      className="mt-1 h-7 font-mono text-[11px]"
                     />
-                    <datalist id="jomashop-categories">
-                      {categoryOptions.map((c) => (
-                        <option key={c} value={c} />
-                      ))}
-                    </datalist>
+                    {categorySelected !== "" && !categoryInLiveList && (
+                      <div
+                        data-testid="warning-category-not-in-list"
+                        className="mt-1 text-[10px] text-amber-500"
+                      >
+                        {categoriesAreLive
+                          ? "Warning: this category is not in the live Jomashop category list."
+                          : "Note: live categories not fetched — using fallback list."}
+                      </div>
+                    )}
                   </div>
                   <div>
                     <Label htmlFor="ovr-brand" className="text-[10px] uppercase">

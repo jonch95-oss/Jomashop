@@ -48,6 +48,7 @@ export type CategorySchema = {
 
 export type MappedProduct = {
   category: "Shoes" | "Handbags" | "Clothing";
+  is_sample?: boolean;
   raw_category?: string | null;
   suggested_category?: string;
   vendor_sku: string;

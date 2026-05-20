@@ -41,6 +41,10 @@ export type ShopifyProduct = {
 
 export type MappedProduct = {
   category: SupportedCategory;
+  /** True when this mapping was produced from a built-in demo fixture rather
+   *  than a real Shopify product. The UI uses this to block pushes and label
+   *  the row as sample data; the push endpoint refuses such products outright. */
+  is_sample: boolean;
   /** Free-form category label resolved from Shopify (raw vendor type/tag/metafield).
    *  Distinct from `category`, which is one of the SUPPORTED_CATEGORIES enum
    *  values. Surfaced so the UI can show what Shopify provided before the user
@@ -82,6 +86,31 @@ export type PushOverrides = {
   sku?: string;
   manufacturer_number?: string;
 };
+
+/**
+ * IDs reserved for built-in demo fixtures returned by SAMPLE_SHOPIFY_PRODUCTS.
+ * A product is considered "sample" when its id is in this set OR when the
+ * id has the shopify-1xxx pattern emitted by the fixture file. Sample
+ * products are surfaced as previews only — the push endpoint rejects them so
+ * the operator can never accidentally ship demo SKUs to Jomashop.
+ */
+export const SAMPLE_PRODUCT_IDS = new Set<string>([
+  "shopify-1001",
+  "shopify-1002",
+  "shopify-1003",
+]);
+
+export function isSampleProduct(p: ShopifyProduct): boolean {
+  if (!p) return false;
+  const id = p.id === undefined || p.id === null ? "" : String(p.id);
+  if (SAMPLE_PRODUCT_IDS.has(id)) return true;
+  if (/^shopify-1\d{3}$/.test(id)) return true;
+  const sku = (p.variants && p.variants[0]?.sku) || "";
+  if (/^(GG-ACE-WHT|YSL-LOULOU-NOIR|BB-VC-SHIRT)/i.test(String(sku))) return true;
+  const firstImg = (p.images && p.images[0]?.src) || "";
+  if (/cdn\.shopify\.com\/sample\//i.test(String(firstImg))) return true;
+  return false;
+}
 
 /** Infer the Jomashop category for a Shopify product. */
 export function inferCategory(p: ShopifyProduct): SupportedCategory | null {
@@ -238,10 +267,13 @@ export function mapShopifyToJomashop(
   const sizeOpt = resolveOption(product, ["size"]);
   const colorOpt = resolveOption(product, ["color", "colour"]);
 
+  const sampleFixture = isSampleProduct(product);
   const firstVariant = product.variants?.[0];
-  // SKU precedence: variant.sku → product/variant metafield ff_sku →
-  // generic sku/vendor_sku/manufacturer-style metafields → LX-<id> fallback.
-  const vendorSku =
+  // SKU precedence: real Shopify variant.sku → real ff_sku metafield →
+  // generic sku/vendor_sku metafields. No demo fallback is generated — if
+  // nothing real is found the SKU is left empty and the push endpoint will
+  // reject the payload at validation.
+  const resolvedSku =
     (firstVariant?.sku && firstVariant.sku.trim()) ||
     readMetafieldAny(product, [
       "ff_sku",
@@ -249,12 +281,17 @@ export function mapShopifyToJomashop(
       "custom.ff_sku",
       "sku",
       "vendor_sku",
-      "manufacturer_number",
-    ]) ||
-    (product.id ? `LX-${product.id}` : `LX-${Date.now()}`);
+    ]);
+  const vendorSku = resolvedSku || "";
+  if (!resolvedSku) {
+    warnings.push(
+      "No real SKU found — set variant.sku or a ff_sku/sku metafield. Push will be rejected.",
+    );
+  }
 
-  // manufacturer_number precedence: ff_designer_id (Shopify metafield used
-  // for designer/style numbers) → manufacturer_number → designer_id → SKU.
+  // manufacturer_number precedence: real ff_designer_id metafield →
+  // manufacturer_number / designer_id metafields → resolved SKU. Never a
+  // synthesized demo value.
   const manufacturerNumber =
     readMetafieldAny(product, [
       "ff_designer_id",
@@ -263,7 +300,8 @@ export function mapShopifyToJomashop(
       "manufacturer_number",
       "designer_id",
       "Designer Id",
-    ]) || vendorSku;
+    ]) ||
+    (resolvedSku ? resolvedSku : null);
 
   // Build a properties object using the category schema. For each schema
   // property we look first at metafields (namespaced), then at common Shopify
@@ -362,7 +400,7 @@ export function mapShopifyToJomashop(
     });
     const variantPrice = parsePrice(v.price);
     return {
-      vendor_sku: v.sku || `${vendorSku}-V${v.id ?? ""}`,
+      vendor_sku: (v.sku && v.sku.trim()) || (vendorSku ? `${vendorSku}-V${v.id ?? ""}` : ""),
       price: variantPrice,
       jomashop_price: computeJomashopPrice(variantPrice, commercialDiscount),
       quantity: v.inventory_quantity ?? 0,
@@ -382,6 +420,7 @@ export function mapShopifyToJomashop(
 
   return {
     category,
+    is_sample: sampleFixture,
     raw_category: rawCategory,
     suggested_category: suggestJomashopCategory(rawCategory, category),
     vendor_sku: vendorSku,
@@ -450,14 +489,15 @@ export function buildJomashopProductPayload(
 
   const sku =
     (overrides.sku && overrides.sku.trim()) ||
-    variant?.vendor_sku ||
-    mapped.sku ||
-    mapped.vendor_sku;
+    (variant?.vendor_sku && variant.vendor_sku.trim()) ||
+    (mapped.sku && mapped.sku.trim()) ||
+    (mapped.vendor_sku && mapped.vendor_sku.trim()) ||
+    "";
 
   const manufacturerNumber =
     (overrides.manufacturer_number && overrides.manufacturer_number.trim()) ||
-    mapped.manufacturer_number ||
-    sku;
+    (mapped.manufacturer_number && String(mapped.manufacturer_number).trim()) ||
+    (sku ? sku : "");
 
   const category =
     (overrides.category && overrides.category.trim()) || mapped.category;
