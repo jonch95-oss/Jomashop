@@ -31,6 +31,7 @@ import {
   MAPPER_VERSION,
 } from "./shopify";
 import { registerBulkRepairRoutes } from "./bulk_repair";
+import { registerCategoryMappingRoutes, lookupCategoryOverride } from "./category_mapping";
 import { registerWebhookRoutes, registerShopifyWebhooks } from "./webhooks";
 
 // -------------------- helpers --------------------
@@ -524,12 +525,25 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
 
     const mapped = products.map((p) => {
-      const cat = (mapShopifyToJomashop(p, []).category) as SupportedCategory;
+      const tmp = mapShopifyToJomashop(p, []);
+      // Apply operator-supplied category override (XLSX-driven). When set, the
+      // override pins the SupportedCategory used for schema resolution AND the
+      // suggested_category surfaced to the UI / readiness check. This is how a
+      // single mapping for "DRSH" → "Dress Shirts" flips every dress shirt to
+      // ready without a full Shopify re-pagination.
+      const override = lookupCategoryOverride(tmp.raw_category);
+      const cat = (override?.supportedCategory ?? tmp.category) as SupportedCategory;
       const schemaWrap = schemas[cat];
       const props =
         (schemaWrap?.schema?.properties as Array<any>) ||
         FALLBACK_CATEGORY_SCHEMAS[cat].map((f) => ({ field: f.field, required: f.required, type: f.type, options: f.options }));
-      const m = mapShopifyToJomashop(p, props);
+      const m = mapShopifyToJomashop(p, props, override?.supportedCategory ?? undefined);
+      if (override) {
+        m.suggested_category = override.jomashopCategory;
+        // An operator-supplied override resolves the "ambiguous" flag — they
+        // explicitly told us what this code maps to.
+        m.ambiguous_category = false;
+      }
 
       // Attach push status + readiness flag. Readiness is the stricter
       // signal the UI uses for the "Ready to push" filter:
@@ -1164,6 +1178,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   // ---------- Bulk repair workflow (XLSX export/import/apply/push) ----------
   registerBulkRepairRoutes(app);
+
+  // ---------- Category mapping workflow (Shopify code → Jomashop category) ----------
+  registerCategoryMappingRoutes(app);
 
   // ---------- Shopify webhooks (public, HMAC-verified) ----------
   registerWebhookRoutes(app);

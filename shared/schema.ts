@@ -59,6 +59,20 @@ export const categoryMappings = sqliteTable("category_mappings", {
   updatedAt: integer("updated_at").notNull(),
 });
 
+// ---------- Category override (operator-supplied Shopify code → Jomashop category) ----------
+// Saved by the Excel-driven category mapping workflow. Keyed by the lowercased
+// Shopify category code (product_type / `category` metafield, e.g. "drsh"). When
+// a product preview is built the override is looked up first and replaces the
+// inferred category, so a single mapping for "drsh" → "Dress Shirts" can flip
+// every dress shirt at once.
+export const categoryOverrides = sqliteTable("category_overrides", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  shopifyCategoryCode: text("shopify_category_code").notNull().unique(),
+  jomashopCategory: text("jomashop_category").notNull(),
+  notes: text("notes"),
+  updatedAt: integer("updated_at").notNull(),
+});
+
 // ---------- Sync jobs / logs ----------
 export const syncJobs = sqliteTable("sync_jobs", {
   id: integer("id").primaryKey({ autoIncrement: true }),
@@ -159,6 +173,7 @@ export const insertStoreSchema = createInsertSchema(stores).omit({ id: true });
 export const insertCredentialStatusSchema = createInsertSchema(credentialStatus).omit({ id: true });
 export const insertSkuMappingSchema = createInsertSchema(skuMappings).omit({ id: true });
 export const insertCategoryMappingSchema = createInsertSchema(categoryMappings).omit({ id: true });
+export const insertCategoryOverrideSchema = createInsertSchema(categoryOverrides).omit({ id: true });
 export const insertSyncJobSchema = createInsertSchema(syncJobs).omit({ id: true });
 export const insertSyncLogSchema = createInsertSchema(syncLogs).omit({ id: true });
 export const insertImportedOrderSchema = createInsertSchema(importedOrders).omit({ id: true });
@@ -175,6 +190,8 @@ export type SkuMapping = typeof skuMappings.$inferSelect;
 export type InsertSkuMapping = z.infer<typeof insertSkuMappingSchema>;
 export type CategoryMapping = typeof categoryMappings.$inferSelect;
 export type InsertCategoryMapping = z.infer<typeof insertCategoryMappingSchema>;
+export type CategoryOverride = typeof categoryOverrides.$inferSelect;
+export type InsertCategoryOverride = z.infer<typeof insertCategoryOverrideSchema>;
 export type SyncJob = typeof syncJobs.$inferSelect;
 export type InsertSyncJob = z.infer<typeof insertSyncJobSchema>;
 export type SyncLog = typeof syncLogs.$inferSelect;

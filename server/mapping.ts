@@ -199,6 +199,17 @@ export function isAmbiguousCategoryCode(rawCategory: string | null | undefined):
   return SMALL_LEATHER_GOODS_CODES.has(norm);
 }
 
+/**
+ * Canonical lookup key for a Shopify category code used by the operator-supplied
+ * override table. Lowercases and strips non-alphanumerics so "DRSH", "drsh",
+ * and "Dress-Shirts" can be matched without depending on the operator's exact
+ * casing in the uploaded XLSX.
+ */
+export function normalizeCategoryCode(raw: string | null | undefined): string {
+  if (!raw) return "";
+  return String(raw).toLowerCase().trim().replace(/[^a-z0-9]+/g, "");
+}
+
 /** Resolve option index for a named option, e.g. "Size" → option2. */
 function resolveOption(p: ShopifyProduct, names: string[]): "option1" | "option2" | "option3" | null {
   const opts = p.options || [];

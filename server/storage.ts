@@ -3,6 +3,7 @@ import {
   credentialStatus,
   skuMappings,
   categoryMappings,
+  categoryOverrides,
   syncJobs,
   syncLogs,
   importedOrders,
@@ -19,6 +20,8 @@ import type {
   InsertSkuMapping,
   CategoryMapping,
   InsertCategoryMapping,
+  CategoryOverride,
+  InsertCategoryOverride,
   SyncJob,
   InsertSyncJob,
   SyncLog,
@@ -77,6 +80,13 @@ sqlite.exec(`
     shopify_product_type TEXT NOT NULL UNIQUE,
     jomashop_category TEXT NOT NULL,
     field_map_json TEXT NOT NULL DEFAULT '{}',
+    updated_at INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS category_overrides (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    shopify_category_code TEXT NOT NULL UNIQUE,
+    jomashop_category TEXT NOT NULL,
+    notes TEXT,
     updated_at INTEGER NOT NULL
   );
   CREATE TABLE IF NOT EXISTS sync_jobs (
@@ -173,6 +183,12 @@ export interface IStorage {
   // Category mappings
   listCategoryMappings(): CategoryMapping[];
   upsertCategoryMapping(input: InsertCategoryMapping): CategoryMapping;
+
+  // Category overrides (Shopify code → Jomashop category, Excel-driven)
+  listCategoryOverrides(): CategoryOverride[];
+  getCategoryOverride(shopifyCategoryCode: string): CategoryOverride | undefined;
+  upsertCategoryOverride(input: InsertCategoryOverride): CategoryOverride;
+  deleteCategoryOverride(shopifyCategoryCode: string): void;
 
   // Sync jobs/logs
   createSyncJob(input: InsertSyncJob): SyncJob;
@@ -284,6 +300,34 @@ export class DatabaseStorage implements IStorage {
         .get();
     }
     return db.insert(categoryMappings).values(input).returning().get();
+  }
+
+  listCategoryOverrides(): CategoryOverride[] {
+    return db.select().from(categoryOverrides).all();
+  }
+  getCategoryOverride(shopifyCategoryCode: string): CategoryOverride | undefined {
+    return db
+      .select()
+      .from(categoryOverrides)
+      .where(eq(categoryOverrides.shopifyCategoryCode, shopifyCategoryCode))
+      .get();
+  }
+  upsertCategoryOverride(input: InsertCategoryOverride): CategoryOverride {
+    const existing = this.getCategoryOverride(input.shopifyCategoryCode);
+    if (existing) {
+      return db
+        .update(categoryOverrides)
+        .set({ ...input })
+        .where(eq(categoryOverrides.id, existing.id))
+        .returning()
+        .get();
+    }
+    return db.insert(categoryOverrides).values(input).returning().get();
+  }
+  deleteCategoryOverride(shopifyCategoryCode: string): void {
+    db.delete(categoryOverrides)
+      .where(eq(categoryOverrides.shopifyCategoryCode, shopifyCategoryCode))
+      .run();
   }
 
   createSyncJob(input: InsertSyncJob): SyncJob {

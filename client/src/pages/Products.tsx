@@ -17,6 +17,7 @@ import {
 import { PageHeader, EmptyState, LoadingRows } from "@/components/AppShell";
 import { apiRequest } from "@/lib/queryClient";
 import { BulkRepairCard } from "@/components/BulkRepair";
+import { CategoryMappingCard } from "@/components/CategoryMapping";
 import type { MappedProduct } from "@/lib/types";
 
 type OverrideFields = {
@@ -425,6 +426,8 @@ export default function Products() {
       ) : (
         <div className="space-y-4">
           {banner}
+
+          <CategoryMappingCard onAfterApply={() => refresh.mutate()} />
 
           <BulkRepairCard onAfterApply={() => refresh.mutate()} />
 
