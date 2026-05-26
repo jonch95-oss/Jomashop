@@ -267,6 +267,89 @@ export const ORDER_STATUSES = [
 ] as const;
 export type OrderStatus = (typeof ORDER_STATUSES)[number];
 
+// Conservative allowed-value lists for Apparel "Apparel Type" / "Article"
+// and "Country of Origin" fields. These mirror the values Jomashop accepts on
+// its live /i1 Apparel category — a free-text submission that isn't in this
+// list is rejected with "Article is not included in the list" /
+// "Country of origin is not included in the list".
+//
+// The lists are intentionally conservative: they include the apparel
+// sub-types and countries the catalog has historically accepted. If a live
+// schema response is available (via /i1/categories/:id) it ALWAYS takes
+// precedence — these lists exist purely as a safety net so the bundled
+// fallback never sends free-text into an enum-only field.
+const APPAREL_TYPE_OPTIONS_INTERNAL = [
+  "Outerwear",
+  "Jackets",
+  "Coats",
+  "Vests",
+  "Blazers",
+  "Suits",
+  "Tuxedos",
+  "Pants",
+  "Jeans",
+  "Shorts",
+  "Sweatpants",
+  "Joggers",
+  "Leggings",
+  "Skirts",
+  "Dresses",
+  "Jumpsuits",
+  "Bodysuits",
+  "Shirts",
+  "Dress Shirts",
+  "T-Shirts",
+  "Polo Shirts",
+  "Tank Tops",
+  "Tops",
+  "Blouses",
+  "Sweaters",
+  "Sweatshirts",
+  "Hoodies",
+  "Pullovers",
+  "Activewear",
+  "Swimwear",
+  "Underwear",
+  "Bras",
+  "Socks",
+  "Pajamas",
+  "Robes",
+  "Capes",
+  "Scarves",
+  "Hats",
+  "Cummerbunds",
+  "Headwear",
+  "Masks",
+];
+
+const COUNTRY_OF_ORIGIN_OPTIONS_INTERNAL = [
+  "Italy",
+  "France",
+  "USA",
+  "United States",
+  "Spain",
+  "Portugal",
+  "Switzerland",
+  "Germany",
+  "United Kingdom",
+  "UK",
+  "China",
+  "Japan",
+  "Vietnam",
+  "Romania",
+  "Turkey",
+  "India",
+  "Thailand",
+  "Bangladesh",
+  "Sri Lanka",
+  "Indonesia",
+  "Mexico",
+  "Brazil",
+  "Cambodia",
+  "Tunisia",
+  "Bulgaria",
+];
+
 // Static fallback schema used when /i1/categories/:id cannot be reached.
 // The app prefers fetching live category schemas from Jomashop, but when the
 // live lookup fails these are used as a last-resort source of EXACT property
@@ -275,23 +358,90 @@ export type OrderStatus = (typeof ORDER_STATUSES)[number];
 // push at preflight rather than producing a payload Jomashop will reject
 // (the rejected /i1 endpoint requires Title Case labels and forbids the
 // legacy lowercase fields).
-export const FALLBACK_CATEGORY_SCHEMAS: Record<
-  SupportedCategory,
-  { field: string; type: "string" | "number" | "enum" | "boolean"; required: boolean; options?: string[]; example?: string }[]
-> = {
+//
+// Per-field flags:
+//   - required: schema-required by Jomashop. Missing → preflight 422.
+//   - options: allowed enum values. A canonical value not in this list is
+//     coerced to a matching option if possible; otherwise behaviour depends
+//     on `allow_omit` below.
+//   - allow_omit: when true (and the field is not required), the payload
+//     OMITS the key entirely if no value can be safely mapped. Used for
+//     fields Jomashop accepts an absent key for but rejects a wrong value
+//     (e.g. Apparel Material — Jomashop demands a specific enum list and
+//     rejects free-text material strings with "Material must be blank").
+//   - omit_when_unknown_enum: when true and the canonical value can't be
+//     coerced to any of `options`, the field is dropped from the payload
+//     rather than sent with an invalid value. Used to avoid Jomashop's
+//     "X is not included in the list" rejections for optional fields.
+export type FallbackPropertyDef = {
+  field: string;
+  type: "string" | "number" | "enum" | "boolean";
+  required: boolean;
+  options?: string[];
+  example?: string;
+  allow_omit?: boolean;
+  omit_when_unknown_enum?: boolean;
+};
+
+export const FALLBACK_CATEGORY_SCHEMAS: Record<SupportedCategory, FallbackPropertyDef[]> = {
   // ----- Apparel (Title Case Jomashop labels per /i1/categories/Apparel) -----
+  // Gender accepts only Men/Women/Unisex on the live Jomashop Apparel schema —
+  // "Kids" is rejected ("Gender is not included in the list"). Kids products
+  // route through Age=Kids with Gender mapped to Unisex (or omitted).
+  // Material is REJECTED for Apparel ("Material must be blank") so it is
+  // deliberately absent from this schema. The schema-driven payload builder
+  // refuses to send keys not in the schema for the category, so Material
+  // simply never reaches Jomashop for Apparel pushes.
+  // Article carries Jomashop's accepted apparel-type list. A canonical value
+  // that doesn't match (e.g. "Canada Goose Kids Black Outerwear") is dropped
+  // rather than sent verbatim — Jomashop rejects free-text Article values
+  // with "Article is not included in the list".
+  // Country of Origin carries the published Jomashop country list. Values
+  // outside the list (e.g. "Canada", which Jomashop rejected) are dropped
+  // via omit_when_unknown_enum so the push isn't blocked.
   Apparel: [
-    { field: "Gender", type: "enum", required: true, options: ["Men", "Women", "Unisex", "Kids"] },
+    {
+      field: "Gender",
+      type: "enum",
+      required: true,
+      options: ["Men", "Women", "Unisex"],
+      omit_when_unknown_enum: false,
+    },
     { field: "Age", type: "enum", required: true, options: ["Adult", "Kids"] },
-    { field: "Apparel Type", type: "string", required: true },
+    {
+      field: "Apparel Type",
+      type: "enum",
+      required: true,
+      options: APPAREL_TYPE_OPTIONS_INTERNAL,
+    },
     { field: "Detailed Description", type: "string", required: true },
     { field: "Total Number of Pieces", type: "string", required: true, example: "1" },
     { field: "Color", type: "string", required: true },
-    { field: "Article", type: "string", required: false },
-    { field: "Apparel Size Type", type: "enum", required: false, options: ["US", "EU", "UK", "IT", "FR"] },
-    { field: "Apparel Size", type: "string", required: false },
-    { field: "Material", type: "string", required: false },
-    { field: "Country of Origin", type: "string", required: false },
+    {
+      field: "Article",
+      type: "enum",
+      required: false,
+      options: APPAREL_TYPE_OPTIONS_INTERNAL,
+      allow_omit: true,
+      omit_when_unknown_enum: true,
+    },
+    {
+      field: "Apparel Size Type",
+      type: "enum",
+      required: false,
+      options: ["US", "EU", "UK", "IT", "FR"],
+      allow_omit: true,
+      omit_when_unknown_enum: true,
+    },
+    { field: "Apparel Size", type: "string", required: false, allow_omit: true },
+    {
+      field: "Country of Origin",
+      type: "enum",
+      required: false,
+      options: COUNTRY_OF_ORIGIN_OPTIONS_INTERNAL,
+      allow_omit: true,
+      omit_when_unknown_enum: true,
+    },
   ],
   // ----- Footwear -----
   Footwear: [
@@ -299,80 +449,150 @@ export const FALLBACK_CATEGORY_SCHEMAS: Record<
     { field: "Shoe Size", type: "string", required: true },
     { field: "Shoe Size Type", type: "enum", required: true, options: ["US", "EU", "UK", "IT", "FR"] },
     { field: "Color", type: "string", required: true },
-    { field: "Material", type: "string", required: false },
-    { field: "Style", type: "string", required: false },
-    { field: "Country of Origin", type: "string", required: false },
+    { field: "Material", type: "string", required: false, allow_omit: true },
+    { field: "Style", type: "string", required: false, allow_omit: true },
+    {
+      field: "Country of Origin",
+      type: "enum",
+      required: false,
+      options: COUNTRY_OF_ORIGIN_OPTIONS_INTERNAL,
+      allow_omit: true,
+      omit_when_unknown_enum: true,
+    },
   ],
   // ----- Handbags -----
   Handbags: [
     { field: "Color", type: "string", required: true, example: "Noir" },
     { field: "Material", type: "string", required: true, example: "Calfskin leather" },
-    { field: "Style", type: "enum", required: false, options: ["Shoulder", "Tote", "Crossbody", "Clutch", "Backpack", "Top-handle"] },
-    { field: "Hardware", type: "enum", required: false, options: ["Gold", "Silver", "Gunmetal", "Mixed"] },
-    { field: "Interior Material", type: "string", required: false },
-    { field: "Dimensions", type: "string", required: false },
-    { field: "Country of Origin", type: "string", required: false },
+    { field: "Style", type: "enum", required: false, options: ["Shoulder", "Tote", "Crossbody", "Clutch", "Backpack", "Top-handle"], allow_omit: true, omit_when_unknown_enum: true },
+    { field: "Hardware", type: "enum", required: false, options: ["Gold", "Silver", "Gunmetal", "Mixed"], allow_omit: true, omit_when_unknown_enum: true },
+    { field: "Interior Material", type: "string", required: false, allow_omit: true },
+    { field: "Dimensions", type: "string", required: false, allow_omit: true },
+    {
+      field: "Country of Origin",
+      type: "enum",
+      required: false,
+      options: COUNTRY_OF_ORIGIN_OPTIONS_INTERNAL,
+      allow_omit: true,
+      omit_when_unknown_enum: true,
+    },
   ],
   // ----- Accessories (wallets/belts/cardholders) -----
   Accessories: [
-    { field: "Gender", type: "enum", required: false, options: ["Men", "Women", "Unisex", "Kids"] },
+    { field: "Gender", type: "enum", required: false, options: ["Men", "Women", "Unisex", "Kids"], allow_omit: true, omit_when_unknown_enum: true },
     { field: "Color", type: "string", required: true },
-    { field: "Material", type: "string", required: false },
-    { field: "Style", type: "string", required: false },
-    { field: "Country of Origin", type: "string", required: false },
+    { field: "Material", type: "string", required: false, allow_omit: true },
+    { field: "Style", type: "string", required: false, allow_omit: true },
+    {
+      field: "Country of Origin",
+      type: "enum",
+      required: false,
+      options: COUNTRY_OF_ORIGIN_OPTIONS_INTERNAL,
+      allow_omit: true,
+      omit_when_unknown_enum: true,
+    },
   ],
   // ----- Eyewear -----
   Eyewear: [
     { field: "Gender", type: "enum", required: true, options: ["Men", "Women", "Unisex", "Kids"] },
     { field: "Frame Color", type: "string", required: true },
-    { field: "Lens Color", type: "string", required: false },
-    { field: "Frame Material", type: "string", required: false },
-    { field: "Country of Origin", type: "string", required: false },
+    { field: "Lens Color", type: "string", required: false, allow_omit: true },
+    { field: "Frame Material", type: "string", required: false, allow_omit: true },
+    {
+      field: "Country of Origin",
+      type: "enum",
+      required: false,
+      options: COUNTRY_OF_ORIGIN_OPTIONS_INTERNAL,
+      allow_omit: true,
+      omit_when_unknown_enum: true,
+    },
   ],
   // ----- Jewelry sub-categories — Rings -----
   Rings: [
     { field: "Gender", type: "enum", required: true, options: ["Men", "Women", "Unisex"] },
     { field: "Metal", type: "string", required: true },
-    { field: "Ring Size", type: "string", required: false },
-    { field: "Stone", type: "string", required: false },
-    { field: "Country of Origin", type: "string", required: false },
+    { field: "Ring Size", type: "string", required: false, allow_omit: true },
+    { field: "Stone", type: "string", required: false, allow_omit: true },
+    {
+      field: "Country of Origin",
+      type: "enum",
+      required: false,
+      options: COUNTRY_OF_ORIGIN_OPTIONS_INTERNAL,
+      allow_omit: true,
+      omit_when_unknown_enum: true,
+    },
   ],
   // ----- Necklaces -----
   Necklaces: [
     { field: "Gender", type: "enum", required: true, options: ["Men", "Women", "Unisex"] },
     { field: "Metal", type: "string", required: true },
-    { field: "Length", type: "string", required: false },
-    { field: "Stone", type: "string", required: false },
-    { field: "Country of Origin", type: "string", required: false },
+    { field: "Length", type: "string", required: false, allow_omit: true },
+    { field: "Stone", type: "string", required: false, allow_omit: true },
+    {
+      field: "Country of Origin",
+      type: "enum",
+      required: false,
+      options: COUNTRY_OF_ORIGIN_OPTIONS_INTERNAL,
+      allow_omit: true,
+      omit_when_unknown_enum: true,
+    },
   ],
   // ----- Bracelets -----
   Bracelets: [
     { field: "Gender", type: "enum", required: true, options: ["Men", "Women", "Unisex"] },
     { field: "Metal", type: "string", required: true },
-    { field: "Length", type: "string", required: false },
-    { field: "Stone", type: "string", required: false },
-    { field: "Country of Origin", type: "string", required: false },
+    { field: "Length", type: "string", required: false, allow_omit: true },
+    { field: "Stone", type: "string", required: false, allow_omit: true },
+    {
+      field: "Country of Origin",
+      type: "enum",
+      required: false,
+      options: COUNTRY_OF_ORIGIN_OPTIONS_INTERNAL,
+      allow_omit: true,
+      omit_when_unknown_enum: true,
+    },
   ],
   // ----- Earrings -----
   Earrings: [
     { field: "Gender", type: "enum", required: true, options: ["Men", "Women", "Unisex"] },
     { field: "Metal", type: "string", required: true },
-    { field: "Stone", type: "string", required: false },
-    { field: "Country of Origin", type: "string", required: false },
+    { field: "Stone", type: "string", required: false, allow_omit: true },
+    {
+      field: "Country of Origin",
+      type: "enum",
+      required: false,
+      options: COUNTRY_OF_ORIGIN_OPTIONS_INTERNAL,
+      allow_omit: true,
+      omit_when_unknown_enum: true,
+    },
   ],
   // ----- Pins & Brooches -----
   "Pins & Brooches": [
     { field: "Metal", type: "string", required: true },
     { field: "Color", type: "string", required: true },
-    { field: "Stone", type: "string", required: false },
-    { field: "Country of Origin", type: "string", required: false },
+    { field: "Stone", type: "string", required: false, allow_omit: true },
+    {
+      field: "Country of Origin",
+      type: "enum",
+      required: false,
+      options: COUNTRY_OF_ORIGIN_OPTIONS_INTERNAL,
+      allow_omit: true,
+      omit_when_unknown_enum: true,
+    },
   ],
   // ----- Home Decor -----
   "Home Decor": [
     { field: "Color", type: "string", required: true },
-    { field: "Material", type: "string", required: false },
-    { field: "Dimensions", type: "string", required: false },
-    { field: "Country of Origin", type: "string", required: false },
+    { field: "Material", type: "string", required: false, allow_omit: true },
+    { field: "Dimensions", type: "string", required: false, allow_omit: true },
+    {
+      field: "Country of Origin",
+      type: "enum",
+      required: false,
+      options: COUNTRY_OF_ORIGIN_OPTIONS_INTERNAL,
+      allow_omit: true,
+      omit_when_unknown_enum: true,
+    },
   ],
   // ----- Legacy buckets kept for backward compatibility -----
   // Shoes / Clothing predate the strict-label rewrite and are aliased to the
@@ -383,20 +603,57 @@ export const FALLBACK_CATEGORY_SCHEMAS: Record<
     { field: "Shoe Size", type: "string", required: true },
     { field: "Shoe Size Type", type: "enum", required: true, options: ["US", "EU", "UK", "IT", "FR"] },
     { field: "Color", type: "string", required: true },
-    { field: "Material", type: "string", required: false },
-    { field: "Country of Origin", type: "string", required: false },
+    { field: "Material", type: "string", required: false, allow_omit: true },
+    {
+      field: "Country of Origin",
+      type: "enum",
+      required: false,
+      options: COUNTRY_OF_ORIGIN_OPTIONS_INTERNAL,
+      allow_omit: true,
+      omit_when_unknown_enum: true,
+    },
   ],
   Clothing: [
-    { field: "Gender", type: "enum", required: true, options: ["Men", "Women", "Unisex", "Kids"] },
+    {
+      field: "Gender",
+      type: "enum",
+      required: true,
+      options: ["Men", "Women", "Unisex"],
+    },
     { field: "Age", type: "enum", required: true, options: ["Adult", "Kids"] },
-    { field: "Apparel Type", type: "string", required: true },
+    {
+      field: "Apparel Type",
+      type: "enum",
+      required: true,
+      options: APPAREL_TYPE_OPTIONS_INTERNAL,
+    },
     { field: "Detailed Description", type: "string", required: true },
     { field: "Total Number of Pieces", type: "string", required: true, example: "1" },
     { field: "Color", type: "string", required: true },
-    { field: "Article", type: "string", required: false },
-    { field: "Apparel Size Type", type: "enum", required: false, options: ["US", "EU", "UK", "IT", "FR"] },
-    { field: "Apparel Size", type: "string", required: false },
-    { field: "Material", type: "string", required: false },
-    { field: "Country of Origin", type: "string", required: false },
+    {
+      field: "Article",
+      type: "enum",
+      required: false,
+      options: APPAREL_TYPE_OPTIONS_INTERNAL,
+      allow_omit: true,
+      omit_when_unknown_enum: true,
+    },
+    {
+      field: "Apparel Size Type",
+      type: "enum",
+      required: false,
+      options: ["US", "EU", "UK", "IT", "FR"],
+      allow_omit: true,
+      omit_when_unknown_enum: true,
+    },
+    { field: "Apparel Size", type: "string", required: false, allow_omit: true },
+    {
+      field: "Country of Origin",
+      type: "enum",
+      required: false,
+      options: COUNTRY_OF_ORIGIN_OPTIONS_INTERNAL,
+      allow_omit: true,
+      omit_when_unknown_enum: true,
+    },
   ],
 };

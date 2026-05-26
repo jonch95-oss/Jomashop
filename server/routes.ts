@@ -1010,6 +1010,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             required: f.required,
             type: f.type,
             options: f.options,
+            allow_omit: f.allow_omit,
+            omit_when_unknown_enum: f.omit_when_unknown_enum,
           }))
         : [];
       const bundledIsExactForCat =
@@ -1766,6 +1768,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         required: f.required,
         type: f.type,
         options: f.options,
+        allow_omit: f.allow_omit,
+        omit_when_unknown_enum: f.omit_when_unknown_enum,
       }));
 
     let mapped = mapShopifyToJomashop(body.product, props, body.forcedCategory);
@@ -1869,6 +1873,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         required: f.required,
         type: f.type,
         options: f.options,
+        allow_omit: f.allow_omit,
+        omit_when_unknown_enum: f.omit_when_unknown_enum,
       }));
       mapped = mapShopifyToJomashop(body.product, bundledProps, body.forcedCategory);
       ({ payload, variant, missingRequired, missingTopLevel, pushDebug } =
@@ -2028,6 +2034,55 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       });
     }
 
+    // Preflight: refuse the push when a REQUIRED schema field has an enum
+    // value that doesn't match Jomashop's accepted list. We surface the
+    // exact property, the source value we tried to send, and the accepted
+    // options so the operator can fix the metafield or add a mapping
+    // without burning a Jomashop rejection round-trip.
+    const blockingInvalidEnums = (pushDebug.invalidEnums || []).filter((inv) =>
+      missingRequired.includes(inv.field),
+    );
+    if (blockingInvalidEnums.length > 0) {
+      const detail = blockingInvalidEnums
+        .map(
+          (inv) =>
+            `${inv.field}: "${inv.value}" is not accepted (allowed: ${inv.options.slice(0, 12).join(", ")}${inv.options.length > 12 ? ", …" : ""})`,
+        )
+        .join("; ");
+      storage.updateSyncJob(job.id, {
+        status: "failed",
+        finishedAt: Date.now(),
+        errorItems: 1,
+        summary: `Preflight enum: ${detail.slice(0, 120)}`,
+      });
+      storage.appendLog({
+        jobId: job.id,
+        level: "error",
+        message: `Push aborted before API call: invalid enum value(s) for ${payload.sku ?? mapped.vendor_sku}`,
+        detailsJson: JSON.stringify({
+          blockingInvalidEnums,
+          allInvalidEnums: pushDebug.invalidEnums,
+          omittedOptionalFields: pushDebug.omittedOptionalFields,
+          schemaSource: liveSchemaSource,
+        }),
+        createdAt: Date.now(),
+      });
+      return res.status(422).json({
+        ok: false,
+        stage: "preflight_enum",
+        error: `Invalid value(s) for required Jomashop ${pushDebug.category} field(s). ${detail}`,
+        invalidEnums: pushDebug.invalidEnums,
+        omittedOptionalFields: pushDebug.omittedOptionalFields,
+        missingRequired,
+        missingTopLevel,
+        warnings: mapped.warnings,
+        payloadPreview: payload,
+        pushDebug,
+        mapped,
+        schemaSource: liveSchemaSource,
+      });
+    }
+
     if (missingRequired.length > 0 || missingTopLevel.length > 0) {
       storage.updateSyncJob(job.id, {
         status: "failed",
@@ -2039,7 +2094,13 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         jobId: job.id,
         level: "error",
         message: `Push aborted before API call: missing fields for ${payload.sku ?? mapped.vendor_sku}`,
-        detailsJson: JSON.stringify({ missingRequired, missingTopLevel, schemaSource: liveSchemaSource }),
+        detailsJson: JSON.stringify({
+          missingRequired,
+          missingTopLevel,
+          invalidEnums: pushDebug.invalidEnums,
+          omittedOptionalFields: pushDebug.omittedOptionalFields,
+          schemaSource: liveSchemaSource,
+        }),
         createdAt: Date.now(),
       });
       return res.status(422).json({
@@ -2047,6 +2108,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         error: "Required fields are missing. Fix the mapping or supply overrides and retry.",
         missingRequired,
         missingTopLevel,
+        invalidEnums: pushDebug.invalidEnums,
+        omittedOptionalFields: pushDebug.omittedOptionalFields,
         warnings: mapped.warnings,
         payloadPreview: payload,
         pushDebug,

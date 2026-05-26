@@ -44,6 +44,13 @@ export type MappedProduct = {
   missing_required?: string[];
   /** Names of required top-level fields that are missing (e.g. "sku", "manufacturer_number"). */
   missing_top_level?: string[];
+  /** Schema-driven enum coercion failures captured during mapping. Surfaced
+   *  in preflight so the UI / push response can list the offending field,
+   *  the canonical value we tried to send, and the accepted options. */
+  invalid_enums?: Array<{ field: string; value: string; options: string[] }>;
+  /** Optional schema fields that were dropped from the outgoing properties
+   *  because their canonical value could not be mapped (allow_omit). */
+  omitted_optional_fields?: string[];
   category: SupportedCategory;
   /** True when this mapping was produced from a built-in demo fixture rather
    *  than a real Shopify product. The UI uses this to block pushes and label
@@ -582,6 +589,13 @@ export type SchemaPropertyDescriptor = {
   required: boolean;
   type?: string;
   options?: string[];
+  /** When true and the field is not required, the field is OMITTED entirely
+   *  from the payload when no value can be safely mapped. */
+  allow_omit?: boolean;
+  /** When true and the canonical value cannot be coerced to any of `options`,
+   *  the field is dropped from the payload rather than sent with an invalid
+   *  value. Avoids Jomashop's "X is not included in the list" rejections. */
+  omit_when_unknown_enum?: boolean;
 };
 
 /** Collapse a label/field to a single comparable token. */
@@ -713,8 +727,16 @@ export function buildCanonicalProductFields(p: ShopifyProduct): CanonicalProduct
     readMetafieldAny(p, ["Pieces", "pieces", "Total Number of Pieces", "total_pieces", "piece_count"]) ||
     "1";
 
+  // Article is an enum on Jomashop's Apparel category — sending the product
+  // title verbatim triggers "Article is not included in the list". Prefer an
+  // explicit Article metafield, then derive from apparel_type / category code
+  // (e.g. OUTW → "Outerwear"). buildSchemaProperties will then coerce to the
+  // schema's accepted option list and drop the value when no match exists.
   const article =
-    readMetafieldAny(p, ["Article", "article", "model", "Model"]) || p.title || undefined;
+    readMetafieldAny(p, ["Article", "article"]) ||
+    apparel_type ||
+    APPAREL_TYPE_BY_CODE[normalizeCategoryCode(rawCategoryCode || "")] ||
+    undefined;
 
   const hardware = readMetafieldAny(p, ["hardware", "Hardware"]);
   const dimensions = readMetafieldAny(p, ["dimensions", "Dimensions"]);
@@ -922,12 +944,23 @@ export function normalizeI1CategorySchema(raw: unknown): SchemaPropertyDescripto
         }
       }
     }
+    // Live-schema interpretation:
+    //   - Optional enum properties default to omit_when_unknown_enum=true so
+    //     a source value not in the accepted list is dropped from the
+    //     payload rather than triggering Jomashop's "X is not included in
+    //     the list" rejection.
+    //   - Optional properties default to allow_omit=true so the payload
+    //     never carries an explicit null for a field Jomashop did not
+    //     require (some validators reject explicit nulls).
+    const hasOptions = options.length > 0;
     out.push({
       field,
       label: typeof label === "string" ? label : undefined,
       required,
       type,
-      options: options.length > 0 ? options : undefined,
+      options: hasOptions ? options : undefined,
+      allow_omit: !required,
+      omit_when_unknown_enum: !required && hasOptions,
     });
   }
   return out;
@@ -951,10 +984,18 @@ export function buildSchemaProperties(
   properties: Record<string, string | number | boolean | null>;
   missingRequired: string[];
   schemaLabels: string[];
+  /** Per-field record of enum coercion failures (canonical value, accepted
+   *  options) for preflight error reporting. Keyed by schema label. */
+  invalidEnums: Array<{ field: string; value: string; options: string[] }>;
+  /** Fields that were dropped from the payload because the value could not
+   *  be mapped to an accepted option AND the field allows omission. */
+  omittedFields: string[];
 } {
   const properties: Record<string, string | number | boolean | null> = {};
   const missingRequired: string[] = [];
   const schemaLabels: string[] = [];
+  const invalidEnums: Array<{ field: string; value: string; options: string[] }> = [];
+  const omittedFields: string[] = [];
 
   for (const prop of schema) {
     if (!prop || typeof prop.field !== "string" || prop.field.trim() === "" || prop.field === "undefined") {
@@ -965,22 +1006,115 @@ export function buildSchemaProperties(
     const canonicalKey = pickCanonicalField(prop);
     let value: string | undefined = canonicalKey ? (canonical[canonicalKey] as string | undefined) : undefined;
     if (typeof value === "string") value = value.trim() || undefined;
+    const rawValueForReporting = value;
 
-    // Normalize against schema options if present. If the canonical value
-    // doesn't match any option, drop it — sending an invalid enum value is
-    // worse than sending nothing (Jomashop rejects the whole payload).
+    // Normalize against schema options if present. A canonical value that
+    // doesn't match any option is dropped here — sending an invalid enum
+    // value triggers Jomashop's "X is not included in the list" rejection.
+    let enumCoercionFailed = false;
     if (value && prop.options && prop.options.length > 0) {
-      value = matchSchemaOption(value, prop.options);
+      const coerced = matchSchemaOption(value, prop.options);
+      if (coerced === undefined || coerced === "") {
+        enumCoercionFailed = true;
+        value = undefined;
+      } else {
+        value = coerced;
+      }
     }
 
     if (!value) {
-      properties[outKey] = null;
+      // Two branches:
+      //   (a) The field permits omission AND the value either is missing
+      //       outright or failed enum coercion → drop the key from output.
+      //   (b) The field is required → null + missingRequired entry.
+      //   (c) Otherwise → null (legacy behaviour for non-enum optional fields).
+      const isOptionalEnumMiss = enumCoercionFailed && prop.omit_when_unknown_enum;
+      const canOmit = !prop.required && (prop.allow_omit || isOptionalEnumMiss);
+      if (canOmit) {
+        omittedFields.push(outKey);
+      } else {
+        properties[outKey] = null;
+      }
       if (prop.required) missingRequired.push(outKey);
+      if (enumCoercionFailed && rawValueForReporting) {
+        invalidEnums.push({
+          field: outKey,
+          value: rawValueForReporting,
+          options: prop.options || [],
+        });
+      }
     } else {
       properties[outKey] = value;
     }
   }
-  return { properties, missingRequired, schemaLabels };
+  return { properties, missingRequired, schemaLabels, invalidEnums, omittedFields };
+}
+
+/**
+ * Pre-flight coercions on the canonical bag based on the schema being
+ * targeted. Most categories don't need this, but Apparel's Gender enum
+ * (Men/Women/Unisex) doesn't accept "Kids" — Kids products must travel via
+ * Age=Kids and Gender=Unisex. Doing this before enum coercion lets the
+ * required Gender field always pass.
+ *
+ * Also maps Country of Origin synonyms (e.g. "USA" → "United States" when
+ * the live schema only lists the latter, and vice versa) when both are not
+ * in the accepted list.
+ */
+export function coerceCanonicalForCategory(
+  canonical: CanonicalProductFields,
+  schemaProperties: Array<{ field: string; options?: string[]; label?: string }>,
+): CanonicalProductFields {
+  const out = { ...canonical };
+  // Find the Gender schema property and inspect its option list.
+  const genderProp = schemaProperties.find(
+    (p) => p && typeof p.field === "string" && /gender/i.test(p.field),
+  );
+  if (genderProp) {
+    const opts = (genderProp.options || []).map((o) => o.toLowerCase());
+    if (
+      out.gender &&
+      out.gender.toLowerCase() === "kids" &&
+      opts.length > 0 &&
+      !opts.includes("kids")
+    ) {
+      // Funnel Kids to Unisex when supported; otherwise let enum coercion
+      // drop the value (Age=Kids still carries the kids signal).
+      if (opts.includes("unisex")) out.gender = "Unisex";
+      else out.gender = undefined;
+      if (!out.age) out.age = "Kids";
+    }
+  }
+  // Country of Origin synonym pass — try the obvious variants when the
+  // canonical string doesn't directly match one of the accepted options.
+  const cooProp = schemaProperties.find(
+    (p) =>
+      p &&
+      typeof p.field === "string" &&
+      /country(of)?origin/i.test(p.field.replace(/\s+/g, "")),
+  );
+  if (cooProp && out.country_of_origin && cooProp.options && cooProp.options.length > 0) {
+    const lower = out.country_of_origin.trim().toLowerCase();
+    const optsLower = cooProp.options.map((o) => o.toLowerCase());
+    if (!optsLower.includes(lower)) {
+      const synonyms: Record<string, string[]> = {
+        usa: ["united states", "united states of america", "us"],
+        "united states": ["usa", "us"],
+        "united states of america": ["usa", "united states"],
+        uk: ["united kingdom", "great britain", "britain", "england"],
+        "united kingdom": ["uk", "great britain"],
+      };
+      const aliases = synonyms[lower] || [];
+      for (const alias of aliases) {
+        const idx = optsLower.indexOf(alias);
+        if (idx !== -1) {
+          out.country_of_origin = cooProp.options[idx];
+          break;
+        }
+      }
+    }
+  }
+  return out;
 }
 
 /**
@@ -1045,9 +1179,17 @@ export function mapShopifyToJomashop(
   const usesLiveSchemaLabels = schemaUsesExactLabels(schemaProperties);
   const properties: Record<string, string | number | boolean | null> = {};
   const missingRequiredProps: string[] = [];
+  let invalidEnums: Array<{ field: string; value: string; options: string[] }> = [];
+  let omittedOptionalFields: string[] = [];
 
   if (usesLiveSchemaLabels) {
-    const canonical = buildCanonicalProductFields(product);
+    let canonical = buildCanonicalProductFields(product);
+    // Apparel-specific coercion: the live Apparel Gender schema rejects
+    // "Kids" — it expects Men/Women/Unisex. Funnel Kids products through
+    // Age=Kids and downshift Gender to Unisex BEFORE schema mapping so the
+    // enum coercion in buildSchemaProperties doesn't drop Gender as
+    // unmappable (which would surface a required-field error).
+    canonical = coerceCanonicalForCategory(canonical, schemaProperties);
     const built = buildSchemaProperties(
       schemaProperties as SchemaPropertyDescriptor[],
       canonical,
@@ -1059,6 +1201,13 @@ export function mapShopifyToJomashop(
       missingRequiredProps.push(label);
       warnings.push(
         `Missing required ${category} field "${label}" — add via metafield, product option, or vendor field.`,
+      );
+    }
+    invalidEnums = built.invalidEnums;
+    omittedOptionalFields = built.omittedFields;
+    for (const inv of invalidEnums) {
+      warnings.push(
+        `Value "${inv.value}" for ${category} field "${inv.field}" is not in Jomashop's accepted list (${inv.options.slice(0, 8).join(", ")}${inv.options.length > 8 ? "…" : ""}). Add a mapping or correct the source metafield.`,
       );
     }
   } else for (const prop of schemaProperties) {
@@ -1317,6 +1466,8 @@ export function mapShopifyToJomashop(
   return {
     missing_required: missingRequiredProps,
     missing_top_level: missingTopLevelFields,
+    invalid_enums: invalidEnums,
+    omitted_optional_fields: omittedOptionalFields,
     category,
     is_sample: sampleFixture,
     raw_category: rawCategory,
@@ -1411,12 +1562,16 @@ export function buildJomashopProductPayload(
   variant: MappedProduct["variants"][number] | null;
   missingRequired: string[];
   missingTopLevel: string[];
+  invalidEnums: Array<{ field: string; value: string; options: string[] }>;
+  omittedOptionalFields: string[];
   pushDebug: {
     category: string;
     schemaLabelsExact: boolean;
     propertyKeys: string[];
     removedLegacyKeys: string[];
     fallbackUnsafe: boolean;
+    invalidEnums: Array<{ field: string; value: string; options: string[] }>;
+    omittedOptionalFields: string[];
   };
 } {
   const variant =
@@ -1511,15 +1666,28 @@ export function buildJomashopProductPayload(
     missingTopLevel.push("category_id");
   }
 
+  const invalidEnums = mapped.invalid_enums || [];
+  const omittedOptionalFields = mapped.omitted_optional_fields || [];
+
   const pushDebug = {
     category: (overrides.category && overrides.category.trim()) || mapped.category,
     schemaLabelsExact: propertiesUseLiveLabels,
     propertyKeys: Object.keys(properties),
     removedLegacyKeys,
     fallbackUnsafe,
+    invalidEnums,
+    omittedOptionalFields,
   };
 
-  return { payload, variant, missingRequired, missingTopLevel, pushDebug };
+  return {
+    payload,
+    variant,
+    missingRequired,
+    missingTopLevel,
+    invalidEnums,
+    omittedOptionalFields,
+    pushDebug,
+  };
 }
 
 /**

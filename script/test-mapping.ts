@@ -108,9 +108,13 @@ function runColorNavyCase() {
     mapped.properties.Color === "NAVY",
     `properties.Color === "NAVY" (got ${JSON.stringify(mapped.properties.Color)})`,
   );
+  // Material is now intentionally absent from the Clothing/Apparel schema
+  // because Jomashop rejects it for those categories ("Material must be
+  // blank"). The mapper must not emit a Material key when the schema omits
+  // it — sending a Composition-derived value would trigger that rejection.
   assert(
-    typeof mapped.properties.Material === "string" && /cotton/i.test(String(mapped.properties.Material)),
-    `properties.Material populated from Composition (got ${JSON.stringify(mapped.properties.Material)})`,
+    !("Material" in mapped.properties),
+    `properties.Material is omitted for Clothing schema (got ${JSON.stringify(mapped.properties.Material)})`,
   );
   assert(
     !(mapped.missing_required || []).includes("Color"),
@@ -211,9 +215,12 @@ function runListTypeMetafield() {
     mapped.properties.Color === "NAVY",
     `list metafield unpacked: properties.Color === "NAVY" (got ${JSON.stringify(mapped.properties.Color)})`,
   );
+  // Material is intentionally absent from Clothing schema (Jomashop rejects
+  // Material for Apparel/Clothing). The metafield is still parsed correctly
+  // — just not emitted under the Clothing schema's property list.
   assert(
-    mapped.properties.Material === "cotton",
-    `quoted scalar unwrapped: properties.Material === "cotton" (got ${JSON.stringify(mapped.properties.Material)})`,
+    !("Material" in mapped.properties),
+    `Material omitted under Clothing schema (got ${JSON.stringify(mapped.properties.Material)})`,
   );
 }
 
@@ -1379,6 +1386,358 @@ function runEverySupportedCategoryHasExactLabels() {
   }
 }
 
+// ---------- Cases 21+: enum/option validation across categories ----------
+
+// Mirrors the exact payload Jomashop rejected: Canada Goose Kids Black
+// Outerwear, SKU 3103K61-4, pushed to category_id 35 (Apparel). Jomashop
+// returned validation errors for Material, Gender ("Kids" not in list),
+// Article (free-text product name), and Country of Origin ("Canada" not in
+// list). The mapper + payload builder must now:
+//   - omit Material entirely (not in the Apparel schema)
+//   - coerce Gender Kids → Unisex (and surface Age=Kids)
+//   - either map Article to an accepted enum option or omit it (no free text)
+//   - drop Country of Origin when "Canada" isn't in the accepted list
+function runCanadaGooseApparelRejectionFix() {
+  console.log(
+    "Case 21: Canada Goose Kids Apparel rejection — Material/Gender/Article/Country handled",
+  );
+  const apparelFallback = FALLBACK_CATEGORY_SCHEMAS.Apparel.map((f) => ({
+    field: f.field,
+    required: f.required,
+    type: f.type,
+    options: f.options,
+    allow_omit: f.allow_omit,
+    omit_when_unknown_enum: f.omit_when_unknown_enum,
+  }));
+  const product: ShopifyProduct = {
+    id: "shopify-cg-3103K61-4",
+    title: "Canada Goose Kids Black Outerwear",
+    body_html: "<p>Kids outerwear in black.</p>",
+    vendor: "Canada Goose",
+    product_type: "OUTW",
+    tags: ["Kids", "Outerwear"],
+    images: [{ src: "https://example.com/cg.jpg" }],
+    options: [{ name: "Size", values: ["4"] }],
+    variants: [
+      {
+        id: 30001,
+        sku: "3103K61-4",
+        price: "650.00",
+        inventory_quantity: 1,
+        option1: "4",
+      },
+    ],
+    metafields: [
+      { namespace: "custom", key: "color", value: "BLACK", name: "Color" },
+      { namespace: "custom", key: "composition", value: "Cotton" },
+      { namespace: "custom", key: "country_of_origin", value: "Canada" },
+      { namespace: "custom", key: "ff_designer_id", value: "3103K61" },
+    ],
+  };
+  const mapped = mapShopifyToJomashop(product, apparelFallback, "Apparel");
+
+  // (1) Material must not appear in mapped.properties — it is not in the
+  // Apparel schema at all. The previous code emitted Material from the
+  // Composition metafield, which Jomashop rejected.
+  assert(
+    !("Material" in mapped.properties),
+    `Apparel: Material is NOT emitted (Jomashop rejects it) (got ${JSON.stringify(mapped.properties.Material)})`,
+  );
+
+  // (2) Gender "Kids" must be coerced to Unisex (the Apparel Gender enum
+  // accepts Men/Women/Unisex — "Kids" triggers the rejection).
+  assert(
+    mapped.properties.Gender === "Unisex",
+    `Apparel: Gender Kids → Unisex (got ${JSON.stringify(mapped.properties.Gender)})`,
+  );
+
+  // (3) Age must remain "Kids" so Jomashop still knows this is a kids item.
+  assert(
+    mapped.properties.Age === "Kids",
+    `Apparel: Age === "Kids" (got ${JSON.stringify(mapped.properties.Age)})`,
+  );
+
+  // (4) Article must NOT be the product title verbatim. It should either
+  // map to an accepted option (e.g. "Outerwear" from the OUTW code) or be
+  // dropped from the payload. Free-text "Canada Goose Kids Black Outerwear"
+  // is exactly what Jomashop rejected.
+  const articleValue = mapped.properties.Article;
+  if (articleValue !== undefined && articleValue !== null) {
+    assert(
+      typeof articleValue === "string" && APPAREL_TYPE_OPTIONS_FOR_TEST.includes(articleValue),
+      `Apparel: Article (when present) maps to accepted option (got ${JSON.stringify(articleValue)})`,
+    );
+  }
+  // For OUTW specifically we expect "Outerwear" via APPAREL_TYPE_BY_CODE.
+  assert(
+    articleValue === "Outerwear",
+    `Apparel/OUTW: Article === "Outerwear" via code map (got ${JSON.stringify(articleValue)})`,
+  );
+
+  // (5) Country of Origin "Canada" is not in the accepted list — the
+  // payload must DROP the field rather than send "Canada".
+  const { payload, pushDebug, invalidEnums, omittedOptionalFields } = buildJomashopProductPayload(
+    mapped,
+    undefined,
+    {
+      category: "Apparel",
+      brand: "Canada Goose",
+      manufacturer_id: 2774,
+      category_id: 35,
+    },
+  );
+  const payloadProps = (payload.properties as Record<string, unknown>) || {};
+  assert(
+    !("Country of Origin" in payloadProps),
+    `Apparel: Country of Origin dropped when value not in accepted list (got ${JSON.stringify(payloadProps["Country of Origin"])})`,
+  );
+  assert(
+    omittedOptionalFields.includes("Country of Origin"),
+    `Apparel: omittedOptionalFields lists Country of Origin (got ${JSON.stringify(omittedOptionalFields)})`,
+  );
+
+  // (6) invalidEnums must record the Canada attempt so the operator can see
+  // what was sent versus what is accepted.
+  const cooInvalid = invalidEnums.find((e) => e.field === "Country of Origin");
+  assert(
+    cooInvalid !== undefined && cooInvalid.value === "Canada",
+    `Apparel: invalidEnums captures the Canada → accepted-list mismatch (got ${JSON.stringify(invalidEnums)})`,
+  );
+
+  // (7) The payload must be pushable: no Material, Gender is Unisex,
+  // Article is Outerwear (accepted), Country of Origin dropped. pushDebug
+  // confirms schemaLabelsExact and no missing required.
+  assert(pushDebug.schemaLabelsExact === true, `Apparel: pushDebug.schemaLabelsExact === true`);
+  assert(pushDebug.fallbackUnsafe === false, `Apparel: pushDebug.fallbackUnsafe === false`);
+
+  // (8) Top-level payload must NOT carry a Material key, even though the
+  // Composition metafield was present.
+  assert(
+    !("Material" in payload),
+    `Apparel: top-level payload excludes Material (got ${Object.keys(payload).join(",")})`,
+  );
+}
+
+// Helper mirroring the internal APPAREL_TYPE_OPTIONS list used by the
+// Apparel schema for Article/Apparel Type validation. Kept here so the test
+// doesn't need to import the private const.
+const APPAREL_TYPE_OPTIONS_FOR_TEST = [
+  "Outerwear",
+  "Jackets",
+  "Coats",
+  "Vests",
+  "Blazers",
+  "Suits",
+  "Tuxedos",
+  "Pants",
+  "Jeans",
+  "Shorts",
+  "Sweatpants",
+  "Joggers",
+  "Leggings",
+  "Skirts",
+  "Dresses",
+  "Jumpsuits",
+  "Bodysuits",
+  "Shirts",
+  "Dress Shirts",
+  "T-Shirts",
+  "Polo Shirts",
+  "Tank Tops",
+  "Tops",
+  "Blouses",
+  "Sweaters",
+  "Sweatshirts",
+  "Hoodies",
+  "Pullovers",
+  "Activewear",
+  "Swimwear",
+  "Underwear",
+  "Bras",
+  "Socks",
+  "Pajamas",
+  "Robes",
+  "Capes",
+  "Scarves",
+  "Hats",
+  "Cummerbunds",
+  "Headwear",
+  "Masks",
+];
+
+// Case 22: Footwear with a country not in the accepted list — Country of
+// Origin must be dropped, but the rest of the payload remains pushable.
+function runFootwearUnknownCountry() {
+  console.log("Case 22: Footwear — unknown Country of Origin dropped, push remains valid");
+  const footwearFallback = FALLBACK_CATEGORY_SCHEMAS.Footwear.map((f) => ({
+    field: f.field,
+    required: f.required,
+    type: f.type,
+    options: f.options,
+    allow_omit: f.allow_omit,
+    omit_when_unknown_enum: f.omit_when_unknown_enum,
+  }));
+  const product: ShopifyProduct = {
+    id: "shopify-tods-fw-1",
+    title: "Tods Womens Black Loafer",
+    body_html: "<p>Calfskin loafer.</p>",
+    vendor: "Tods",
+    product_type: "LOAF",
+    tags: ["Women", "Loafer"],
+    images: [],
+    options: [{ name: "Size", values: ["38"] }],
+    variants: [
+      { id: 40001, sku: "TODS-LOAF-38", price: "650.00", inventory_quantity: 1, option1: "38" },
+    ],
+    metafields: [
+      { namespace: "custom", key: "color", value: "Black", name: "Color" },
+      { namespace: "custom", key: "composition", value: "Calfskin leather" },
+      { namespace: "custom", key: "country_of_origin", value: "Atlantis" },
+      { namespace: "custom", key: "size_scale", value: "EU" },
+      { namespace: "custom", key: "ff_designer_id", value: "TODS-LOAF" },
+    ],
+  };
+  const mapped = mapShopifyToJomashop(product, footwearFallback, "Footwear");
+  const { payload, invalidEnums, omittedOptionalFields, missingRequired } =
+    buildJomashopProductPayload(mapped, undefined, {
+      category: "Footwear",
+      brand: "Tods",
+      manufacturer_id: 1,
+      category_id: 2,
+    });
+  const props = (payload.properties as Record<string, unknown>) || {};
+  // Required fields present.
+  assert(props.Gender === "Women", `Footwear: Gender === "Women"`);
+  assert(props["Shoe Size"] === "38", `Footwear: Shoe Size === "38"`);
+  assert(props["Shoe Size Type"] === "EU", `Footwear: Shoe Size Type === "EU"`);
+  assert(props.Color === "Black", `Footwear: Color === "Black"`);
+  // Country of Origin dropped.
+  assert(
+    !("Country of Origin" in props),
+    `Footwear: Country of Origin dropped when not in accepted list (got ${JSON.stringify(props["Country of Origin"])})`,
+  );
+  assert(
+    omittedOptionalFields.includes("Country of Origin"),
+    `Footwear: omittedOptionalFields includes Country of Origin (got ${JSON.stringify(omittedOptionalFields)})`,
+  );
+  // invalidEnums records "Atlantis".
+  const inv = invalidEnums.find((e) => e.field === "Country of Origin");
+  assert(
+    inv !== undefined && inv.value === "Atlantis",
+    `Footwear: invalidEnums captures Atlantis (got ${JSON.stringify(invalidEnums)})`,
+  );
+  // Required fields all good.
+  assert(
+    missingRequired.length === 0,
+    `Footwear: no missing required fields (got ${JSON.stringify(missingRequired)})`,
+  );
+}
+
+// Case 23: Handbags — Style unknown value dropped, Material remains
+// required and present (Handbags does accept Material, unlike Apparel).
+function runHandbagsStyleEnumDrop() {
+  console.log("Case 23: Handbags — unknown Style enum dropped, Material kept");
+  const handbagFallback = FALLBACK_CATEGORY_SCHEMAS.Handbags.map((f) => ({
+    field: f.field,
+    required: f.required,
+    type: f.type,
+    options: f.options,
+    allow_omit: f.allow_omit,
+    omit_when_unknown_enum: f.omit_when_unknown_enum,
+  }));
+  const product: ShopifyProduct = {
+    id: "shopify-bag-22",
+    title: "Saint Laurent Bag",
+    body_html: "<p>Quilted bag.</p>",
+    vendor: "Saint Laurent",
+    product_type: "HBAG",
+    tags: ["Women"],
+    images: [],
+    options: [{ name: "Color", values: ["Noir"] }],
+    variants: [
+      { id: 50001, sku: "YSL-BAG-22", price: "1500.00", inventory_quantity: 1, option1: "Noir" },
+    ],
+    metafields: [
+      { namespace: "custom", key: "color", value: "Noir", name: "Color" },
+      { namespace: "custom", key: "composition", value: "Calfskin leather" },
+      { namespace: "custom", key: "style", value: "MessengerStyleNotInList" },
+      { namespace: "custom", key: "hardware", value: "Gold" },
+      { namespace: "custom", key: "ff_designer_id", value: "YSL-BAG" },
+    ],
+  };
+  const mapped = mapShopifyToJomashop(product, handbagFallback, "Handbags");
+  const { payload, omittedOptionalFields, missingRequired } = buildJomashopProductPayload(
+    mapped,
+    undefined,
+    {
+      category: "Handbags",
+      brand: "Saint Laurent",
+      manufacturer_id: 1,
+      category_id: 2,
+    },
+  );
+  const props = (payload.properties as Record<string, unknown>) || {};
+  // Material is required for Handbags and must be present.
+  assert(
+    props.Material === "Calfskin leather",
+    `Handbags: Material === "Calfskin leather" (got ${JSON.stringify(props.Material)})`,
+  );
+  // Style "MessengerStyleNotInList" not in accepted options — must be dropped.
+  assert(
+    !("Style" in props),
+    `Handbags: unknown Style dropped (got ${JSON.stringify(props.Style)})`,
+  );
+  assert(
+    omittedOptionalFields.includes("Style"),
+    `Handbags: omittedOptionalFields includes Style`,
+  );
+  // Hardware "Gold" is accepted.
+  assert(
+    props.Hardware === "Gold",
+    `Handbags: Hardware === "Gold" (got ${JSON.stringify(props.Hardware)})`,
+  );
+  assert(
+    missingRequired.length === 0,
+    `Handbags: no missing required (got ${JSON.stringify(missingRequired)})`,
+  );
+}
+
+// Case 24: Apparel required Gender that doesn't coerce to any option must
+// surface a clear preflight failure — neither a silent omit nor a Jomashop
+// round-trip rejection.
+function runApparelGenderUnmappable() {
+  console.log("Case 24: Apparel — Gender that cannot be mapped surfaces as required");
+  const apparelFallback = FALLBACK_CATEGORY_SCHEMAS.Apparel.map((f) => ({
+    field: f.field,
+    required: f.required,
+    type: f.type,
+    options: f.options,
+    allow_omit: f.allow_omit,
+    omit_when_unknown_enum: f.omit_when_unknown_enum,
+  }));
+  const product: ShopifyProduct = {
+    id: "shopify-apparel-no-gender",
+    title: "Pants",
+    vendor: "Generic",
+    product_type: "PANT",
+    tags: [],
+    images: [],
+    options: [{ name: "Size", values: ["32"] }],
+    variants: [{ id: 60001, sku: "G-PANT-1", price: "100.00", inventory_quantity: 1, option1: "32" }],
+    metafields: [
+      { namespace: "custom", key: "color", value: "Navy", name: "Color" },
+      { namespace: "custom", key: "ff_designer_id", value: "G-PANT-1" },
+    ],
+  };
+  const mapped = mapShopifyToJomashop(product, apparelFallback, "Apparel");
+  // No tag/metafield gives us Men/Women/Unisex; the canonical bag has no
+  // gender, so missing_required should list "Gender".
+  assert(
+    (mapped.missing_required || []).includes("Gender"),
+    `Apparel: missing_required includes Gender when unresolvable (got ${JSON.stringify(mapped.missing_required)})`,
+  );
+}
+
 runColorNavyCase();
 runDefinitionNameOnlyCase();
 runVariantSelectedOptionFallback();
@@ -1400,6 +1759,10 @@ runFallbackUnsafeGate();
 runEverySupportedCategoryHasExactLabels();
 runApparelFallbackPushability();
 runApparelFallbackPayloadIsTitleCase();
+runCanadaGooseApparelRejectionFix();
+runFootwearUnknownCountry();
+runHandbagsStyleEnumDrop();
+runApparelGenderUnmappable();
 
 if (failures > 0) {
   console.error(`\n${failures} assertion(s) failed.`);
