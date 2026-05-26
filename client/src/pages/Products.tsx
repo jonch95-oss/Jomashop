@@ -802,25 +802,81 @@ export default function Products() {
                       </div>
 
                       <div className="md:col-span-2">
-                        <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Category properties</div>
-                        {Object.entries(p.properties).filter(([k]) => k && k !== "undefined").length === 0 ? (
-                          <div className="mt-2 rounded border border-amber-500/40 bg-amber-500/5 px-2.5 py-1.5 text-xs text-amber-600 dark:text-amber-400">
-                            No Jomashop schema loaded for this category — needs category verification.
-                          </div>
-                        ) : (
-                          <div className="mt-2 grid grid-cols-1 gap-1.5 md:grid-cols-2">
-                            {Object.entries(p.properties)
-                              .filter(([k]) => k && k !== "undefined")
-                              .map(([k, v]) => {
-                                const display = displayPropertyValue(v);
+                        <div className="flex items-center justify-between">
+                          <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Category properties</div>
+                          {p.schema_source && p.schema_source !== "none" && (
+                            <div
+                              className={`text-[10px] uppercase tracking-wider ${
+                                p.schema_source === "fallback"
+                                  ? "text-amber-600 dark:text-amber-400"
+                                  : "text-emerald-600 dark:text-emerald-400"
+                              }`}
+                              data-testid={`text-schema-source-${p.vendor_sku}`}
+                              title={
+                                p.schema_source === "fallback"
+                                  ? "Live Jomashop category schema unavailable — using bundled exact-label fallback schema."
+                                  : "Using the live Jomashop category schema."
+                              }
+                            >
+                              Schema: {p.schema_source === "fallback" ? "fallback (bundled)" : "live"}
+                            </div>
+                          )}
+                        </div>
+                        {(() => {
+                          const propEntries = Object.entries(p.properties).filter(
+                            ([k]) => k && k !== "undefined",
+                          );
+                          const schemaFields = (p.schema_fields ?? []).filter(
+                            (f) => f && f.field && f.field !== "undefined",
+                          );
+                          if (propEntries.length === 0 && schemaFields.length === 0) {
+                            return (
+                              <div
+                                className="mt-2 rounded border border-amber-500/40 bg-amber-500/5 px-2.5 py-1.5 text-xs text-amber-600 dark:text-amber-400"
+                                data-testid={`text-no-schema-${p.vendor_sku}`}
+                              >
+                                No Jomashop schema loaded for this category — needs category verification.
+                              </div>
+                            );
+                          }
+                          // Build a union of schema-declared fields and any
+                          // values present in p.properties so the panel always
+                          // renders the expected category shape — even when
+                          // the Shopify product is missing values.
+                          const seen = new Set<string>();
+                          const rows: Array<{ field: string; value: unknown; required: boolean }> = [];
+                          for (const f of schemaFields) {
+                            seen.add(f.field);
+                            rows.push({
+                              field: f.field,
+                              value: (p.properties as Record<string, unknown>)[f.field],
+                              required: f.required,
+                            });
+                          }
+                          for (const [k, v] of propEntries) {
+                            if (seen.has(k)) continue;
+                            rows.push({ field: k, value: v, required: false });
+                          }
+                          return (
+                            <div className="mt-2 grid grid-cols-1 gap-1.5 md:grid-cols-2">
+                              {rows.map(({ field, value, required }) => {
+                                const display = displayPropertyValue(value);
                                 const isMissing = display.tone === "missing";
                                 return (
                                   <div
-                                    key={k}
+                                    key={field}
                                     className="flex items-center justify-between rounded border border-border bg-card/40 px-2.5 py-1.5 text-xs"
                                   >
                                     <span className="font-mono text-muted-foreground">
-                                      {displayPropertyKey(k)}
+                                      {displayPropertyKey(field)}
+                                      {required && (
+                                        <span
+                                          className="ml-1 text-[10px] uppercase text-amber-500/80"
+                                          title="Required by the Jomashop category schema"
+                                        >
+                                          *
+                                        </span>
+                                      )}
                                     </span>
                                     <span
                                       className={`ml-2 truncate font-mono ${isMissing ? "text-amber-500/80" : ""}`}
@@ -830,8 +886,9 @@ export default function Products() {
                                   </div>
                                 );
                               })}
-                          </div>
-                        )}
+                            </div>
+                          );
+                        })()}
                       </div>
 
                       {p.warnings.length > 0 && (

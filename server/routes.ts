@@ -145,6 +145,17 @@ type CompactMappedProduct = {
     category_record: { id: number | string; name: string } | null;
     i1_available: boolean;
   };
+  // Where the category property schema for this row came from. "fallback"
+  // means the bundled exact-label schema was used because the live lookup
+  // was unavailable or returned a lowercase legacy shape. The UI surfaces
+  // this so operators can tell at a glance whether a row is using live or
+  // bundled labels.
+  schema_source: "live-i1" | "live-v1" | "fallback" | "none";
+  // Field names + required flags from the resolved schema so the UI can
+  // render the Category Properties panel even when the Shopify product
+  // lacks values for those fields (fallback rows still show the expected
+  // shape with "missing" placeholders).
+  schema_fields: Array<{ field: string; required: boolean }>;
   readiness: string;
 };
 
@@ -239,6 +250,16 @@ function compactifyMapped(m: any): CompactMappedProduct {
       category_record: null,
       i1_available: false,
     },
+    schema_source: (m.schema_source ?? "none") as "live-i1" | "live-v1" | "fallback" | "none",
+    schema_fields: Array.isArray(m.schema_fields)
+      ? m.schema_fields
+          .filter(
+            (f: any) =>
+              f && typeof f.field === "string" && f.field.trim() !== "" && f.field !== "undefined",
+          )
+          .slice(0, 32)
+          .map((f: any) => ({ field: String(f.field), required: Boolean(f.required) }))
+      : [],
     readiness: m.readiness ?? "missing",
   };
 }
@@ -978,22 +999,55 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const resolvedI1Cat = outboundCategoryKey
         ? i1CategoryByKey.get(outboundCategoryKey) ?? null
         : null;
-      let props: Array<any>;
+      // Resolve a schema property list with an unambiguous source label so
+      // the UI / debug surfaces can distinguish "live" from "fallback". A
+      // supported category with an exact-label bundled fallback ALWAYS has
+      // a usable schema even when the live /i1 + /v1 lookups fail.
+      const bundledForCat = FALLBACK_CATEGORY_SCHEMAS[cat];
+      const bundledPropsForCat: Array<any> = Array.isArray(bundledForCat)
+        ? bundledForCat.map((f) => ({
+            field: f.field,
+            required: f.required,
+            type: f.type,
+            options: f.options,
+          }))
+        : [];
+      const bundledIsExactForCat =
+        bundledPropsForCat.length > 0 &&
+        bundledPropsForCat.every(
+          (p: any) => typeof p.field === "string" && (/[A-Z]/.test(p.field) || /\s/.test(p.field)),
+        );
+      let props: Array<any> = [];
+      let schemaSource: "live-i1" | "live-v1" | "fallback" | "none" = "none";
       if (resolvedI1Cat) {
         const liveSchema = await loadI1Schema(resolvedI1Cat.id);
         if (liveSchema && liveSchema.length > 0) {
-          props = liveSchema;
-        } else {
-          const schemaWrap = schemas[cat];
-          props =
-            (schemaWrap?.schema?.properties as Array<any>) ||
-            FALLBACK_CATEGORY_SCHEMAS[cat].map((f) => ({ field: f.field, required: f.required, type: f.type, options: f.options }));
+          const liveExact = liveSchema.some(
+            (p: any) => p && typeof p.field === "string" && (/[A-Z]/.test(p.field) || /\s/.test(p.field)),
+          );
+          if (liveExact || !bundledIsExactForCat) {
+            props = liveSchema;
+            schemaSource = "live-i1";
+          }
         }
-      } else {
+      }
+      if (props.length === 0) {
         const schemaWrap = schemas[cat];
-        props =
-          (schemaWrap?.schema?.properties as Array<any>) ||
-          FALLBACK_CATEGORY_SCHEMAS[cat].map((f) => ({ field: f.field, required: f.required, type: f.type, options: f.options }));
+        const wrapProps = (schemaWrap?.schema?.properties as Array<any>) || [];
+        const wrapExact =
+          Array.isArray(wrapProps) &&
+          wrapProps.length > 0 &&
+          wrapProps.some(
+            (p: any) => p && typeof p.field === "string" && (/[A-Z]/.test(p.field) || /\s/.test(p.field)),
+          );
+        if (wrapProps.length > 0 && (wrapExact || !bundledIsExactForCat)) {
+          props = wrapProps;
+          schemaSource = schemaWrap?.source === "live" ? "live-v1" : "fallback";
+        }
+      }
+      if (props.length === 0 && bundledPropsForCat.length > 0) {
+        props = bundledPropsForCat;
+        schemaSource = "fallback";
       }
       const m = mapShopifyToJomashop(p, props, override?.supportedCategory ?? undefined);
       if (override) {
@@ -1171,6 +1225,13 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           category_record: resolvedCategoryRecord,
           i1_available: i1Available,
         },
+        schema_source: schemaSource,
+        schema_fields: props
+          .filter(
+            (p: any) =>
+              p && typeof p.field === "string" && p.field.trim() !== "" && p.field !== "undefined",
+          )
+          .map((p: any) => ({ field: p.field as string, required: Boolean(p.required) })),
         readiness,
       };
       })(p);
@@ -1768,16 +1829,27 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     // Schema-driven property mapping: once we know the resolved Jomashop
     // category id, fetch its live property list and re-map the Shopify
     // product against EXACT live labels. Falls back silently to the bundled
-    // schema when /i1/categories/:id is unavailable.
+    // schema when /i1/categories/:id is unavailable OR returns a
+    // lowercase-only legacy shape (Jomashop's /i1 validator rejects those).
     let liveSchemaSource: "live-i1" | "live-v1" | "fallback" = source === "live" ? "live-v1" : "fallback";
+    const bundledFallback = FALLBACK_CATEGORY_SCHEMAS[tmpMap.category];
+    const bundledIsExact =
+      Array.isArray(bundledFallback) &&
+      bundledFallback.length > 0 &&
+      bundledFallback.every((p) => /[A-Z]/.test(p.field) || /\s/.test(p.field));
     if (overrides.category_id !== undefined && overrides.category_id !== null) {
       try {
         const i1SchemaResp = await getCategoryPropertiesI1(overrides.category_id);
         if (i1SchemaResp.ok && i1SchemaResp.data) {
           const liveSchema = normalizeI1CategorySchema(i1SchemaResp.data);
           if (liveSchema.length > 0) {
-            mapped = mapShopifyToJomashop(body.product, liveSchema, body.forcedCategory);
-            liveSchemaSource = "live-i1";
+            const liveSchemaExact = liveSchema.some(
+              (p) => p && typeof p.field === "string" && (/[A-Z]/.test(p.field) || /\s/.test(p.field)),
+            );
+            if (liveSchemaExact || !bundledIsExact) {
+              mapped = mapShopifyToJomashop(body.product, liveSchema, body.forcedCategory);
+              liveSchemaSource = "live-i1";
+            }
           }
         }
       } catch {
@@ -1785,8 +1857,24 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
     }
 
-    const { payload, variant, missingRequired, missingTopLevel, pushDebug } =
+    let { payload, variant, missingRequired, missingTopLevel, pushDebug } =
       buildJomashopProductPayload(mapped, body.variantSku, overrides);
+
+    // If the chosen schema produced an unsafe (lowercase-only) payload but we
+    // have a Title Case bundled fallback for this category, re-map against
+    // the bundled fallback so the push can proceed with exact labels.
+    if (pushDebug.fallbackUnsafe && bundledIsExact) {
+      const bundledProps = bundledFallback.map((f) => ({
+        field: f.field,
+        required: f.required,
+        type: f.type,
+        options: f.options,
+      }));
+      mapped = mapShopifyToJomashop(body.product, bundledProps, body.forcedCategory);
+      ({ payload, variant, missingRequired, missingTopLevel, pushDebug } =
+        buildJomashopProductPayload(mapped, body.variantSku, overrides));
+      liveSchemaSource = "fallback";
+    }
 
     const startedAt = Date.now();
     const job = storage.createSyncJob({

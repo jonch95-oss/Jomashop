@@ -185,15 +185,37 @@ export async function getCategorySchema(name: string) {
 }
 
 // Helper that the mapping preview uses: it tries to fetch a live schema
-// but falls back to the bundled one if the API is unavailable.
+// but falls back to the bundled one if the API is unavailable OR if the
+// live schema would emit lowercase legacy labels (Jomashop's /i1 schema
+// validator now rejects those). When we have a bundled exact-label
+// fallback for the category we prefer it over a lowercase live shape.
 export async function resolveCategorySchema(category: SupportedCategory) {
+  const bundled = FALLBACK_CATEGORY_SCHEMAS[category];
+  const bundledIsExact =
+    Array.isArray(bundled) &&
+    bundled.length > 0 &&
+    bundled.every((p) => /[A-Z]/.test(p.field) || /\s/.test(p.field));
   const live = await getCategorySchema(category);
   if (live.ok && live.data) {
-    return { source: "live" as const, schema: live.data };
+    const props = (live.data as { properties?: Array<{ field: string }> } | undefined)?.properties;
+    const liveHasExactLabels =
+      Array.isArray(props) &&
+      props.length > 0 &&
+      props.some((p) => p && typeof p.field === "string" && (/[A-Z]/.test(p.field) || /\s/.test(p.field)));
+    if (liveHasExactLabels || !bundledIsExact) {
+      return { source: "live" as const, schema: live.data };
+    }
+    // Live schema is lowercase-only (legacy) but we have an exact-label
+    // bundled fallback — prefer the bundled one so the outgoing payload
+    // uses Title Case labels Jomashop accepts.
+    return {
+      source: "fallback" as const,
+      schema: { name: category, properties: bundled },
+    };
   }
   return {
     source: "fallback" as const,
-    schema: { name: category, properties: FALLBACK_CATEGORY_SCHEMAS[category] },
+    schema: { name: category, properties: bundled },
   };
 }
 

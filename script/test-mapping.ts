@@ -1212,6 +1212,152 @@ function runFallbackUnsafeGate() {
   );
 }
 
+// ---------- Cases 19 & 20: Apparel fallback pushability ----------
+//
+// Mirrors the production failure flagged on the Products page after 35ab58b:
+// a Canada Goose Kids Apparel item resolves to brand_id 2774 + category_id 35
+// but the live /i1/categories/35 schema lookup comes back empty. The push
+// builder MUST be allowed to fall back to FALLBACK_CATEGORY_SCHEMAS.Apparel
+// (which uses exact Title Case labels) and produce a safe, pushable payload —
+// it must not flag fallbackUnsafe and it must never emit lowercase legacy
+// fields at the top level.
+
+function canadaGooseKidsApparelProduct(): ShopifyProduct {
+  return {
+    id: "shopify-cg-kids-1",
+    title: "Canada Goose Kids Black Outerwear Jacket",
+    body_html: "<p>Kids outerwear.</p>",
+    vendor: "Canada Goose",
+    product_type: "Outerwear",
+    tags: ["Kids"],
+    images: [{ src: "https://example.com/cg.jpg" }],
+    options: [{ name: "Size", values: ["M"] }],
+    variants: [
+      {
+        id: 70001,
+        sku: "OUTW-CG-001",
+        price: "400.00",
+        inventory_quantity: 4,
+        option1: "M",
+      },
+    ],
+    metafields: [
+      { namespace: "custom", key: "color", value: "Black", name: "Color" },
+      { namespace: "custom", key: "composition", value: "Down/Polyester", name: "Composition" },
+      { namespace: "custom", key: "ff_designer_id", value: "OUTW-CG-001" },
+      { namespace: "custom", key: "gender", value: "Kids" },
+      { namespace: "custom", key: "age", value: "Kids" },
+      { namespace: "custom", key: "apparel_type", value: "Outerwear" },
+      { namespace: "custom", key: "detailed_description", value: "Black down-filled outerwear jacket for kids." },
+      { namespace: "custom", key: "total_number_of_pieces", value: "1" },
+    ],
+  };
+}
+
+function runApparelFallbackPushability() {
+  console.log(
+    "Case 19: Apparel fallback schema produces a pushable payload when live /i1 schema is unavailable",
+  );
+  const product = canadaGooseKidsApparelProduct();
+  const apparelFallback = FALLBACK_CATEGORY_SCHEMAS.Apparel.map((f) => ({
+    field: f.field,
+    required: f.required,
+    type: f.type,
+    options: f.options,
+  }));
+  const mapped = mapShopifyToJomashop(product, apparelFallback, "Apparel");
+  const { payload, pushDebug, missingRequired, missingTopLevel } = buildJomashopProductPayload(
+    mapped,
+    undefined,
+    {
+      category: "Apparel",
+      brand: "Canada Goose",
+      manufacturer_id: 2774,
+      category_id: 35,
+    },
+  );
+
+  assert(
+    pushDebug.fallbackUnsafe === false,
+    `Apparel fallback push is NOT flagged fallbackUnsafe (got ${pushDebug.fallbackUnsafe})`,
+  );
+  assert(
+    pushDebug.schemaLabelsExact === true,
+    `Apparel fallback push reports schemaLabelsExact === true`,
+  );
+  assert(
+    missingTopLevel.length === 0,
+    `Apparel fallback push has no missing top-level fields (got ${JSON.stringify(missingTopLevel)})`,
+  );
+  assert(
+    missingRequired.length === 0,
+    `Apparel fallback push has no missing required fields when source data is present (got ${JSON.stringify(missingRequired)})`,
+  );
+  assert(payload.manufacturer_id === 2774, `payload.manufacturer_id propagated (got ${payload.manufacturer_id})`);
+  assert(payload.category_id === 35, `payload.category_id propagated (got ${payload.category_id})`);
+}
+
+function runApparelFallbackPayloadIsTitleCase() {
+  console.log(
+    "Case 20: Apparel fallback payload uses Title Case property keys and never emits lowercase legacy fields",
+  );
+  const product = canadaGooseKidsApparelProduct();
+  const apparelFallback = FALLBACK_CATEGORY_SCHEMAS.Apparel.map((f) => ({
+    field: f.field,
+    required: f.required,
+    type: f.type,
+    options: f.options,
+  }));
+  const mapped = mapShopifyToJomashop(product, apparelFallback, "Apparel");
+  const { payload } = buildJomashopProductPayload(mapped, undefined, {
+    category: "Apparel",
+    brand: "Canada Goose",
+    manufacturer_id: 2774,
+    category_id: 35,
+  });
+
+  const forbiddenTopLevel = [
+    "brand",
+    "category",
+    "gender",
+    "size",
+    "size_system",
+    "color",
+    "material",
+    "category_type",
+    "country_of_origin",
+    "age",
+    "apparel_type",
+    "style",
+    "hardware",
+    "model",
+    "composition",
+  ];
+  for (const k of forbiddenTopLevel) {
+    assert(
+      !(k in payload),
+      `Apparel fallback payload top-level excludes forbidden "${k}" (got top-level ${JSON.stringify(Object.keys(payload))})`,
+    );
+  }
+  const props = (payload.properties as Record<string, unknown>) || {};
+  const propKeys = Object.keys(props);
+  assert(propKeys.length > 0, `Apparel fallback payload.properties is populated (got ${JSON.stringify(propKeys)})`);
+  assert(
+    propKeys.every((k) => /[A-Z]/.test(k) || /\s/.test(k)),
+    `Apparel fallback payload.properties uses ONLY Title Case labels (got ${JSON.stringify(propKeys)})`,
+  );
+  for (const k of forbiddenTopLevel) {
+    assert(
+      !(k in props),
+      `Apparel fallback payload.properties excludes lowercase legacy key "${k}" (got ${JSON.stringify(propKeys)})`,
+    );
+  }
+  // Spot-check known Title Case labels for Apparel.
+  assert("Gender" in props, `Apparel fallback payload.properties carries "Gender"`);
+  assert("Apparel Type" in props, `Apparel fallback payload.properties carries "Apparel Type"`);
+  assert("Color" in props, `Apparel fallback payload.properties carries "Color"`);
+}
+
 // ---------- Case 18: every SUPPORTED_CATEGORIES entry has exact-label fallback ----------
 //
 // Guard rail. A future category addition that forgets to put exact Title
@@ -1252,6 +1398,8 @@ runCanonicalFieldsExtraction();
 runStrictShapePerCategory();
 runFallbackUnsafeGate();
 runEverySupportedCategoryHasExactLabels();
+runApparelFallbackPushability();
+runApparelFallbackPayloadIsTitleCase();
 
 if (failures > 0) {
   console.error(`\n${failures} assertion(s) failed.`);

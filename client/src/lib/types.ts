@@ -110,6 +110,15 @@ export type MappedProduct = {
     category_record: { id: number | string; name: string } | null;
     i1_available: boolean;
   };
+  /** Where the category property schema for this row came from. "fallback"
+   *  means the bundled exact-label schema was used because the live lookup
+   *  was unavailable. The UI uses this to label the Category Properties
+   *  panel ("Live schema" vs "Fallback schema"). */
+  schema_source?: "live-i1" | "live-v1" | "fallback" | "none";
+  /** Field names + required flags from the resolved schema. Surfaced so
+   *  the UI can render the Category Properties panel even when the Shopify
+   *  product lacks values for those fields. */
+  schema_fields?: Array<{ field: string; required: boolean }>;
   /** Compact echo of the raw Shopify metafields + options the mapper saw.
    *  Surfaced in the UI as an expandable debug panel for diagnosing
    *  missing-field complaints. */
