@@ -42,6 +42,7 @@ import {
 import { registerBulkRepairRoutes } from "./bulk_repair";
 import { registerCategoryMappingRoutes, lookupCategoryOverride } from "./category_mapping";
 import { registerBrandMappingRoutes, lookupBrandOverride, normalizeBrandKey } from "./brand_mapping";
+import { registerResolutionAuditRoutes } from "./resolution_audit";
 import { registerWebhookRoutes, registerShopifyWebhooks } from "./webhooks";
 
 // -------------------- helpers --------------------
@@ -1682,6 +1683,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   // ---------- Brand mapping workflow (Shopify brand → exact Jomashop brand) ----------
   registerBrandMappingRoutes(app);
+
+  // ---------- Brand & category resolution audit (XLSX export / import / apply) ----------
+  registerResolutionAuditRoutes(app);
 
   // ---------- Shopify webhooks (public, HMAC-verified) ----------
   registerWebhookRoutes(app);

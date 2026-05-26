@@ -461,6 +461,103 @@ function runResolvedRecordsRequiredForReadiness() {
   );
 }
 
+async function runResolutionAuditHelpers() {
+  const { brandLookupKey, editDistance, buildResolutionAuditWorkbook } = await import(
+    "../server/resolution_audit"
+  );
+  assert(
+    brandLookupKey("Tod's") === brandLookupKey("Tods"),
+    `brandLookupKey collapses apostrophe variations`,
+  );
+  assert(
+    brandLookupKey("Saint Laurent") === "saintlaurent",
+    `brandLookupKey strips whitespace and lowercases`,
+  );
+  assert(editDistance("kitten", "sitting") === 3, `editDistance basic Levenshtein distance`);
+  assert(editDistance("abc", "abc") === 0, `editDistance identical strings are zero`);
+  assert(editDistance("", "abc") === 3, `editDistance against empty string returns length`);
+
+  // Build a tiny fixture audit and confirm the workbook serializes.
+  const buf = await buildResolutionAuditWorkbook({
+    shopDomain: "test.myshopify.com",
+    fromCache: true,
+    cachedAt: Date.now(),
+    totalProducts: 2,
+    i1Available: true,
+    jomashopManufacturers: [
+      { id: 1, name: "Tod's" },
+      { id: 2, name: "Gucci" },
+    ],
+    jomashopCategories: [
+      { id: 10, name: "Footwear" },
+      { id: 11, name: "Handbags" },
+    ],
+    brandRows: [
+      {
+        shopify_brand: "Tods",
+        shopify_brand_normalized: "tods",
+        product_count: 3,
+        sample_titles: ["Tods loafer"],
+        sample_skus: ["TODS-1"],
+        current_override: "Tod's",
+        current_override_source: "operator",
+        outbound_brand: "Tod's",
+        exact_match: { id: 1, name: "Tod's" },
+        suggestion: null,
+        suggestion_distance: null,
+        status: "override",
+      },
+      {
+        shopify_brand: "Unknown",
+        shopify_brand_normalized: "unknown",
+        product_count: 1,
+        sample_titles: [],
+        sample_skus: [],
+        current_override: null,
+        current_override_source: null,
+        outbound_brand: "Unknown",
+        exact_match: null,
+        suggestion: null,
+        suggestion_distance: null,
+        status: "unresolved",
+      },
+    ],
+    categoryRows: [
+      {
+        shopify_category_code: "DRSH",
+        shopify_category_code_normalized: "drsh",
+        suggested_category: "Dress Shirts",
+        product_count: 5,
+        sample_titles: ["Cavalli Class Mens Shirt"],
+        sample_skus: ["CAV-1"],
+        current_override: null,
+        current_override_source: null,
+        outbound_category: "Dress Shirts",
+        exact_match: null,
+        suggestion: null,
+        suggestion_distance: null,
+        status: "unresolved",
+      },
+    ],
+    summary: {
+      distinctBrands: 2,
+      unresolvedBrands: 1,
+      fuzzyBrands: 0,
+      exactBrands: 0,
+      overrideBrands: 1,
+      distinctCategories: 1,
+      unresolvedCategories: 1,
+      fuzzyCategories: 0,
+      exactCategories: 0,
+      overrideCategories: 0,
+      totalProducts: 2,
+      notReadyProducts: 2,
+    },
+    warnings: [],
+  });
+  assert(buf.length > 1000, `audit XLSX workbook serializes to non-trivial buffer`);
+}
+
 runColorNavyCase();
 runDefinitionNameOnlyCase();
 runVariantSelectedOptionFallback();
@@ -469,6 +566,7 @@ runBuiltInCategoryDefaults();
 runBrandKeyNormalization();
 runManufacturerIdCarriedThrough();
 runResolvedRecordsRequiredForReadiness();
+await runResolutionAuditHelpers();
 
 if (failures > 0) {
   console.error(`\n${failures} assertion(s) failed.`);

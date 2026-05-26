@@ -19,6 +19,7 @@ import { apiRequest } from "@/lib/queryClient";
 import { BulkRepairCard } from "@/components/BulkRepair";
 import { CategoryMappingCard } from "@/components/CategoryMapping";
 import { BrandMappingCard } from "@/components/BrandMapping";
+import { ResolutionAuditCard } from "@/components/ResolutionAudit";
 import type { MappedProduct } from "@/lib/types";
 
 type OverrideFields = {
@@ -82,7 +83,21 @@ type ProductFilter =
   | "pushed"
   | "not_pushed"
   | "rejected"
+  | "unresolved_brand"
+  | "unresolved_category"
   | "sample";
+
+function brandUnresolved(p: MappedProduct): boolean {
+  const r = p.jomashop_resolution;
+  if (!r || !r.i1_available) return false;
+  return !r.manufacturer;
+}
+
+function categoryUnresolved(p: MappedProduct): boolean {
+  const r = p.jomashop_resolution;
+  if (!r || !r.i1_available) return false;
+  return !r.category_record;
+}
 
 function missingFieldsFor(p: MappedProduct): string[] {
   const out = new Set<string>();
@@ -296,7 +311,17 @@ export default function Products() {
 
   const filterCounts = useMemo(() => {
     const mapped = data?.mapped ?? [];
-    const counts = { all: mapped.length, ready: 0, missing: 0, pushed: 0, not_pushed: 0, rejected: 0, sample: 0 };
+    const counts = {
+      all: mapped.length,
+      ready: 0,
+      missing: 0,
+      pushed: 0,
+      not_pushed: 0,
+      rejected: 0,
+      unresolved_brand: 0,
+      unresolved_category: 0,
+      sample: 0,
+    };
     for (const p of mapped) {
       if (p.is_sample) counts.sample += 1;
       const miss = missingFieldsFor(p);
@@ -306,6 +331,8 @@ export default function Products() {
       else if (!p.is_sample) counts.not_pushed += 1;
       if (isReady(p)) counts.ready += 1;
       else if (miss.length > 0 && !p.is_sample) counts.missing += 1;
+      if (!p.is_sample && brandUnresolved(p)) counts.unresolved_brand += 1;
+      if (!p.is_sample && categoryUnresolved(p)) counts.unresolved_category += 1;
     }
     return counts;
   }, [data]);
@@ -338,6 +365,8 @@ export default function Products() {
       if (filter === "pushed") return state === "pushed";
       if (filter === "not_pushed") return state === "not_pushed" && !p.is_sample;
       if (filter === "rejected") return state === "rejected" || state === "failed";
+      if (filter === "unresolved_brand") return !p.is_sample && brandUnresolved(p);
+      if (filter === "unresolved_category") return !p.is_sample && categoryUnresolved(p);
       if (filter === "sample") return p.is_sample === true;
       return true;
     });
@@ -420,6 +449,12 @@ export default function Products() {
     { key: "pushed", label: "Pushed", count: filterCounts.pushed },
     { key: "not_pushed", label: "Not pushed", count: filterCounts.not_pushed },
     { key: "rejected", label: "Rejected / Needs fix", count: filterCounts.rejected },
+    { key: "unresolved_brand", label: "Unresolved brand", count: filterCounts.unresolved_brand },
+    {
+      key: "unresolved_category",
+      label: "Unresolved category",
+      count: filterCounts.unresolved_category,
+    },
   ];
   if (filterCounts.sample > 0) {
     filters.push({ key: "sample", label: "Sample only", count: filterCounts.sample });
@@ -454,6 +489,8 @@ export default function Products() {
       ) : (
         <div className="space-y-4">
           {banner}
+
+          <ResolutionAuditCard onAfterApply={() => refresh.mutate()} />
 
           <CategoryMappingCard onAfterApply={() => refresh.mutate()} />
 
