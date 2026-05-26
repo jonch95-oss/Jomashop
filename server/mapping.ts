@@ -196,7 +196,11 @@ const SMALL_LEATHER_GOODS_CODES = new Set([
 export function isAmbiguousCategoryCode(rawCategory: string | null | undefined): boolean {
   if (!rawCategory) return false;
   const norm = rawCategory.toLowerCase().trim();
-  return SMALL_LEATHER_GOODS_CODES.has(norm);
+  if (!SMALL_LEATHER_GOODS_CODES.has(norm)) return false;
+  // A built-in default mapping (e.g. WALL → Accessories, CARD → Accessories)
+  // resolves the ambiguity — no operator decision needed.
+  if (BUILT_IN_CATEGORY_OVERRIDES[normalizeCategoryCode(rawCategory)]) return false;
+  return true;
 }
 
 /**
@@ -208,6 +212,119 @@ export function isAmbiguousCategoryCode(rawCategory: string | null | undefined):
 export function normalizeCategoryCode(raw: string | null | undefined): string {
   if (!raw) return "";
   return String(raw).toLowerCase().trim().replace(/[^a-z0-9]+/g, "");
+}
+
+/**
+ * Built-in Shopify category code → Jomashop category mappings. Keyed by the
+ * canonical normalized code (lowercase, alphanumeric only). Operator-saved
+ * overrides in the `category_overrides` SQLite table take precedence; these
+ * defaults fill the rest so products with known codes don't show as
+ * "Needs category verification" out of the box.
+ *
+ * Target names match the live Jomashop category list (Footwear, Accessories,
+ * Clothing, Handbags).
+ */
+export const BUILT_IN_CATEGORY_OVERRIDES: Record<string, string> = {
+  boot: "Footwear",
+  card: "Accessories",
+  rtw: "Clothing",
+  accessori: "Clothing",
+  pksq: "Clothing",
+  outw: "Clothing",
+  phon: "Clothing",
+  jack: "Clothing",
+  tie1: "Clothing",
+  dres: "Clothing",
+  jewelry: "Clothing",
+  drsh: "Clothing",
+  tuxe: "Clothing",
+  sung: "Clothing",
+  tops: "Clothing",
+  blzr: "Clothing",
+  suit: "Clothing",
+  swsh: "Clothing",
+  opti: "Clothing",
+  shir: "Clothing",
+  crew: "Clothing",
+  hat1: "Clothing",
+  luggage: "Clothing",
+  neck: "Clothing",
+  scoat: "Clothing",
+  tshr: "Clothing",
+  chol: "Clothing",
+  clth: "Clothing",
+  kchn: "Clothing",
+  shrt: "Clothing",
+  sock: "Clothing",
+  ring: "Clothing",
+  trou: "Clothing",
+  coat: "Clothing",
+  glasses: "Clothing",
+  jean: "Clothing",
+  pant: "Clothing",
+  pins: "Clothing",
+  pouc: "Clothing",
+  scrf: "Clothing",
+  skrt: "Clothing",
+  vest: "Clothing",
+  bags: "Handbags",
+  hand: "Handbags",
+  tote: "Handbags",
+  shld: "Handbags",
+  bpck: "Handbags",
+  crbd: "Handbags",
+  bltb: "Handbags",
+  toph: "Handbags",
+  heel: "Footwear",
+  shoes: "Footwear",
+  sand: "Footwear",
+  loaf: "Footwear",
+  pump: "Footwear",
+  flip: "Footwear",
+  mule: "Footwear",
+  ball: "Footwear",
+  derby: "Footwear",
+  flat: "Footwear",
+  slpr: "Footwear",
+  dsho: "Footwear",
+  snek: "Footwear",
+  wall: "Accessories",
+};
+
+/**
+ * Return the built-in default Jomashop category name for a raw Shopify
+ * category code, or null when no default mapping exists.
+ */
+export function lookupBuiltInCategoryDefault(
+  rawCategory: string | null | undefined,
+): string | null {
+  const norm = normalizeCategoryCode(rawCategory);
+  if (!norm) return null;
+  return BUILT_IN_CATEGORY_OVERRIDES[norm] ?? null;
+}
+
+/**
+ * Coerce a Jomashop category name (which may be Footwear/Accessories outside
+ * the SUPPORTED_CATEGORIES enum) into one of the SupportedCategory values
+ * used for schema resolution. Footwear → Shoes, Accessories → Clothing,
+ * everything else falls back to the closest exact / substring match.
+ */
+export function coerceJomashopToSupported(
+  jomashopCategoryName: string | null | undefined,
+): SupportedCategory | null {
+  if (!jomashopCategoryName) return null;
+  const lower = String(jomashopCategoryName).toLowerCase().trim();
+  if (!lower) return null;
+  // Direct match against the enum.
+  const direct = SUPPORTED_CATEGORIES.find((c) => c.toLowerCase() === lower);
+  if (direct) return direct;
+  // Known Jomashop categories outside the enum.
+  if (lower === "footwear") return "Shoes";
+  if (lower === "accessories") return "Clothing";
+  // Substring fallback (e.g. "Dress Shirts" → "Clothing"-adjacent? we keep
+  // this conservative — prefer exact map above).
+  const sub = SUPPORTED_CATEGORIES.find((c) => lower.includes(c.toLowerCase()));
+  return sub ?? null;
 }
 
 /** Resolve option index for a named option, e.g. "Size" → option2. */

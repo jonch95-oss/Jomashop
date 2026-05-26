@@ -15,6 +15,9 @@ import {
   type SupportedCategory,
 } from "@shared/schema";
 import {
+  BUILT_IN_CATEGORY_OVERRIDES,
+  coerceJomashopToSupported,
+  lookupBuiltInCategoryDefault,
   normalizeCategoryCode,
   type MappedProduct,
 } from "./mapping";
@@ -181,6 +184,7 @@ export async function aggregateCategoryCodes(): Promise<CategoryAggregateResult>
   const rows: CategoryAggregateRow[] = [];
   byCode.forEach((entry, key) => {
     const override = overrides.get(key);
+    const builtIn = BUILT_IN_CATEGORY_OVERRIDES[key] ?? null;
     rows.push({
       shopify_category_code: entry.raw,
       shopify_category_code_normalized: key,
@@ -189,8 +193,11 @@ export async function aggregateCategoryCodes(): Promise<CategoryAggregateResult>
       missing_count: entry.missing,
       sample_titles: entry.titles,
       sample_skus: entry.skus,
-      current_jomashop_category: override?.jomashopCategory ?? null,
-      current_override_notes: override?.notes ?? null,
+      current_jomashop_category:
+        override?.jomashopCategory ?? builtIn ?? null,
+      current_override_notes:
+        override?.notes ??
+        (builtIn ? "built-in default (override to change)" : null),
       jomashop_schema_loaded: entry.schemaLoaded,
       ambiguous: entry.ambiguous,
     });
@@ -414,27 +421,46 @@ function gcSessions(): void {
 // ---------- Override application helpers ----------
 
 /**
- * Look up the operator-supplied override for a given Shopify category code.
+ * Look up the override for a given Shopify category code.
+ *
+ * Precedence:
+ *   1. Operator-saved row in `category_overrides` (SQLite, Excel-driven).
+ *   2. Built-in seed mapping shipped with the tool (BUILT_IN_CATEGORY_OVERRIDES).
+ *
  * Used by buildPreview to flip readiness without a full Shopify re-fetch.
- * Returns null when no override is set.
+ * Returns null only when neither source has a mapping.
  */
 export function lookupCategoryOverride(
   rawCategory: string | null | undefined,
-): { jomashopCategory: string; supportedCategory: SupportedCategory | null } | null {
+): {
+  jomashopCategory: string;
+  supportedCategory: SupportedCategory | null;
+  source: "operator" | "built-in";
+} | null {
   const norm = normalizeCategoryCode(rawCategory);
   if (!norm) return null;
   const row = storage.getCategoryOverride(norm);
-  if (!row) return null;
-  // Try to coerce to one of the SUPPORTED_CATEGORIES enum values so we can
-  // load a schema. Fallback: leave null and let the caller treat it as a free
-  // category name (the schema may still be live).
-  const lower = row.jomashopCategory.toLowerCase();
-  const supported =
-    SUPPORTED_CATEGORIES.find((c) => c.toLowerCase() === lower) ||
-    SUPPORTED_CATEGORIES.find((c) => lower.includes(c.toLowerCase())) ||
-    null;
-  return { jomashopCategory: row.jomashopCategory, supportedCategory: supported };
+  if (row) {
+    return {
+      jomashopCategory: row.jomashopCategory,
+      supportedCategory: coerceJomashopToSupported(row.jomashopCategory),
+      source: "operator",
+    };
+  }
+  const builtIn = lookupBuiltInCategoryDefault(rawCategory);
+  if (builtIn) {
+    return {
+      jomashopCategory: builtIn,
+      supportedCategory: coerceJomashopToSupported(builtIn),
+      source: "built-in",
+    };
+  }
+  return null;
 }
+
+// Re-export the built-in table so callers (e.g. XLSX export) can surface the
+// default mapped category alongside operator-saved rows.
+export { BUILT_IN_CATEGORY_OVERRIDES };
 
 // ---------- Route registration ----------
 

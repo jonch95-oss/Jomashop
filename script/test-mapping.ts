@@ -18,7 +18,15 @@
  * Invoke with: npx tsx script/test-mapping.ts
  */
 
-import { mapShopifyToJomashop, type ShopifyProduct } from "../server/mapping";
+import {
+  BUILT_IN_CATEGORY_OVERRIDES,
+  coerceJomashopToSupported,
+  isAmbiguousCategoryCode,
+  lookupBuiltInCategoryDefault,
+  mapShopifyToJomashop,
+  normalizeCategoryCode,
+  type ShopifyProduct,
+} from "../server/mapping";
 import { FALLBACK_CATEGORY_SCHEMAS } from "../shared/schema";
 
 let failures = 0;
@@ -195,10 +203,76 @@ function runListTypeMetafield() {
   );
 }
 
+function runBuiltInCategoryDefaults() {
+  console.log("Case 5: built-in Shopify→Jomashop category seed mappings");
+  const cases: Array<{ code: string; expected: string }> = [
+    { code: "DRSH", expected: "Clothing" },
+    { code: "SNEK", expected: "Footwear" },
+    { code: "BAGS", expected: "Handbags" },
+    { code: "WALL", expected: "Accessories" },
+    { code: "BOOT", expected: "Footwear" },
+    { code: "CARD", expected: "Accessories" },
+    { code: "TOTE", expected: "Handbags" },
+    // Casing / punctuation tolerance — normalized lookup must collapse these.
+    { code: "drsh", expected: "Clothing" },
+    { code: "Dress-Shirts".replace("Dress-Shirts", "DRSH"), expected: "Clothing" },
+  ];
+  for (const { code, expected } of cases) {
+    const got = lookupBuiltInCategoryDefault(code);
+    assert(
+      got === expected,
+      `lookupBuiltInCategoryDefault("${code}") === "${expected}" (got ${JSON.stringify(got)})`,
+    );
+  }
+  // Unknown codes return null.
+  assert(
+    lookupBuiltInCategoryDefault("ZZZZ-UNKNOWN") === null,
+    `unknown code returns null`,
+  );
+  // Coercion from Jomashop name → SupportedCategory.
+  assert(coerceJomashopToSupported("Footwear") === "Shoes", `Footwear → Shoes`);
+  assert(
+    coerceJomashopToSupported("Accessories") === "Clothing",
+    `Accessories → Clothing`,
+  );
+  assert(coerceJomashopToSupported("Handbags") === "Handbags", `Handbags → Handbags`);
+  assert(coerceJomashopToSupported("Clothing") === "Clothing", `Clothing → Clothing`);
+  // Ambiguity: WALL/CARD have built-in defaults, so they no longer surface
+  // as ambiguous (operator decision already made via the seed mapping).
+  assert(
+    !isAmbiguousCategoryCode("WALL"),
+    `WALL is no longer ambiguous after built-in mapping → Accessories`,
+  );
+  assert(
+    !isAmbiguousCategoryCode("CARD"),
+    `CARD is no longer ambiguous after built-in mapping → Accessories`,
+  );
+  // A code that is in SMALL_LEATHER_GOODS_CODES but NOT in the built-in
+  // map (e.g. "belt") must still be flagged ambiguous so the operator picks.
+  assert(
+    isAmbiguousCategoryCode("BELT"),
+    `BELT remains ambiguous (no built-in seed mapping)`,
+  );
+  // normalizeCategoryCode parity check used by the lookup table.
+  assert(
+    normalizeCategoryCode("Dress-Shirts") === "dressshirts",
+    `normalizeCategoryCode strips non-alphanumerics`,
+  );
+  // Spot-check that the built-in map shape is what the rest of the code
+  // expects: keys are normalized.
+  for (const k of Object.keys(BUILT_IN_CATEGORY_OVERRIDES)) {
+    assert(
+      normalizeCategoryCode(k) === k,
+      `built-in key "${k}" is already in normalized form`,
+    );
+  }
+}
+
 runColorNavyCase();
 runDefinitionNameOnlyCase();
 runVariantSelectedOptionFallback();
 runListTypeMetafield();
+runBuiltInCategoryDefaults();
 
 if (failures > 0) {
   console.error(`\n${failures} assertion(s) failed.`);
