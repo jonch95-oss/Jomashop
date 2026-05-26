@@ -82,6 +82,18 @@ export const categoryOverrides = sqliteTable("category_overrides", {
 // into a Jomashop-accepted option for a required enum field, so the push
 // isn't blocked indefinitely. Mirrors brand_overrides / category_overrides
 // but at the schema-property level rather than category-level.
+//
+// `verified` is the trust gate the payload builder consults before emitting
+// any override. A row is verified when one of the following holds:
+//   - it was checked against the live Jomashop accepted option list at save
+//     time (`acceptedOptionsJson` captured the live list and the target
+//     option is in it), or
+//   - the operator explicitly flagged it verified (`operatorVerified`) when
+//     no live option list is available.
+// Unverified rows are NEVER used to satisfy a required enum field — the
+// preflight surfaces "Fix mapping for X" instead so a bad guess never lands
+// in a Jomashop payload again (see commit history for "Article=Outerwear"
+// regression).
 export const enumOverrides = sqliteTable("enum_overrides", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   jomashopCategory: text("jomashop_category").notNull(),
@@ -89,6 +101,19 @@ export const enumOverrides = sqliteTable("enum_overrides", {
   sourceValue: text("source_value").notNull(),
   jomashopOption: text("jomashop_option").notNull(),
   notes: text("notes"),
+  // 1 when the override has passed the trust gate (live-options check or
+  // explicit operator confirmation). 0 otherwise. Stored as integer because
+  // SQLite booleans are integers. Default 0 so any pre-existing rows from
+  // earlier builds are treated as untrusted until the operator re-saves them.
+  verified: integer("verified", { mode: "boolean" }).notNull().default(false),
+  // When the operator confirmed without a live option list (e.g. Jomashop
+  // hasn't published Apparel "Article" accepted values). The audit endpoint
+  // requires explicit confirmation so a no-live-options save is auditable.
+  operatorVerified: integer("operator_verified", { mode: "boolean" }).notNull().default(false),
+  // Snapshot of the accepted Jomashop option list at the moment the row was
+  // saved (JSON string array). Empty / null when no live list was reachable.
+  // Used to render audit context and to gate future re-validations.
+  acceptedOptionsJson: text("accepted_options_json"),
   updatedAt: integer("updated_at").notNull(),
 });
 

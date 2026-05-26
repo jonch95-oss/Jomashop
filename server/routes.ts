@@ -48,7 +48,10 @@ import {
   registerEnumMappingRoutes,
   lookupEnumOverride,
   normalizeEnumSourceValue,
+  normalizeEnumCategoryKey,
+  normalizeEnumFieldKey,
   BUILT_IN_ENUM_OVERRIDES,
+  listBuiltInSeeds,
 } from "./enum_mapping";
 import { registerResolutionAuditRoutes } from "./resolution_audit";
 import { registerWebhookRoutes, registerShopifyWebhooks } from "./webhooks";
@@ -2554,12 +2557,14 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // ---------- Enum mapping workflow (source value → exact Jomashop option) ----------
   registerEnumMappingRoutes(app);
 
-  // Debug: walks the cached product preview and aggregates every required
-  // enum field that is currently unresolved (no live option list AND no
-  // operator-supplied mapping). Surfaces the source values the operator
-  // would need to map to unblock the push, grouped per category+field. Used
-  // by the Products page "Fix mapping" panel and by the audit dashboard.
-  app.get("/api/jomashop/required-enum-audit", (_req, res) => {
+  // Debug + dashboard: walks the cached product preview and aggregates every
+  // required enum field that is currently unresolved (no live option list AND
+  // no verified operator-supplied mapping). For each unresolved (category,
+  // field) pair it ALSO attempts to load the live Jomashop accepted option
+  // list via /i1/categories/:id/properties so the operator/UI can pick an
+  // exact accepted value when creating the verified override. Used by the
+  // Products page "Fix mapping" panel and by the audit dashboard.
+  app.get("/api/jomashop/required-enum-audit", async (_req, res) => {
     const stores = storage.listStores();
     const connected = stores.find((s) => s.oauthStatus === "connected");
     const shopDomain = connected?.shopDomain ?? null;
@@ -2570,6 +2575,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         shopDomain,
         totalProducts: 0,
         unresolvedFields: [],
+        resolvedFields: [],
         note:
           "No cached product preview. Open the Products page (or POST /api/products/refresh) to populate the cache.",
       });
@@ -2594,7 +2600,11 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       sample_titles: string[];
       current_override: string | null;
       current_override_source: "operator" | "built-in" | null;
+      current_override_verified: boolean;
+      accepted_options: string[] | null;
+      accepted_options_source: "live" | "fallback" | "unknown";
       resolved: boolean;
+      remediation: string;
     };
     const byKey = new Map<string, Entry>();
     for (const m of allMapped) {
@@ -2602,8 +2612,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const unverified = Array.isArray(m.unverified_required_options)
         ? m.unverified_required_options
         : [];
-      // Each entry includes the schema field + the canonical source value we
-      // tried to send (raw_category fallback). Group by (cat, field, value).
       for (const u of unverified) {
         const field = String((u as any)?.field || "").trim();
         const sourceValue =
@@ -2634,11 +2642,89 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             sample_titles: m.name ? [String(m.name)] : [],
             current_override: override?.jomashopOption ?? null,
             current_override_source: override?.source ?? null,
+            current_override_verified: override?.verified ?? false,
+            accepted_options: null,
+            accepted_options_source: "unknown",
             resolved: Boolean(override),
+            remediation: "",
           });
         }
       }
     }
+
+    // Decorate every unique (category, field) with the live accepted options
+    // list when available — folded into each entry. We cache the result per
+    // category so we don't refetch /i1 for every grouped source value.
+    type FieldAccepted = {
+      options: string[];
+      source: "live" | "fallback" | "unknown";
+    };
+    const acceptedByCatField = new Map<string, FieldAccepted>();
+    async function loadAccepted(category: string): Promise<Map<string, FieldAccepted>> {
+      const out = new Map<string, FieldAccepted>();
+      const fallback = (FALLBACK_CATEGORY_SCHEMAS as any)[category] || [];
+      for (const f of fallback) {
+        if (f?.type === "enum" && Array.isArray(f.options) && f.options.length > 0) {
+          const verified = f.options_unverified !== true;
+          out.set(normalizeEnumFieldKey(f.field), {
+            options: [...f.options],
+            source: verified ? "fallback" : "unknown",
+          });
+        }
+      }
+      if (jomashopConfigured()) {
+        const catResolve = await resolveCategoryRecord(category).catch(() => null);
+        const liveId =
+          catResolve && (catResolve as any).ok && (catResolve as any).configured && (catResolve as any).exact
+            ? (catResolve as any).exact.id
+            : null;
+        if (liveId !== null) {
+          const propsResp = await getCategoryPropertiesI1(liveId).catch(() => null);
+          if (propsResp && (propsResp as any).ok && (propsResp as any).data) {
+            const liveSchema = normalizeI1CategorySchema((propsResp as any).data);
+            for (const p of liveSchema) {
+              if (Array.isArray(p.options) && p.options.length > 0) {
+                out.set(normalizeEnumFieldKey(p.field), {
+                  options: [...p.options],
+                  source: "live",
+                });
+              }
+            }
+          }
+        }
+      }
+      return out;
+    }
+
+    const seenCats = new Set<string>();
+    for (const e of Array.from(byKey.values())) seenCats.add(e.jomashop_category);
+    for (const c of Array.from(seenCats)) {
+      try {
+        const m = await loadAccepted(c);
+        for (const [field, accepted] of Array.from(m.entries())) {
+          acceptedByCatField.set(`${c.toLowerCase()}|${field}`, accepted);
+        }
+      } catch {
+        // ignore — entries fall back to unknown
+      }
+    }
+
+    for (const e of Array.from(byKey.values())) {
+      const k = `${e.jomashop_category.toLowerCase()}|${normalizeEnumFieldKey(e.jomashop_field)}`;
+      const accepted = acceptedByCatField.get(k);
+      if (accepted) {
+        e.accepted_options = accepted.options;
+        e.accepted_options_source = accepted.source;
+      }
+      if (e.resolved) {
+        e.remediation = `Resolved by ${e.current_override_source ?? "override"} → "${e.current_override}".`;
+      } else if (e.accepted_options_source === "live") {
+        e.remediation = `Add a verified mapping: POST /api/enum-mapping/overrides {jomashop_category: "${e.jomashop_category}", jomashop_field: "${e.jomashop_field}", source_value: "${e.source_value}", jomashop_option: "<pick one>", accepted_options: ${JSON.stringify(e.accepted_options)}}.`;
+      } else {
+        e.remediation = `Live accepted option list unavailable for ${e.jomashop_category}/${e.jomashop_field}. Add a verified mapping with operator_verified: true once you confirm the Jomashop-accepted target: POST /api/enum-mapping/overrides {jomashop_category: "${e.jomashop_category}", jomashop_field: "${e.jomashop_field}", source_value: "${e.source_value}", jomashop_option: "<exact Jomashop label>", operator_verified: true}.`;
+      }
+    }
+
     const entries = Array.from(byKey.values()).sort(
       (a, b) => b.product_count - a.product_count,
     );
@@ -2649,6 +2735,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       unresolvedFields: entries.filter((e) => !e.resolved),
       resolvedFields: entries.filter((e) => e.resolved),
       builtInSeedCount: Object.keys(BUILT_IN_ENUM_OVERRIDES).length,
+      builtInSeeds: listBuiltInSeeds(),
     });
   });
 

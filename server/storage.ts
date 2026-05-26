@@ -109,6 +109,9 @@ sqlite.exec(`
     source_value TEXT NOT NULL,
     jomashop_option TEXT NOT NULL,
     notes TEXT,
+    verified INTEGER NOT NULL DEFAULT 0,
+    operator_verified INTEGER NOT NULL DEFAULT 0,
+    accepted_options_json TEXT,
     updated_at INTEGER NOT NULL,
     UNIQUE (jomashop_category, jomashop_field, source_value)
   );
@@ -207,6 +210,26 @@ try {
   }
   if (!existing.has("last_rejected_brand")) {
     sqlite.exec("ALTER TABLE push_statuses ADD COLUMN last_rejected_brand TEXT");
+  }
+} catch {
+  // ignore
+}
+
+// Lightweight migration: add verification columns to enum_overrides for
+// pre-existing tables. Older rows default verified=0 so the strict trust gate
+// in lookupEnumOverride treats them as unverified until the operator re-saves
+// them via /api/enum-mapping/overrides (which runs the live-options check).
+try {
+  const cols = sqlite.prepare("PRAGMA table_info(enum_overrides)").all() as Array<{ name: string }>;
+  const existing = new Set(cols.map((c) => c.name));
+  if (!existing.has("verified")) {
+    sqlite.exec("ALTER TABLE enum_overrides ADD COLUMN verified INTEGER NOT NULL DEFAULT 0");
+  }
+  if (!existing.has("operator_verified")) {
+    sqlite.exec("ALTER TABLE enum_overrides ADD COLUMN operator_verified INTEGER NOT NULL DEFAULT 0");
+  }
+  if (!existing.has("accepted_options_json")) {
+    sqlite.exec("ALTER TABLE enum_overrides ADD COLUMN accepted_options_json TEXT");
   }
 } catch {
   // ignore

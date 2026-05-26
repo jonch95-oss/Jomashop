@@ -47,10 +47,15 @@ import {
 import { FALLBACK_CATEGORY_SCHEMAS, SUPPORTED_CATEGORIES } from "../shared/schema";
 
 // Pure (storage-free) enum override resolver that mimics the production
-// lookupEnumOverride for tests — checks only the BUILT_IN_ENUM_OVERRIDES
-// map plus a caller-supplied per-test overlay. The production resolver also
-// consults the SQLite enum_overrides table, but the mapping logic itself is
-// independent of where the mapping is stored.
+// lookupEnumOverride for tests. Mirrors the strict trust gate used in
+// production:
+//  - overlay entries are treated as VERIFIED operator overrides (the test
+//    has already decided the mapping is correct, regardless of acceptedOptions).
+//  - BUILT_IN_ENUM_OVERRIDES entries are only honored when their `verified`
+//    flag is true AND the supplied acceptedOptions list contains the target.
+//  - When acceptedOptions is undefined, built-in seeds are NEVER honored —
+//    matches the production resolver. Overlay entries continue to be honored
+//    so tests can simulate an operator_verified row when no live list exists.
 function makeTestEnumResolver(overlay: Record<string, string> = {}) {
   return (
     category: string,
@@ -63,13 +68,21 @@ function makeTestEnumResolver(overlay: Record<string, string> = {}) {
     const v = normalizeEnumSourceValue(sourceValue);
     if (!cat || !f || !v) return null;
     const key = `${cat}|${f}|${v}`;
-    const candidate = overlay[key] ?? BUILT_IN_ENUM_OVERRIDES[key] ?? null;
-    if (!candidate) return null;
-    if (acceptedOptions && acceptedOptions.length > 0) {
-      const accepted = acceptedOptions.map((o) => o.toLowerCase().trim());
-      if (!accepted.includes(candidate.toLowerCase().trim())) return null;
+    const overlayHit = overlay[key];
+    if (overlayHit) {
+      if (acceptedOptions && acceptedOptions.length > 0) {
+        const accepted = acceptedOptions.map((o) => o.toLowerCase().trim());
+        if (!accepted.includes(overlayHit.toLowerCase().trim())) return null;
+      }
+      return overlayHit;
     }
-    return candidate;
+    const seed = BUILT_IN_ENUM_OVERRIDES[key];
+    if (!seed) return null;
+    if (!seed.verified) return null;
+    if (!acceptedOptions || acceptedOptions.length === 0) return null;
+    const accepted = acceptedOptions.map((o) => o.toLowerCase().trim());
+    if (!accepted.includes(seed.jomashopOption.toLowerCase().trim())) return null;
+    return seed.jomashopOption;
   };
 }
 
@@ -1308,11 +1321,17 @@ function runApparelFallbackPushability() {
     omit_when_unknown_enum: f.omit_when_unknown_enum,
     options_unverified: f.options_unverified,
   }));
-  // With the production enum-override resolver wired in, the built-in seed
-  // maps the "Outerwear" raw_category_code → Jomashop Article "Outerwear",
-  // so Article is satisfied and the payload is pushable end-to-end.
+  // With a verified operator override in place, the resolver maps the
+  // "Outerwear" raw_category_code → Jomashop Article "Outerwear", Article is
+  // satisfied, and the payload is pushable end-to-end. Built-in seeds are no
+  // longer trusted to do this — the operator must explicitly stand up the
+  // mapping (see lookupEnumOverride / enum_overrides table).
+  const verifiedOverlay = {
+    "apparel|article|outerwear": "Outerwear",
+    "apparel|article|outw": "Outerwear",
+  };
   const mapped = mapShopifyToJomashop(product, apparelFallback, "Apparel", {
-    resolveEnumOverride: makeTestEnumResolver(),
+    resolveEnumOverride: makeTestEnumResolver(verifiedOverlay),
   });
   const { payload, pushDebug, missingRequired, missingTopLevel } = buildJomashopProductPayload(
     mapped,
@@ -1574,23 +1593,27 @@ function runCanadaGooseApparelRejectionFix() {
     `Apparel: top-level payload excludes Material (got ${Object.keys(payload).join(",")})`,
   );
 
-  // (10) When the resolver IS supplied (built-in OUTW → Outerwear seed),
-  // the SAME product re-maps with Article = "Outerwear" emitted, no
-  // preflight block. This is the operator-unblock path for OUTW pushes.
+  // (10) When the resolver IS supplied AND a VERIFIED operator override
+  // exists for OUTW → "Outerwear", the SAME product re-maps with Article =
+  // "Outerwear" emitted, no preflight block. This is the operator-unblock
+  // path for OUTW pushes. Critically, this is now ONLY satisfied by an
+  // operator-supplied overlay — the prior built-in seed is no longer
+  // trusted (see lookupEnumOverride trust gate).
+  const verifiedOverlay = { "apparel|article|outw": "Outerwear" };
   const mappedWithResolver = mapShopifyToJomashop(product, apparelFallback, "Apparel", {
-    resolveEnumOverride: makeTestEnumResolver(),
+    resolveEnumOverride: makeTestEnumResolver(verifiedOverlay),
   });
   assert(
     mappedWithResolver.properties.Article === "Outerwear",
-    `Apparel: with enum resolver, Article = "Outerwear" via OUTW seed (got ${JSON.stringify(mappedWithResolver.properties.Article)})`,
+    `Apparel: with verified enum override, Article = "Outerwear" (got ${JSON.stringify(mappedWithResolver.properties.Article)})`,
   );
   assert(
     !(mappedWithResolver.missing_required || []).includes("Article"),
-    `Apparel: with resolver, Article is NOT missing_required (got ${JSON.stringify(mappedWithResolver.missing_required)})`,
+    `Apparel: with verified override, Article is NOT missing_required (got ${JSON.stringify(mappedWithResolver.missing_required)})`,
   );
   assert(
     !(mappedWithResolver.unverified_required_options || []).some((u) => u.field === "Article"),
-    `Apparel: with resolver, Article NOT in unverified_required_options (got ${JSON.stringify(mappedWithResolver.unverified_required_options)})`,
+    `Apparel: with verified override, Article NOT in unverified_required_options (got ${JSON.stringify(mappedWithResolver.unverified_required_options)})`,
   );
   const resolvedPayload = buildJomashopProductPayload(mappedWithResolver, undefined, {
     category: "Apparel",
@@ -1601,7 +1624,40 @@ function runCanadaGooseApparelRejectionFix() {
   const resolvedProps = (resolvedPayload.payload.properties as Record<string, unknown>) || {};
   assert(
     resolvedProps.Article === "Outerwear",
-    `Apparel: with resolver, payload.properties.Article === "Outerwear" (got ${JSON.stringify(resolvedProps.Article)})`,
+    `Apparel: with verified override, payload.properties.Article === "Outerwear" (got ${JSON.stringify(resolvedProps.Article)})`,
+  );
+
+  // (11) Without the verified overlay — i.e. relying on the (now-removed)
+  // built-in OUTW seed — Article MUST remain blocked. This is the
+  // regression guard for the 3103K61-4 incident: the prior build sent
+  // Article="Outerwear" from a never-verified seed and Jomashop rejected
+  // it. The test ensures we never re-introduce that behavior.
+  const mappedNoOverlay = mapShopifyToJomashop(product, apparelFallback, "Apparel", {
+    resolveEnumOverride: makeTestEnumResolver(),
+  });
+  assert(
+    mappedNoOverlay.properties.Article == null,
+    `Apparel: built-in seed alone NEVER emits Article (got ${JSON.stringify(mappedNoOverlay.properties.Article)})`,
+  );
+  assert(
+    (mappedNoOverlay.missing_required || []).includes("Article"),
+    `Apparel: built-in seed alone keeps Article in missing_required`,
+  );
+  assert(
+    (mappedNoOverlay.unverified_required_options || []).some((u) => u.field === "Article"),
+    `Apparel: built-in seed alone keeps Article in unverified_required_options`,
+  );
+  const noOverlayPayload = buildJomashopProductPayload(mappedNoOverlay, undefined, {
+    category: "Apparel",
+    brand: "Canada Goose",
+    manufacturer_id: 2774,
+    category_id: 35,
+  });
+  const noOverlayProps =
+    (noOverlayPayload.payload.properties as Record<string, unknown>) || {};
+  assert(
+    !("Article" in noOverlayProps),
+    `Apparel: built-in seed alone never sends Article in payload (got ${JSON.stringify(noOverlayProps.Article)})`,
   );
 }
 
@@ -2241,6 +2297,278 @@ function runEnumOverrideRespectsAcceptedOptions() {
   );
 }
 
+// ---------- Case 32: BUILT_IN_ENUM_OVERRIDES is no longer trusted for Apparel/Article ----------
+//
+// Regression for SKU 3103K61-4: prior to this change, BUILT_IN_ENUM_OVERRIDES
+// shipped a bundled `apparel|article|outw → Outerwear` seed that the mapper
+// emitted directly. Jomashop's live Apparel category does NOT accept that
+// value (the catch was the post-deploy "Article is not included in the list"
+// rejection). This test pins the new invariant: even with the seed map fully
+// present, the built-in entry MUST be ignored when (a) the seed is not
+// flagged `verified: true`, OR (b) no live accepted-options list confirms
+// the target. The product-side payload must omit Article entirely until a
+// verified operator override exists.
+function runCanadaGooseOutwBlocksWithoutVerifiedMapping() {
+  console.log(
+    "Case 32: Canada Goose OUTW Apparel blocks preflight and never sends Article from an unverified seed",
+  );
+  const apparelFallback = FALLBACK_CATEGORY_SCHEMAS.Apparel.map((f) => ({
+    field: f.field,
+    required: f.required,
+    type: f.type,
+    options: f.options,
+    allow_omit: f.allow_omit,
+    omit_when_unknown_enum: f.omit_when_unknown_enum,
+    options_unverified: f.options_unverified,
+  }));
+  const product: ShopifyProduct = {
+    id: "shopify-cg-3103K61-4",
+    title: "Canada Goose Kids Black Outerwear",
+    body_html: "<p>Kids outerwear in black.</p>",
+    vendor: "Canada Goose",
+    product_type: "OUTW",
+    tags: ["Kids"],
+    images: [{ src: "https://example.com/cg.jpg" }],
+    options: [{ name: "Size", values: ["4"] }],
+    variants: [
+      { id: 30001, sku: "3103K61-4", price: "650.00", inventory_quantity: 1, option1: "4" },
+    ],
+    metafields: [
+      { namespace: "custom", key: "color", value: "BLACK", name: "Color" },
+      { namespace: "custom", key: "ff_designer_id", value: "3103K61" },
+      { namespace: "custom", key: "detailed_description", value: "Kids outerwear in black." },
+      { namespace: "custom", key: "total_number_of_pieces", value: "1" },
+    ],
+  };
+
+  // Use the resolver WITHOUT an overlay — the only mappings available are
+  // the (potentially historical) built-in seeds. With the new trust gate the
+  // resolver must return null and Article must remain blocked.
+  const mapped = mapShopifyToJomashop(product, apparelFallback, "Apparel", {
+    resolveEnumOverride: makeTestEnumResolver(),
+  });
+  assert(
+    mapped.properties.Article == null,
+    `Case 32: Article not emitted from a built-in seed (got ${JSON.stringify(mapped.properties.Article)})`,
+  );
+  assert(
+    (mapped.missing_required || []).includes("Article"),
+    `Case 32: missing_required includes Article`,
+  );
+  assert(
+    (mapped.unverified_required_options || []).some((u) => u.field === "Article"),
+    `Case 32: unverified_required_options surfaces Article`,
+  );
+  const { payload, pushDebug } = buildJomashopProductPayload(mapped, undefined, {
+    category: "Apparel",
+    brand: "Canada Goose",
+    manufacturer_id: 2774,
+    category_id: 35,
+  });
+  const props = (payload.properties as Record<string, unknown>) || {};
+  assert(
+    !("Article" in props),
+    `Case 32: payload.properties never carries Article (got ${JSON.stringify(props.Article)})`,
+  );
+  assert(
+    pushDebug.unverifiedRequiredOptions.some((u) => u.field === "Article"),
+    `Case 32: pushDebug.unverifiedRequiredOptions surfaces Article`,
+  );
+
+  // Sanity: BUILT_IN_ENUM_OVERRIDES has no entries left for apparel/article —
+  // a regression test that the export is intentionally empty for the field
+  // that produced the 3103K61-4 rejection. (Future additions to the seed
+  // table MUST set verified=true and ship with documented accepted options.)
+  for (const key of Object.keys(BUILT_IN_ENUM_OVERRIDES)) {
+    if (key.startsWith("apparel|article|") || key.startsWith("clothing|article|")) {
+      const seed = BUILT_IN_ENUM_OVERRIDES[key];
+      assert(
+        seed.verified === true,
+        `Case 32: any remaining apparel/article seed must be flagged verified (key=${key}, seed=${JSON.stringify(seed)})`,
+      );
+    }
+  }
+}
+
+// ---------- Case 33: an unverified OUTW->Outerwear seed is rejected ----------
+//
+// Even if a future change re-introduces a seed for `apparel|article|outw`
+// with `verified: false`, the lookup MUST refuse to honor it. This proves
+// the trust gate is enforced inside the resolver, not just at the registration
+// site — we never want a careless test/fixture/seed update to flip on a
+// guessed mapping in production.
+function runUnverifiedBuiltInSeedIsRejected() {
+  console.log(
+    "Case 33: an unverified built-in OUTW → Outerwear seed is NEVER honored",
+  );
+  // Stash the original seed (if any) so the test doesn't leak state.
+  const seedKey = "apparel|article|outw";
+  const original = BUILT_IN_ENUM_OVERRIDES[seedKey];
+  try {
+    BUILT_IN_ENUM_OVERRIDES[seedKey] = { jomashopOption: "Outerwear", verified: false };
+    const resolver = makeTestEnumResolver();
+    // Even with a live accepted-options list that contains "Outerwear", an
+    // unverified seed must not be returned.
+    const result = resolver("Apparel", "Article", "OUTW", ["Outerwear", "Bomber"]);
+    assert(
+      result === null,
+      `Case 33: unverified seed never returned (got ${JSON.stringify(result)})`,
+    );
+    // And with no accepted-options list, definitely not returned.
+    const result2 = resolver("Apparel", "Article", "OUTW", undefined);
+    assert(
+      result2 === null,
+      `Case 33: unverified seed never returned without live options (got ${JSON.stringify(result2)})`,
+    );
+  } finally {
+    if (original === undefined) {
+      delete BUILT_IN_ENUM_OVERRIDES[seedKey];
+    } else {
+      BUILT_IN_ENUM_OVERRIDES[seedKey] = original;
+    }
+  }
+}
+
+// ---------- Case 34: verified mapping only allowed if accepted options contain target or operator_verified ----------
+//
+// Trust contract on operator-supplied overrides:
+//   (a) target IN acceptedOptions → honored.
+//   (b) target NOT IN acceptedOptions → rejected (the override is stale or
+//       miskeyed against the live schema).
+//   (c) no acceptedOptions provided → still honored when the override was
+//       saved as operator_verified (in the test resolver, an overlay entry
+//       stands in for an operator_verified row).
+function runVerifiedMappingRespectsAcceptedOrOperatorVerified() {
+  console.log(
+    "Case 34: verified mapping honored only when accepted_options contain target OR operator_verified with no live options",
+  );
+  const overlay = { "apparel|article|outw": "Outerwear" };
+  const resolver = makeTestEnumResolver(overlay);
+
+  // (a) Target in accepted list → honored.
+  const accepted = resolver("Apparel", "Article", "OUTW", ["Outerwear", "Bomber"]);
+  assert(accepted === "Outerwear", `Case 34a: target in accepted list → emitted (got ${JSON.stringify(accepted)})`);
+
+  // (b) Target NOT in accepted list → rejected.
+  const rejected = resolver("Apparel", "Article", "OUTW", ["Bomber", "Parka"]);
+  assert(
+    rejected === null,
+    `Case 34b: target not in accepted list → rejected (got ${JSON.stringify(rejected)})`,
+  );
+
+  // (c) No live options, but overlay (operator_verified surrogate) → honored.
+  const noLive = resolver("Apparel", "Article", "OUTW", undefined);
+  assert(
+    noLive === "Outerwear",
+    `Case 34c: no live options, operator-verified → emitted (got ${JSON.stringify(noLive)})`,
+  );
+}
+
+// ---------- Case 35: Footwear & Handbags required-enum regression ----------
+//
+// A category-spanning guard for the verified-override contract. Confirms:
+//  - Footwear's required "Shoe Size Type" stays blocked when only a stale
+//    (out-of-list) override exists, and resolves when a verified overlay
+//    inside the accepted list is supplied.
+//  - Handbags' required "Color" is unaffected by the enum mapping changes
+//    (it's a free-text string field, not an enum) — proves the trust gate
+//    didn't accidentally tighten non-enum fields.
+function runFootwearHandbagsRequiredEnumRegression() {
+  console.log(
+    "Case 35: Footwear/Handbags required-field regression around verified overrides",
+  );
+
+  // ---- Footwear ----
+  const footwearFallback = FALLBACK_CATEGORY_SCHEMAS.Footwear.map((f) => ({
+    field: f.field,
+    required: f.required,
+    type: f.type,
+    options: f.options,
+    allow_omit: f.allow_omit,
+    omit_when_unknown_enum: f.omit_when_unknown_enum,
+    options_unverified: f.options_unverified,
+  }));
+  const fwProduct: ShopifyProduct = {
+    id: "shopify-fw-regress",
+    title: "Some Boot",
+    body_html: "<p>Boot.</p>",
+    vendor: "Tods",
+    product_type: "BOOT",
+    tags: ["Men"],
+    images: [],
+    options: [{ name: "Size", values: ["10"] }],
+    variants: [
+      { id: 1, sku: "FW-REGRESS-1", price: "500.00", inventory_quantity: 1, option1: "10" },
+    ],
+    metafields: [
+      { namespace: "custom", key: "color", value: "Brown", name: "Color" },
+      { namespace: "custom", key: "size_scale", value: "Brazilian", name: "Size Scale" },
+      { namespace: "custom", key: "ff_designer_id", value: "FW-REGRESS-1" },
+    ],
+  };
+
+  // (i) A stale override that maps Brazilian → an option NOT in the accepted
+  //     list must be rejected — Shoe Size Type stays blocked.
+  const stale = mapShopifyToJomashop(fwProduct, footwearFallback, "Footwear", {
+    resolveEnumOverride: makeTestEnumResolver({
+      "footwear|shoesizetype|brazilian": "BR", // "BR" is not in accepted list
+    }),
+  });
+  assert(
+    (stale.missing_required || []).includes("Shoe Size Type"),
+    `Case 35: stale Footwear override leaves Shoe Size Type missing (got ${JSON.stringify(stale.missing_required)})`,
+  );
+
+  // (ii) A verified override that lands on an accepted option resolves it.
+  const verified = mapShopifyToJomashop(fwProduct, footwearFallback, "Footwear", {
+    resolveEnumOverride: makeTestEnumResolver({
+      "footwear|shoesizetype|brazilian": "US",
+    }),
+  });
+  assert(
+    verified.properties["Shoe Size Type"] === "US",
+    `Case 35: verified Footwear override emits Shoe Size Type = "US" (got ${JSON.stringify(verified.properties["Shoe Size Type"])})`,
+  );
+
+  // ---- Handbags ----
+  const handbagsFallback = FALLBACK_CATEGORY_SCHEMAS.Handbags.map((f) => ({
+    field: f.field,
+    required: f.required,
+    type: f.type,
+    options: f.options,
+    allow_omit: f.allow_omit,
+    omit_when_unknown_enum: f.omit_when_unknown_enum,
+    options_unverified: f.options_unverified,
+  }));
+  const hbProduct: ShopifyProduct = {
+    id: "shopify-hb-regress",
+    title: "Bag",
+    body_html: "<p>Bag.</p>",
+    vendor: "Saint Laurent",
+    product_type: "BAG",
+    tags: ["Women"],
+    images: [],
+    options: [{ name: "Color", values: ["Noir"] }],
+    variants: [
+      { id: 2, sku: "HB-REGRESS-1", price: "2350.00", inventory_quantity: 1, option1: "Noir" },
+    ],
+    metafields: [
+      { namespace: "custom", key: "color", value: "Noir", name: "Color" },
+      { namespace: "custom", key: "material", value: "Calfskin leather" },
+      { namespace: "custom", key: "ff_designer_id", value: "HB-REGRESS-1" },
+    ],
+  };
+  const hbMapped = mapShopifyToJomashop(hbProduct, handbagsFallback, "Handbags");
+  assert(
+    hbMapped.properties.Color === "Noir",
+    `Case 35: Handbags free-text required Color still resolves (got ${JSON.stringify(hbMapped.properties.Color)})`,
+  );
+  assert(
+    !(hbMapped.missing_required || []).includes("Color"),
+    `Case 35: Handbags Color not blocked by enum trust gate (got ${JSON.stringify(hbMapped.missing_required)})`,
+  );
+}
+
 runColorNavyCase();
 runDefinitionNameOnlyCase();
 runVariantSelectedOptionFallback();
@@ -2273,6 +2601,10 @@ runApparelArticleResolverUnblocks();
 runFootwearRequiredEnumOverride();
 runHandbagsOptionalEnumOverride();
 runEnumOverrideRespectsAcceptedOptions();
+runCanadaGooseOutwBlocksWithoutVerifiedMapping();
+runUnverifiedBuiltInSeedIsRejected();
+runVerifiedMappingRespectsAcceptedOrOperatorVerified();
+runFootwearHandbagsRequiredEnumRegression();
 
 if (failures > 0) {
   console.error(`\n${failures} assertion(s) failed.`);
