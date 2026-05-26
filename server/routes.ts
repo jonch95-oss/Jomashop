@@ -98,21 +98,31 @@ type CompactMappedProduct = {
   commercial_discount: number;
   jomashop_price: number | null;
   // Only the first image is retained — list views only ever render the primary.
+  // `images` is the array form expected by the client (single-element array)
+  // and `image` is kept for backwards compatibility with older caches.
   image: string | null;
+  images: string[];
+  // Capped description (Shopify-side normalization caps at 1500 chars before
+  // it enters memory). Needed by the push flow which reconstructs a Shopify
+  // product shape from the cached row.
+  description: string;
   // Lightweight property echo: keep only string/number/boolean values that
   // the UI uses to render the property summary chips. We do NOT keep null
   // properties (they'd add up across 3000 products) and we cap the total
   // count to a sane size.
   properties: Record<string, string | number | boolean>;
   variant_count: number;
-  // Compact variant projection. Drops the per-variant `options` object on
-  // products with many variants — list views show count, not full options.
+  // Variant projection. Keeps a small `options` object per variant because
+  // the list view renders option chips per row; without it the UI would
+  // crash trying to Object.entries(undefined). The objects themselves are
+  // already small (a few short strings).
   variants: Array<{
     vendor_sku: string;
     price: number | null;
     jomashop_price: number | null;
     quantity: number;
     status: "active" | "out_of_stock" | "inactive";
+    options: Record<string, string>;
   }>;
   warnings: string[];
   missing_required: string[];
@@ -152,13 +162,26 @@ function compactifyMapped(m: any): CompactMappedProduct {
     }
   }
   const variants = Array.isArray(m.variants)
-    ? m.variants.map((v: any) => ({
-        vendor_sku: String(v.vendor_sku ?? ""),
-        price: typeof v.price === "number" ? v.price : null,
-        jomashop_price: typeof v.jomashop_price === "number" ? v.jomashop_price : null,
-        quantity: typeof v.quantity === "number" ? v.quantity : 0,
-        status: (v.status ?? "inactive") as "active" | "out_of_stock" | "inactive",
-      }))
+    ? m.variants.map((v: any) => {
+        const optsIn =
+          v.options && typeof v.options === "object" && !Array.isArray(v.options)
+            ? v.options
+            : {};
+        const options: Record<string, string> = {};
+        for (const [k, val] of Object.entries(optsIn)) {
+          if (typeof k !== "string" || !k) continue;
+          if (val === null || val === undefined) continue;
+          options[k] = String(val);
+        }
+        return {
+          vendor_sku: String(v.vendor_sku ?? ""),
+          price: typeof v.price === "number" ? v.price : null,
+          jomashop_price: typeof v.jomashop_price === "number" ? v.jomashop_price : null,
+          quantity: typeof v.quantity === "number" ? v.quantity : 0,
+          status: (v.status ?? "inactive") as "active" | "out_of_stock" | "inactive",
+          options,
+        };
+      })
     : [];
   // Accept both the fresh-from-mapping shape (`images: string[]`) and the
   // already-compact shape (`image: string | null`) so this helper is
@@ -169,6 +192,8 @@ function compactifyMapped(m: any): CompactMappedProduct {
       : Array.isArray(m.images) && m.images.length > 0 && typeof m.images[0] === "string"
         ? m.images[0]
         : null;
+  const description =
+    typeof m.description === "string" ? m.description.slice(0, 1500) : "";
   return {
     category: m.category,
     is_sample: Boolean(m.is_sample),
@@ -180,11 +205,13 @@ function compactifyMapped(m: any): CompactMappedProduct {
     manufacturer_number: m.manufacturer_number ?? null,
     name: m.name ?? "",
     brand: m.brand ?? "",
+    description,
     price: typeof m.price === "number" ? m.price : null,
     msrp: typeof m.msrp === "number" ? m.msrp : null,
     commercial_discount: typeof m.commercial_discount === "number" ? m.commercial_discount : 0,
     jomashop_price: typeof m.jomashop_price === "number" ? m.jomashop_price : null,
     image: firstImage,
+    images: firstImage ? [firstImage] : [],
     properties,
     variant_count: variants.length,
     variants,

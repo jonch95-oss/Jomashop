@@ -869,7 +869,7 @@ export default function Products() {
                                 <tr key={v.vendor_sku} className="border-t border-border">
                                   <td className="px-3 py-1.5 font-mono">{v.vendor_sku}</td>
                                   <td className="px-3 py-1.5 text-muted-foreground">
-                                    {Object.entries(v.options).map(([k, val]) => `${k}: ${val}`).join(" • ") || "—"}
+                                    {Object.entries(v.options ?? {}).map(([k, val]) => `${k}: ${val}`).join(" • ") || "—"}
                                   </td>
                                   <td className="px-3 py-1.5 text-right tabular-nums">
                                     {v.price !== null ? `$${v.price.toFixed(2)}` : "—"}
@@ -1530,23 +1530,27 @@ export default function Products() {
  * push endpoint can re-run mapping with the live category schema.
  */
 function shopifyProductFromMapped(m: MappedProduct): Record<string, unknown> {
+  const images = Array.isArray(m.images) ? m.images : [];
   return {
     id: m.source.shopify_product_id,
     title: m.name,
-    body_html: m.description,
+    body_html: m.description ?? "",
     vendor: m.brand,
     product_type: m.category,
-    images: m.images.map((src) => ({ src })),
-    options: Object.keys(m.variants[0]?.options || {}).map((name) => ({ name, values: [] })),
-    variants: m.variants.map((v, i) => ({
-      id: m.source.shopify_variant_ids[i],
-      sku: v.vendor_sku,
-      price: v.price !== null ? String(v.price) : undefined,
-      inventory_quantity: v.quantity,
-      option1: Object.values(v.options)[0],
-      option2: Object.values(v.options)[1],
-      option3: Object.values(v.options)[2],
-    })),
+    images: images.map((src) => ({ src })),
+    options: Object.keys(m.variants[0]?.options ?? {}).map((name) => ({ name, values: [] })),
+    variants: m.variants.map((v, i) => {
+      const opts = v.options ?? {};
+      return {
+        id: m.source.shopify_variant_ids[i],
+        sku: v.vendor_sku,
+        price: v.price !== null ? String(v.price) : undefined,
+        inventory_quantity: v.quantity,
+        option1: Object.values(opts)[0],
+        option2: Object.values(opts)[1],
+        option3: Object.values(opts)[2],
+      };
+    }),
     metafields: [
       { namespace: "custom", key: "commercial_discount", value: m.commercial_discount },
       ...Object.entries(m.properties)
