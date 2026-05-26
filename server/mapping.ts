@@ -87,6 +87,25 @@ export type MappedProduct = {
   }>;
   warnings: string[];
   source: { shopify_product_id?: string | number; shopify_variant_ids: Array<string | number> };
+  /** Compact echo of the raw Shopify metafields + product options + variant
+   *  selectedOptions that the mapper saw for this product. Surfaced to the UI
+   *  as an expandable debug panel so the operator can confirm what Shopify
+   *  data was actually fetched (and diagnose missing-field complaints
+   *  without round-tripping through the Admin API). */
+  debug_raw: {
+    metafields: Array<{
+      namespace?: string;
+      key?: string;
+      name?: string;
+      label?: string;
+      value: string;
+    }>;
+    options: Array<{ name: string; values: string[] }>;
+    variants: Array<{
+      sku?: string;
+      options: Record<string, string>;
+    }>;
+  };
 };
 
 export type PushOverrides = {
@@ -210,11 +229,34 @@ function readMetafield(p: ShopifyProduct, key: string): string | undefined {
     if (normKey(`${m.namespace ?? ""}.${m.key ?? ""}`) === target) return true;
     if (normKey(m.name) === target) return true;
     if (normKey(m.label) === target) return true;
+    if (normKey(m.description) === target) return true;
     return false;
   });
   if (mf?.value === undefined || mf?.value === null) return undefined;
-  const v = String(mf.value).trim();
-  return v === "" ? undefined : v;
+  let raw = String(mf.value).trim();
+  if (raw === "") return undefined;
+  // Shopify list-type metafields are JSON-encoded arrays; flatten to a
+  // comma-joined string. Scalar metaobject_reference values may also be
+  // wrapped in quotes — strip a surrounding pair when present.
+  if (raw.startsWith("[") && raw.endsWith("]")) {
+    try {
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr)) {
+        const flat = arr
+          .map((x) => (x === null || x === undefined ? "" : String(x).trim()))
+          .filter((s) => s !== "")
+          .join(", ");
+        if (flat) return flat;
+      }
+    } catch {
+      // not JSON — fall through
+    }
+  }
+  if (raw.length >= 2 && raw.startsWith('"') && raw.endsWith('"')) {
+    raw = raw.slice(1, -1).trim();
+    if (raw === "") return undefined;
+  }
+  return raw;
 }
 
 /** First non-empty metafield value across the given candidate keys/labels. */
@@ -405,7 +447,28 @@ export function mapShopifyToJomashop(
           value = product.title;
           break;
         case "color":
-          value = readMetafieldAny(product, ["Color", "color", "colour", "custom.color", "luxe.color"]);
+          value = readMetafieldAny(product, [
+            "Color",
+            "color",
+            "Colour",
+            "colour",
+            "primary_color",
+            "Primary Color",
+            "ff_color",
+            "FF Color",
+            "custom.color",
+            "luxe.color",
+            "ff.color",
+            "global.color",
+            "custom.colour",
+            "luxe.colour",
+            "custom.primary_color",
+            "luxe.primary_color",
+            "custom.ff_color",
+            "luxe.ff_color",
+          ]);
+          // Fall back to product/variant option ("Color" / "Colour"). Use
+          // structured fields only — never infer color from product title.
           if (!value && colorOpt && firstVariant) {
             value = (firstVariant[colorOpt] as string | null) || undefined;
           }
@@ -562,6 +625,32 @@ export function mapShopifyToJomashop(
     );
   }
 
+  const debugRaw = {
+    metafields: (product.metafields || []).map((m) => ({
+      namespace: m?.namespace,
+      key: m?.key,
+      name: m?.name,
+      label: m?.label,
+      value: m?.value === null || m?.value === undefined ? "" : String(m.value),
+    })),
+    options: (product.options || []).map((o) => ({
+      name: o.name,
+      values: o.values,
+    })),
+    variants: (product.variants || []).map((v) => {
+      const opts: Record<string, string> = {};
+      (product.options || []).forEach((opt, idx) => {
+        const key = (`option${idx + 1}`) as "option1" | "option2" | "option3";
+        const val = v[key];
+        if (val) opts[opt.name] = String(val);
+      });
+      return {
+        sku: v.sku,
+        options: opts,
+      };
+    }),
+  };
+
   return {
     missing_required: missingRequiredProps,
     missing_top_level: missingTopLevelFields,
@@ -588,6 +677,7 @@ export function mapShopifyToJomashop(
       shopify_product_id: product.id,
       shopify_variant_ids: (product.variants || []).map((v) => v.id).filter(Boolean) as Array<string | number>,
     },
+    debug_raw: debugRaw,
   };
 }
 

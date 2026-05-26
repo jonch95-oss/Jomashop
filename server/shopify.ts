@@ -12,47 +12,17 @@ import type { ShopifyProduct } from "./mapping";
 
 const ADMIN_API_VERSION = "2024-10";
 
-// Metafield identifiers the integration cares about. We pull these by both
-// "namespace.key" form (preferred) and bare key form so older Shopify shops
-// that put everything under "custom" or the unnamespaced default still match.
-const METAFIELD_IDENTIFIERS: Array<{ namespace: string; key: string }> = [
-  { namespace: "custom", key: "ff_designer_id" },
-  { namespace: "luxe", key: "ff_designer_id" },
-  { namespace: "ff", key: "designer_id" },
-  { namespace: "custom", key: "designer_id" },
-  { namespace: "custom", key: "size_scale" },
-  { namespace: "luxe", key: "size_scale" },
-  { namespace: "custom", key: "upc" },
-  { namespace: "luxe", key: "upc" },
-  { namespace: "custom", key: "commercial_discount" },
-  { namespace: "luxe", key: "commercial_discount" },
-  { namespace: "custom", key: "size" },
-  { namespace: "luxe", key: "size" },
-  { namespace: "custom", key: "color" },
-  { namespace: "luxe", key: "color" },
-  { namespace: "custom", key: "gender" },
-  { namespace: "luxe", key: "gender" },
-  { namespace: "custom", key: "ff_sku" },
-  { namespace: "luxe", key: "ff_sku" },
-  { namespace: "custom", key: "ff_country_of_origin" },
-  { namespace: "luxe", key: "ff_country_of_origin" },
-  { namespace: "custom", key: "country_of_origin" },
-  { namespace: "luxe", key: "country_of_origin" },
-  { namespace: "custom", key: "collection" },
-  { namespace: "luxe", key: "collection" },
-  { namespace: "custom", key: "season" },
-  { namespace: "luxe", key: "season" },
-  { namespace: "custom", key: "category" },
-  { namespace: "luxe", key: "category" },
-  { namespace: "custom", key: "composition" },
-  { namespace: "luxe", key: "composition" },
-  { namespace: "custom", key: "material" },
-  { namespace: "luxe", key: "material" },
-  { namespace: "custom", key: "style" },
-  { namespace: "luxe", key: "style" },
-  { namespace: "custom", key: "size_system" },
-  { namespace: "luxe", key: "size_system" },
-];
+// Bump this whenever the normalization / mapping logic changes in a way that
+// invalidates cached preview payloads (e.g. a new metafield extraction rule).
+// Cached previews carrying a different mapperVersion are ignored on read.
+export const MAPPER_VERSION = 2;
+
+// We pass all metafields through the mapper rather than restricting to a
+// namespace+key allowlist. Shopify shops use a wide range of namespaces
+// (`custom`, `luxe`, `ff`, `global`, `app--*`, bare/default) and admin UI
+// definitions often expose human-readable labels ("Color") whose backing key
+// may differ ("primary_color", "color_value", ...). The mapper does the
+// matching by normalized key/label/name/definition.
 
 // ---------- AES-GCM helpers ----------
 
@@ -152,6 +122,7 @@ function buildProductsQuery(first: number, after: string | null): { query: strin
                   key
                   value
                   type
+                  definition { name }
                 }
               }
             }
@@ -200,7 +171,13 @@ type ShopifyGraphProduct = {
   images: { edges: Array<{ node: { url: string; altText: string | null } }> };
   metafields: {
     edges: Array<{
-      node: { namespace: string; key: string; value: string; type: string } | null;
+      node: {
+        namespace: string;
+        key: string;
+        value: string;
+        type: string;
+        definition?: { name: string | null } | null;
+      } | null;
     }>;
   };
   variants: {
@@ -245,25 +222,39 @@ function normalizeProduct(p: ShopifyGraphProduct): ShopifyProduct {
     };
   });
 
-  const wantedNamespaceKey = new Set(
-    METAFIELD_IDENTIFIERS.map((m) => `${m.namespace}.${m.key}`.toLowerCase()),
-  );
-  const wantedKey = new Set(METAFIELD_IDENTIFIERS.map((m) => m.key.toLowerCase()));
+  // Pass all metafields through. The mapper does its own matching by
+  // normalized key/label/name/definition so we don't pre-filter here — that
+  // would drop fields the mapper could otherwise resolve (e.g. a "Color"
+  // metafield whose backing key is `primary_color` in an unexpected
+  // namespace, or one only addressable by its admin-UI definition name).
   const metafields = (p.metafields?.edges ?? [])
     .map((e) => e.node)
-    .filter((m): m is { namespace: string; key: string; value: string; type: string } => m !== null)
-    .filter((m) => {
-      const ns = (m.namespace ?? "").toLowerCase();
-      const key = (m.key ?? "").toLowerCase();
-      return wantedNamespaceKey.has(`${ns}.${key}`) || wantedKey.has(key);
-    })
-    .map((m) => ({
-      namespace: m.namespace,
-      key: m.key,
-      value: m.value,
-      name: m.key,
-      label: m.key,
-    }));
+    .filter(
+      (
+        m,
+      ): m is {
+        namespace: string;
+        key: string;
+        value: string;
+        type: string;
+        definition?: { name: string | null } | null;
+      } => m !== null,
+    )
+    .map((m) => {
+      const defName = m.definition?.name ?? null;
+      return {
+        namespace: m.namespace,
+        key: m.key,
+        value: m.value,
+        // Surface the admin-UI definition name as `name`/`label` so the
+        // mapper's readMetafield can match against the human-readable
+        // label (e.g. "Color") even when the backing key is something
+        // else like "primary_color". Falls back to key when no
+        // definition is attached.
+        name: defName || m.key,
+        label: defName || m.key,
+      };
+    });
 
   return {
     id: numericIdFromGid(p.id),

@@ -782,6 +782,100 @@ export default function Products() {
                           </table>
                         </div>
                       </div>
+
+                      {p.debug_raw && (
+                        <div className="md:col-span-3">
+                          <details className="rounded border border-border bg-card/30 text-[11px]">
+                            <summary
+                              className="cursor-pointer select-none px-3 py-1.5 text-[10px] uppercase tracking-wider text-muted-foreground hover:text-foreground"
+                              data-testid={`toggle-debug-${p.vendor_sku}`}
+                            >
+                              Raw Shopify data (metafields, options, variants)
+                            </summary>
+                            <div className="space-y-3 px-3 pb-3 pt-1">
+                              <div>
+                                <div className="text-[9px] uppercase tracking-wider text-muted-foreground">
+                                  Metafields ({p.debug_raw.metafields.length})
+                                </div>
+                                {p.debug_raw.metafields.length === 0 ? (
+                                  <div className="mt-1 text-muted-foreground">
+                                    No metafields returned by Shopify.
+                                  </div>
+                                ) : (
+                                  <div className="mt-1 overflow-hidden rounded border border-border">
+                                    <table className="w-full font-mono text-[10px]">
+                                      <thead className="bg-card/60 text-[9px] uppercase text-muted-foreground">
+                                        <tr>
+                                          <th className="px-2 py-1 text-left">namespace.key</th>
+                                          <th className="px-2 py-1 text-left">name/label</th>
+                                          <th className="px-2 py-1 text-left">value</th>
+                                        </tr>
+                                      </thead>
+                                      <tbody>
+                                        {p.debug_raw.metafields.map((m, i) => (
+                                          <tr key={i} className="border-t border-border">
+                                            <td className="px-2 py-1">
+                                              {(m.namespace ?? "")}
+                                              {m.namespace ? "." : ""}
+                                              {m.key ?? ""}
+                                            </td>
+                                            <td className="px-2 py-1 text-muted-foreground">
+                                              {m.name || m.label || "—"}
+                                            </td>
+                                            <td className="px-2 py-1 break-all">
+                                              {m.value || "—"}
+                                            </td>
+                                          </tr>
+                                        ))}
+                                      </tbody>
+                                    </table>
+                                  </div>
+                                )}
+                              </div>
+                              <div>
+                                <div className="text-[9px] uppercase tracking-wider text-muted-foreground">
+                                  Product options
+                                </div>
+                                {p.debug_raw.options.length === 0 ? (
+                                  <div className="mt-1 text-muted-foreground">No options.</div>
+                                ) : (
+                                  <ul className="mt-1 space-y-0.5 font-mono">
+                                    {p.debug_raw.options.map((o, i) => (
+                                      <li key={i}>
+                                        <span className="text-muted-foreground">{o.name}:</span>{" "}
+                                        {o.values.join(" / ")}
+                                      </li>
+                                    ))}
+                                  </ul>
+                                )}
+                              </div>
+                              <div>
+                                <div className="text-[9px] uppercase tracking-wider text-muted-foreground">
+                                  Variant selected options
+                                </div>
+                                {p.debug_raw.variants.length === 0 ? (
+                                  <div className="mt-1 text-muted-foreground">No variants.</div>
+                                ) : (
+                                  <ul className="mt-1 space-y-0.5 font-mono">
+                                    {p.debug_raw.variants.map((v, i) => (
+                                      <li key={i}>
+                                        <span className="text-muted-foreground">
+                                          {v.sku || `variant-${i + 1}`}:
+                                        </span>{" "}
+                                        {Object.keys(v.options).length === 0
+                                          ? "—"
+                                          : Object.entries(v.options)
+                                              .map(([k, val]) => `${k}=${val}`)
+                                              .join(" • ")}
+                                      </li>
+                                    ))}
+                                  </ul>
+                                )}
+                              </div>
+                            </div>
+                          </details>
+                        </div>
+                      )}
                     </CardContent>
                   </Card>
                 );

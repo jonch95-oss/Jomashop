@@ -93,6 +93,23 @@ export type MappedProduct = {
    *  "Ready to push" filter so products with missing fields, unverified
    *  categories, or known-rejected pushes never show as ready. */
   readiness?: "ready" | "missing" | "needs-category-verification" | "rejected" | "sample";
+  /** Compact echo of the raw Shopify metafields + options the mapper saw.
+   *  Surfaced in the UI as an expandable debug panel for diagnosing
+   *  missing-field complaints. */
+  debug_raw?: {
+    metafields: Array<{
+      namespace?: string;
+      key?: string;
+      name?: string;
+      label?: string;
+      value: string;
+    }>;
+    options: Array<{ name: string; values: string[] }>;
+    variants: Array<{
+      sku?: string;
+      options: Record<string, string>;
+    }>;
+  };
 };
 
 export type SyncJob = {

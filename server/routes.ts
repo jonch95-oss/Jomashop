@@ -28,6 +28,7 @@ import {
   encryptToken,
   fetchShopifyProducts,
   getActiveShopifyConnection,
+  MAPPER_VERSION,
 } from "./shopify";
 import { registerBulkRepairRoutes } from "./bulk_repair";
 import { registerWebhookRoutes, registerShopifyWebhooks } from "./webhooks";
@@ -600,6 +601,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
     const usingSamples = dataSource === "sample";
     return {
+      mapperVersion: MAPPER_VERSION,
       schemas,
       mapped,
       count: mapped.length,
@@ -633,7 +635,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     );
 
     // Cache fast-path: when not forcing a refresh and no products were
-    // supplied, return the latest cached preview if one exists.
+    // supplied, return the latest cached preview if one exists AND it was
+    // produced by the current mapper version. A bumped MAPPER_VERSION
+    // automatically invalidates stale entries so old payloads (missing the
+    // new color/metafield resolution) are never served.
     if (!forceRefresh && (!Array.isArray(supplied) || supplied.length === 0)) {
       const conn = getActiveShopifyConnection();
       const cacheDomain =
@@ -643,10 +648,20 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         if (cached) {
           try {
             const payload = JSON.parse(cached.payloadJson);
-            return res.json({
-              ...payload,
-              fromCache: true,
-              lastRefreshedAt: cached.fetchedAt,
+            if (payload && payload.mapperVersion === MAPPER_VERSION) {
+              return res.json({
+                ...payload,
+                fromCache: true,
+                lastRefreshedAt: cached.fetchedAt,
+              });
+            }
+            // Stale cache (older mapper version) — drop it so we re-fetch.
+            storage.clearProductCache(cacheDomain);
+            storage.appendLog({
+              level: "info",
+              message: `Cleared product cache for ${cacheDomain} (mapperVersion ${payload?.mapperVersion ?? "<none>"} → ${MAPPER_VERSION})`,
+              detailsJson: null,
+              createdAt: Date.now(),
             });
           } catch {
             // fall through and refetch below
@@ -701,6 +716,16 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     if (!cached) return res.json({ cached: false, shopDomain });
     try {
       const payload = JSON.parse(cached.payloadJson);
+      if (!payload || payload.mapperVersion !== MAPPER_VERSION) {
+        storage.clearProductCache(shopDomain);
+        return res.json({
+          cached: false,
+          shopDomain,
+          reason: "stale-mapper-version",
+          cachedMapperVersion: payload?.mapperVersion ?? null,
+          mapperVersion: MAPPER_VERSION,
+        });
+      }
       return res.json({
         cached: true,
         shopDomain,
