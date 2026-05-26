@@ -89,6 +89,12 @@ export type MappedProduct = {
   jomashop_sku?: string | null;
   last_push_error?: string | null;
   last_pushed_at?: number | null;
+  /** Machine list returned by Jomashop on the last rejection (e.g. ["category", "brand"]). */
+  last_invalid_params?: string[] | null;
+  /** Exact category string that was rejected on the last push attempt. */
+  last_rejected_category?: string | null;
+  /** Exact brand string that was rejected on the last push attempt. */
+  last_rejected_brand?: string | null;
   /** Stricter readiness signal computed by the server. UI uses this for the
    *  "Ready to push" filter so products with missing fields, unverified
    *  categories, or known-rejected pushes never show as ready. */

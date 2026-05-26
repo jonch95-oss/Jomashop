@@ -73,6 +73,19 @@ export const categoryOverrides = sqliteTable("category_overrides", {
   updatedAt: integer("updated_at").notNull(),
 });
 
+// ---------- Brand override (operator-supplied Shopify brand → exact Jomashop brand) ----------
+// Used at push time to translate Shopify vendor/designer values into the exact
+// brand spelling Jomashop expects. Keyed by the normalized Shopify brand string
+// (lowercased, non-alphanumerics stripped) so "Tod's", "Tods", and "TODS" all
+// resolve to the same row. Mirror of category_overrides for brands.
+export const brandOverrides = sqliteTable("brand_overrides", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  shopifyBrand: text("shopify_brand").notNull().unique(),
+  jomashopBrand: text("jomashop_brand").notNull(),
+  notes: text("notes"),
+  updatedAt: integer("updated_at").notNull(),
+});
+
 // ---------- Sync jobs / logs ----------
 export const syncJobs = sqliteTable("sync_jobs", {
   id: integer("id").primaryKey({ autoIncrement: true }),
@@ -119,6 +132,13 @@ export const pushStatuses = sqliteTable("push_statuses", {
   // Stored mapped product JSON used as the base for inventory updates when a
   // Shopify webhook arrives without price/title context.
   lastPayloadJson: text("last_payload_json"),
+  // Jomashop validation context from the last rejection. invalid_params is the
+  // server's machine list ("category", "brand"); rejectedCategory / Brand are
+  // the exact strings sent in the most recent rejected payload so the UI can
+  // show "Jomashop rejected Footwear" without re-decoding payload JSON.
+  lastInvalidParams: text("last_invalid_params"),
+  lastRejectedCategory: text("last_rejected_category"),
+  lastRejectedBrand: text("last_rejected_brand"),
   lastPushedAt: integer("last_pushed_at").notNull(),
   updatedAt: integer("updated_at").notNull(),
 });
@@ -174,6 +194,7 @@ export const insertCredentialStatusSchema = createInsertSchema(credentialStatus)
 export const insertSkuMappingSchema = createInsertSchema(skuMappings).omit({ id: true });
 export const insertCategoryMappingSchema = createInsertSchema(categoryMappings).omit({ id: true });
 export const insertCategoryOverrideSchema = createInsertSchema(categoryOverrides).omit({ id: true });
+export const insertBrandOverrideSchema = createInsertSchema(brandOverrides).omit({ id: true });
 export const insertSyncJobSchema = createInsertSchema(syncJobs).omit({ id: true });
 export const insertSyncLogSchema = createInsertSchema(syncLogs).omit({ id: true });
 export const insertImportedOrderSchema = createInsertSchema(importedOrders).omit({ id: true });
@@ -192,6 +213,8 @@ export type CategoryMapping = typeof categoryMappings.$inferSelect;
 export type InsertCategoryMapping = z.infer<typeof insertCategoryMappingSchema>;
 export type CategoryOverride = typeof categoryOverrides.$inferSelect;
 export type InsertCategoryOverride = z.infer<typeof insertCategoryOverrideSchema>;
+export type BrandOverride = typeof brandOverrides.$inferSelect;
+export type InsertBrandOverride = z.infer<typeof insertBrandOverrideSchema>;
 export type SyncJob = typeof syncJobs.$inferSelect;
 export type InsertSyncJob = z.infer<typeof insertSyncJobSchema>;
 export type SyncLog = typeof syncLogs.$inferSelect;

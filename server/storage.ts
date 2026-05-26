@@ -4,6 +4,7 @@ import {
   skuMappings,
   categoryMappings,
   categoryOverrides,
+  brandOverrides,
   syncJobs,
   syncLogs,
   importedOrders,
@@ -22,6 +23,8 @@ import type {
   InsertCategoryMapping,
   CategoryOverride,
   InsertCategoryOverride,
+  BrandOverride,
+  InsertBrandOverride,
   SyncJob,
   InsertSyncJob,
   SyncLog,
@@ -89,6 +92,13 @@ sqlite.exec(`
     notes TEXT,
     updated_at INTEGER NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS brand_overrides (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    shopify_brand TEXT NOT NULL UNIQUE,
+    jomashop_brand TEXT NOT NULL,
+    notes TEXT,
+    updated_at INTEGER NOT NULL
+  );
   CREATE TABLE IF NOT EXISTS sync_jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     job_type TEXT NOT NULL,
@@ -128,6 +138,9 @@ sqlite.exec(`
     last_status INTEGER,
     last_error TEXT,
     last_payload_json TEXT,
+    last_invalid_params TEXT,
+    last_rejected_category TEXT,
+    last_rejected_brand TEXT,
     last_pushed_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     UNIQUE (shop_domain, shopify_sku)
@@ -166,6 +179,24 @@ try {
   // ignore — fresh installs already have the column via CREATE TABLE above
 }
 
+// Lightweight migration: add rejection-detail columns to push_statuses for
+// pre-existing tables. New installs already have these via CREATE TABLE above.
+try {
+  const cols = sqlite.prepare("PRAGMA table_info(push_statuses)").all() as Array<{ name: string }>;
+  const existing = new Set(cols.map((c) => c.name));
+  if (!existing.has("last_invalid_params")) {
+    sqlite.exec("ALTER TABLE push_statuses ADD COLUMN last_invalid_params TEXT");
+  }
+  if (!existing.has("last_rejected_category")) {
+    sqlite.exec("ALTER TABLE push_statuses ADD COLUMN last_rejected_category TEXT");
+  }
+  if (!existing.has("last_rejected_brand")) {
+    sqlite.exec("ALTER TABLE push_statuses ADD COLUMN last_rejected_brand TEXT");
+  }
+} catch {
+  // ignore
+}
+
 export interface IStorage {
   // Stores
   getStore(shopDomain: string): Store | undefined;
@@ -189,6 +220,12 @@ export interface IStorage {
   getCategoryOverride(shopifyCategoryCode: string): CategoryOverride | undefined;
   upsertCategoryOverride(input: InsertCategoryOverride): CategoryOverride;
   deleteCategoryOverride(shopifyCategoryCode: string): void;
+
+  // Brand overrides (Shopify brand → exact Jomashop brand)
+  listBrandOverrides(): BrandOverride[];
+  getBrandOverride(shopifyBrand: string): BrandOverride | undefined;
+  upsertBrandOverride(input: InsertBrandOverride): BrandOverride;
+  deleteBrandOverride(shopifyBrand: string): void;
 
   // Sync jobs/logs
   createSyncJob(input: InsertSyncJob): SyncJob;
@@ -328,6 +365,32 @@ export class DatabaseStorage implements IStorage {
     db.delete(categoryOverrides)
       .where(eq(categoryOverrides.shopifyCategoryCode, shopifyCategoryCode))
       .run();
+  }
+
+  listBrandOverrides(): BrandOverride[] {
+    return db.select().from(brandOverrides).all();
+  }
+  getBrandOverride(shopifyBrand: string): BrandOverride | undefined {
+    return db
+      .select()
+      .from(brandOverrides)
+      .where(eq(brandOverrides.shopifyBrand, shopifyBrand))
+      .get();
+  }
+  upsertBrandOverride(input: InsertBrandOverride): BrandOverride {
+    const existing = this.getBrandOverride(input.shopifyBrand);
+    if (existing) {
+      return db
+        .update(brandOverrides)
+        .set({ ...input })
+        .where(eq(brandOverrides.id, existing.id))
+        .returning()
+        .get();
+    }
+    return db.insert(brandOverrides).values(input).returning().get();
+  }
+  deleteBrandOverride(shopifyBrand: string): void {
+    db.delete(brandOverrides).where(eq(brandOverrides.shopifyBrand, shopifyBrand)).run();
   }
 
   createSyncJob(input: InsertSyncJob): SyncJob {

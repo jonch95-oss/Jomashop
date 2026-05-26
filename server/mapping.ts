@@ -871,19 +871,24 @@ export function buildJomashopProductPayload(
     (overrides.brand && overrides.brand.trim()) || mapped.brand;
 
   const payload: Record<string, unknown> = {
-    category,
     sku,
     vendor_sku: sku,
     manufacturer_number: manufacturerNumber,
     name: mapped.name,
     description: mapped.description,
-    brand,
     price,
     msrp,
     images: mapped.images,
     properties,
     ...properties,
   };
+  // Apply top-level overrides AFTER the property spread so that
+  // properties.brand / properties.category (populated from the live
+  // category schema) never clobber the operator-supplied outbound values.
+  // Without this, an override of "Tod's" gets overwritten by the Shopify
+  // vendor "Tods" pulled into the brand property earlier.
+  payload.category = category;
+  payload.brand = brand;
 
   const missingRequired = mapped.warnings.filter((w) => /Missing required/.test(w));
   const missingTopLevel: string[] = [];

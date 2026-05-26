@@ -18,6 +18,7 @@ import { PageHeader, EmptyState, LoadingRows } from "@/components/AppShell";
 import { apiRequest } from "@/lib/queryClient";
 import { BulkRepairCard } from "@/components/BulkRepair";
 import { CategoryMappingCard } from "@/components/CategoryMapping";
+import { BrandMappingCard } from "@/components/BrandMapping";
 import type { MappedProduct } from "@/lib/types";
 
 type OverrideFields = {
@@ -200,6 +201,19 @@ export default function Products() {
       setData(d);
       queryClient.invalidateQueries({ queryKey: ["/api/products/cache"] });
       queryClient.invalidateQueries({ queryKey: ["/api/push-statuses"] });
+    },
+  });
+
+  const saveBrandOverride = useMutation({
+    mutationFn: async (args: { shopify_brand: string; jomashop_brand: string }) => {
+      const res = await apiRequest("POST", "/api/brand-mapping/overrides", {
+        shopify_brand: args.shopify_brand,
+        jomashop_brand: args.jomashop_brand,
+      });
+      return (await res.json()) as { ok: boolean; error?: string };
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/brand-mapping/overrides"] });
     },
   });
 
@@ -428,6 +442,8 @@ export default function Products() {
           {banner}
 
           <CategoryMappingCard onAfterApply={() => refresh.mutate()} />
+
+          <BrandMappingCard onAfterApply={() => refresh.mutate()} />
 
           <BulkRepairCard onAfterApply={() => refresh.mutate()} />
 
@@ -659,6 +675,40 @@ export default function Products() {
                             data-testid={`text-last-push-error-${p.vendor_sku}`}
                           >
                             {p.last_push_error}
+                          </div>
+                        )}
+                        {(state === "rejected" || state === "failed") &&
+                          (p.last_rejected_category ||
+                            p.last_rejected_brand ||
+                            (p.last_invalid_params && p.last_invalid_params.length > 0)) && (
+                          <div
+                            data-testid={`block-rejected-details-${p.vendor_sku}`}
+                            className="mt-2 rounded border border-red-500/30 bg-red-500/5 p-2 text-[11px] text-red-600 dark:text-red-400"
+                          >
+                            <div className="font-medium">Jomashop rejected this push.</div>
+                            {p.last_rejected_category && (
+                              <div className="mt-0.5">
+                                Category sent:{" "}
+                                <code className="font-mono">{p.last_rejected_category}</code>
+                                {p.last_invalid_params?.includes("category") && (
+                                  <span className="ml-1 text-[10px] uppercase">(invalid)</span>
+                                )}
+                              </div>
+                            )}
+                            {p.last_rejected_brand && (
+                              <div className="mt-0.5">
+                                Brand sent:{" "}
+                                <code className="font-mono">{p.last_rejected_brand}</code>
+                                {p.last_invalid_params?.includes("brand") && (
+                                  <span className="ml-1 text-[10px] uppercase">(invalid)</span>
+                                )}
+                              </div>
+                            )}
+                            <div className="mt-1 text-[10px] opacity-80">
+                              Open the push modal and supply an exact category and/or brand
+                              override. Save the brand in the Brand mapping card above to apply
+                              it to all matching products.
+                            </div>
                           </div>
                         )}
                       </div>
@@ -945,6 +995,39 @@ export default function Products() {
                     ? "Live Shopify product — already pushed (this will update Jomashop)"
                     : "Live Shopify product"}
               </div>
+              {(pushTarget.mapped.push_state === "rejected" ||
+                pushTarget.mapped.push_state === "failed") &&
+                (pushTarget.mapped.last_rejected_category ||
+                  pushTarget.mapped.last_rejected_brand) && (
+                <div
+                  data-testid="block-modal-prior-rejection"
+                  className="rounded border border-red-500/40 bg-red-500/5 p-2 text-[11px] text-red-600 dark:text-red-400"
+                >
+                  <div className="font-medium">
+                    Jomashop rejected the previous push.
+                  </div>
+                  {pushTarget.mapped.last_rejected_category && (
+                    <div>
+                      Category sent:{" "}
+                      <code className="font-mono">
+                        {pushTarget.mapped.last_rejected_category}
+                      </code>
+                      {pushTarget.mapped.last_invalid_params?.includes("category") &&
+                        " — Jomashop says this category does not exist; pick another exact name or confirm in the portal."}
+                    </div>
+                  )}
+                  {pushTarget.mapped.last_rejected_brand && (
+                    <div>
+                      Brand sent:{" "}
+                      <code className="font-mono">
+                        {pushTarget.mapped.last_rejected_brand}
+                      </code>
+                      {pushTarget.mapped.last_invalid_params?.includes("brand") &&
+                        " — Jomashop says this brand does not exist; try the exact spelling shown in the Jomashop portal."}
+                    </div>
+                  )}
+                </div>
+              )}
               <div className="rounded border border-border bg-card/40 p-3">
                 <div className="mb-1 text-[10px] uppercase tracking-wider text-muted-foreground">
                   Product
@@ -1048,6 +1131,36 @@ export default function Products() {
                     <div className="mt-1 text-[10px] text-amber-500">
                       Warning: Brand must match Jomashop exactly. There is no brand lookup API, so this value cannot be verified before push.
                     </div>
+                    {overrides.brand.trim() !== "" &&
+                      pushTarget &&
+                      overrides.brand.trim() !==
+                        (pushTarget.mapped.brand || "").trim() && (
+                      <div className="mt-1 flex items-center gap-2">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          data-testid="button-save-brand-override-from-modal"
+                          disabled={saveBrandOverride.isPending}
+                          onClick={() =>
+                            saveBrandOverride.mutate({
+                              shopify_brand: pushTarget.mapped.brand,
+                              jomashop_brand: overrides.brand.trim(),
+                            })
+                          }
+                        >
+                          {saveBrandOverride.isPending ? (
+                            <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+                          ) : null}
+                          Save as brand override
+                        </Button>
+                        <span className="text-[10px] text-muted-foreground">
+                          {pushTarget.mapped.brand} → {overrides.brand.trim()} (applies to all matching products)
+                        </span>
+                        {saveBrandOverride.data?.ok && (
+                          <span className="text-[10px] text-emerald-500">saved</span>
+                        )}
+                      </div>
+                    )}
                   </div>
                   <div>
                     <Label htmlFor="ovr-sku" className="text-[10px] uppercase">

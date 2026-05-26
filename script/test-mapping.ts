@@ -20,6 +20,7 @@
 
 import {
   BUILT_IN_CATEGORY_OVERRIDES,
+  buildJomashopProductPayload,
   coerceJomashopToSupported,
   isAmbiguousCategoryCode,
   lookupBuiltInCategoryDefault,
@@ -27,6 +28,7 @@ import {
   normalizeCategoryCode,
   type ShopifyProduct,
 } from "../server/mapping";
+import { normalizeBrandKey } from "../server/brand_mapping";
 import { FALLBACK_CATEGORY_SCHEMAS } from "../shared/schema";
 
 let failures = 0;
@@ -268,11 +270,79 @@ function runBuiltInCategoryDefaults() {
   }
 }
 
+function runBrandKeyNormalization() {
+  console.log("Case 6: brand key normalization + override payload");
+  // Same canonical key for case/punctuation variants. Required for the
+  // brand_overrides lookup table to treat "Tods", "TODS", and "Tod's" as
+  // one row so the operator does not have to save the override three times.
+  assert(
+    normalizeBrandKey("Tods") === normalizeBrandKey("TODS"),
+    `normalizeBrandKey is case-insensitive`,
+  );
+  assert(
+    normalizeBrandKey("Tod's") === normalizeBrandKey("Tods"),
+    `normalizeBrandKey strips apostrophes (Tod's === Tods)`,
+  );
+  assert(
+    normalizeBrandKey("  Off-White  ") === normalizeBrandKey("offwhite"),
+    `normalizeBrandKey strips spaces and dashes`,
+  );
+  assert(
+    normalizeBrandKey(null) === "" && normalizeBrandKey(undefined) === "",
+    `normalizeBrandKey returns empty for null/undefined`,
+  );
+
+  // buildJomashopProductPayload must honour both category and brand
+  // overrides so the outbound payload exactly matches what the operator
+  // typed — this is what unlocks fixing a rejected product without
+  // mutating Shopify.
+  const product: ShopifyProduct = {
+    id: "shopify-tods-boot-1",
+    title: "Tods Womens Multicolored Boot",
+    vendor: "Tods",
+    product_type: "BOOT",
+    options: [{ name: "Size", values: ["35.5"] }],
+    variants: [
+      {
+        id: 9100,
+        sku: "XXW83B0BR70THYG409-35.5",
+        price: "1200.00",
+        inventory_quantity: 1,
+        option1: "35.5",
+      },
+    ],
+    metafields: [
+      { namespace: "custom", key: "ff_designer_id", value: "XXW83B0BR70THYG409" },
+      { namespace: "custom", key: "color", value: "Multicolor", name: "Color" },
+      { namespace: "custom", key: "composition", value: "Leather" },
+    ],
+  };
+  const props = clothingSchema();
+  const mapped = mapShopifyToJomashop(product, props);
+  const { payload } = buildJomashopProductPayload(mapped, undefined, {
+    category: "Boots",
+    brand: "Tod's",
+  });
+  assert(
+    payload.category === "Boots",
+    `payload.category honours override (got ${JSON.stringify(payload.category)})`,
+  );
+  assert(
+    payload.brand === "Tod's",
+    `payload.brand honours override (got ${JSON.stringify(payload.brand)})`,
+  );
+  assert(
+    payload.sku === "XXW83B0BR70THYG409-35.5",
+    `payload.sku preserved from variant (got ${JSON.stringify(payload.sku)})`,
+  );
+}
+
 runColorNavyCase();
 runDefinitionNameOnlyCase();
 runVariantSelectedOptionFallback();
 runListTypeMetafield();
 runBuiltInCategoryDefaults();
+runBrandKeyNormalization();
 
 if (failures > 0) {
   console.error(`\n${failures} assertion(s) failed.`);

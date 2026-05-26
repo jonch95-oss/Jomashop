@@ -20,6 +20,7 @@ import {
   mapShopifyToJomashop,
   buildJomashopProductPayload,
   isSampleProduct,
+  normalizeCategoryCode,
   SAMPLE_SHOPIFY_PRODUCTS,
   type PushOverrides,
   type ShopifyProduct,
@@ -32,6 +33,7 @@ import {
 } from "./shopify";
 import { registerBulkRepairRoutes } from "./bulk_repair";
 import { registerCategoryMappingRoutes, lookupCategoryOverride } from "./category_mapping";
+import { registerBrandMappingRoutes, lookupBrandOverride, normalizeBrandKey } from "./brand_mapping";
 import { registerWebhookRoutes, registerShopifyWebhooks } from "./webhooks";
 
 // -------------------- helpers --------------------
@@ -514,13 +516,36 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
     // Push-status index by Shopify SKU so we can attach pushed/rejected/etc
     // metadata to each mapped product.
-    const pushIndex = new Map<string, { state: string; jomashopSku: string | null; lastError: string | null; lastPushedAt: number }>();
+    const pushIndex = new Map<
+      string,
+      {
+        state: string;
+        jomashopSku: string | null;
+        lastError: string | null;
+        lastPushedAt: number;
+        lastInvalidParams: string[] | null;
+        lastRejectedCategory: string | null;
+        lastRejectedBrand: string | null;
+      }
+    >();
     for (const ps of storage.listPushStatuses(shopDomain ?? undefined)) {
+      let invalidParams: string[] | null = null;
+      if (ps.lastInvalidParams) {
+        try {
+          const parsed = JSON.parse(ps.lastInvalidParams);
+          if (Array.isArray(parsed)) invalidParams = parsed.map(String);
+        } catch {
+          // ignore — stored as best-effort JSON only
+        }
+      }
       pushIndex.set(ps.shopifySku, {
         state: ps.state,
         jomashopSku: ps.jomashopSku,
         lastError: ps.lastError,
         lastPushedAt: ps.lastPushedAt,
+        lastInvalidParams: invalidParams,
+        lastRejectedCategory: ps.lastRejectedCategory,
+        lastRejectedBrand: ps.lastRejectedBrand,
       });
     }
 
@@ -577,9 +602,39 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const schemaLoaded = Array.isArray(props) && props.some(
         (p: any) => p && typeof p.field === "string" && p.field.trim() !== "" && p.field !== "undefined",
       );
+      // Determine what brand/category WOULD be sent on the next push so a
+      // rejection can be cleared automatically when the operator saves a
+      // matching override. This mirrors the precedence inside the push
+      // endpoint: explicit per-push override > saved brand_override > mapped
+      // brand. We only consider saved overrides at preview time because the
+      // per-push override is supplied only when the push modal is submitted.
+      const outboundCategory =
+        (m as any).suggested_category || m.category || "";
+      const brandHit = lookupBrandOverride(m.brand);
+      const outboundBrand = brandHit?.jomashopBrand || m.brand || "";
+      const rejectedCategoryDiffers =
+        status?.lastRejectedCategory != null &&
+        normalizeCategoryCode(outboundCategory) !==
+          normalizeCategoryCode(status.lastRejectedCategory);
+      const rejectedBrandDiffers =
+        status?.lastRejectedBrand != null &&
+        normalizeBrandKey(outboundBrand) !==
+          normalizeBrandKey(status.lastRejectedBrand);
+      // A stale rejection is one where the next push will use a different
+      // category or brand than the one that was rejected — the operator has
+      // effectively addressed the issue via a saved override.
+      const rejectionIsStale =
+        status?.state === "rejected" &&
+        (rejectedCategoryDiffers || rejectedBrandDiffers);
+
       let readiness: "ready" | "missing" | "needs-category-verification" | "rejected" | "sample" = "missing";
       if (m.is_sample) readiness = "sample";
-      else if (status?.state === "rejected" || status?.state === "failed") readiness = "rejected";
+      else if (
+        (status?.state === "rejected" || status?.state === "failed") &&
+        !rejectionIsStale
+      ) {
+        readiness = "rejected";
+      }
       else if (!schemaLoaded) {
         readiness = "needs-category-verification";
       } else if (m.ambiguous_category) {
@@ -609,6 +664,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         jomashop_sku: status?.jomashopSku ?? null,
         last_push_error: status?.lastError ?? null,
         last_pushed_at: status?.lastPushedAt ?? null,
+        last_invalid_params: status?.lastInvalidParams ?? null,
+        last_rejected_category: status?.lastRejectedCategory ?? null,
+        last_rejected_brand: status?.lastRejectedBrand ?? null,
         readiness,
       };
     });
@@ -952,7 +1010,18 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }));
 
     const mapped = mapShopifyToJomashop(body.product, props, body.forcedCategory);
-    const overrides: PushOverrides = body.overrides || {};
+    const overrides: PushOverrides = { ...(body.overrides || {}) };
+    // Brand override precedence at push time:
+    //   1. Explicit operator-supplied overrides.brand on this push call.
+    //   2. Saved brand_overrides row for the resolved Shopify brand
+    //      (e.g. operator saved Tods → "Tod's" after a previous rejection).
+    //   3. The mapped brand from Shopify (current behaviour).
+    if (!overrides.brand || !overrides.brand.trim()) {
+      const brandHit = lookupBrandOverride(mapped.brand);
+      if (brandHit && brandHit.jomashopBrand.trim()) {
+        overrides.brand = brandHit.jomashopBrand;
+      }
+    }
     const { payload, variant, missingRequired, missingTopLevel } = buildJomashopProductPayload(
       mapped,
       body.variantSku,
@@ -1057,10 +1126,21 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             lastError: errStr || productResp.error || `HTTP ${productResp.status}`,
             lastPayloadJson: JSON.stringify({
               category: mapped.category,
+              outbound_category: payload.category ?? null,
+              outbound_brand: payload.brand ?? null,
               price: mapped.jomashop_price,
               msrp: mapped.msrp,
               variants: mapped.variants,
             }),
+            // Persist rejection context so the UI can render
+            // "Jomashop rejected category=Footwear, brand=Tods" and the
+            // readiness check can detect when the next attempt actually
+            // changes the offending field.
+            lastInvalidParams: errBody?.invalid_params && errBody.invalid_params.length > 0
+              ? JSON.stringify(errBody.invalid_params)
+              : null,
+            lastRejectedCategory: payload.category ? String(payload.category) : null,
+            lastRejectedBrand: payload.brand ? String(payload.brand) : null,
             lastPushedAt: Date.now(),
             updatedAt: Date.now(),
           });
@@ -1117,10 +1197,17 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           lastError: null,
           lastPayloadJson: JSON.stringify({
             category: mapped.category,
+            outbound_category: payload.category ?? null,
+            outbound_brand: payload.brand ?? null,
             price: mapped.jomashop_price,
             msrp: mapped.msrp,
             variants: mapped.variants,
           }),
+          // Clear stale rejection markers on successful push so the row
+          // does not flicker back into "Rejected / Needs fix".
+          lastInvalidParams: null,
+          lastRejectedCategory: null,
+          lastRejectedBrand: null,
           lastPushedAt: Date.now(),
           updatedAt: Date.now(),
         });
@@ -1181,6 +1268,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   // ---------- Category mapping workflow (Shopify code → Jomashop category) ----------
   registerCategoryMappingRoutes(app);
+
+  // ---------- Brand mapping workflow (Shopify brand → exact Jomashop brand) ----------
+  registerBrandMappingRoutes(app);
 
   // ---------- Shopify webhooks (public, HMAC-verified) ----------
   registerWebhookRoutes(app);
