@@ -1271,6 +1271,9 @@ function runApparelFallbackPushability() {
     required: f.required,
     type: f.type,
     options: f.options,
+    allow_omit: f.allow_omit,
+    omit_when_unknown_enum: f.omit_when_unknown_enum,
+    options_unverified: f.options_unverified,
   }));
   const mapped = mapShopifyToJomashop(product, apparelFallback, "Apparel");
   const { payload, pushDebug, missingRequired, missingTopLevel } = buildJomashopProductPayload(
@@ -1314,6 +1317,9 @@ function runApparelFallbackPayloadIsTitleCase() {
     required: f.required,
     type: f.type,
     options: f.options,
+    allow_omit: f.allow_omit,
+    omit_when_unknown_enum: f.omit_when_unknown_enum,
+    options_unverified: f.options_unverified,
   }));
   const mapped = mapShopifyToJomashop(product, apparelFallback, "Apparel");
   const { payload } = buildJomashopProductPayload(mapped, undefined, {
@@ -1408,6 +1414,7 @@ function runCanadaGooseApparelRejectionFix() {
     options: f.options,
     allow_omit: f.allow_omit,
     omit_when_unknown_enum: f.omit_when_unknown_enum,
+    options_unverified: f.options_unverified,
   }));
   const product: ShopifyProduct = {
     id: "shopify-cg-3103K61-4",
@@ -1457,21 +1464,17 @@ function runCanadaGooseApparelRejectionFix() {
     `Apparel: Age === "Kids" (got ${JSON.stringify(mapped.properties.Age)})`,
   );
 
-  // (4) Article must NOT be the product title verbatim. It should either
-  // map to an accepted option (e.g. "Outerwear" from the OUTW code) or be
-  // dropped from the payload. Free-text "Canada Goose Kids Black Outerwear"
-  // is exactly what Jomashop rejected.
+  // (4) Article is now treated as `options_unverified` in the bundled
+  // Apparel fallback — Jomashop rejected "Outerwear" on the live category
+  // (the bundled options list does NOT match Jomashop's actual accepted set).
+  // The payload builder must NEVER emit Article from the unverified fallback,
+  // even when the canonical value happens to match a guessed option. The
+  // field is optional, so it is silently omitted; required-version handling
+  // is exercised separately below.
   const articleValue = mapped.properties.Article;
-  if (articleValue !== undefined && articleValue !== null) {
-    assert(
-      typeof articleValue === "string" && APPAREL_TYPE_OPTIONS_FOR_TEST.includes(articleValue),
-      `Apparel: Article (when present) maps to accepted option (got ${JSON.stringify(articleValue)})`,
-    );
-  }
-  // For OUTW specifically we expect "Outerwear" via APPAREL_TYPE_BY_CODE.
   assert(
-    articleValue === "Outerwear",
-    `Apparel/OUTW: Article === "Outerwear" via code map (got ${JSON.stringify(articleValue)})`,
+    articleValue === undefined || articleValue === null,
+    `Apparel: Article must NOT be emitted from unverified bundled options (got ${JSON.stringify(articleValue)})`,
   );
 
   // (5) Country of Origin "Canada" is not in the accepted list — the
@@ -1504,13 +1507,20 @@ function runCanadaGooseApparelRejectionFix() {
     `Apparel: invalidEnums captures the Canada → accepted-list mismatch (got ${JSON.stringify(invalidEnums)})`,
   );
 
-  // (7) The payload must be pushable: no Material, Gender is Unisex,
-  // Article is Outerwear (accepted), Country of Origin dropped. pushDebug
+  // (7) Article must be absent from the outgoing properties — the bundled
+  // option list is unverified, so we never guess.
+  assert(
+    !("Article" in payloadProps),
+    `Apparel: Article omitted from payload.properties when options unverified (got ${JSON.stringify(payloadProps.Article)})`,
+  );
+
+  // (8) The payload must be pushable: no Material, Gender is Unisex,
+  // Article omitted, Country of Origin dropped. pushDebug
   // confirms schemaLabelsExact and no missing required.
   assert(pushDebug.schemaLabelsExact === true, `Apparel: pushDebug.schemaLabelsExact === true`);
   assert(pushDebug.fallbackUnsafe === false, `Apparel: pushDebug.fallbackUnsafe === false`);
 
-  // (8) Top-level payload must NOT carry a Material key, even though the
+  // (9) Top-level payload must NOT carry a Material key, even though the
   // Composition metafield was present.
   assert(
     !("Material" in payload),
@@ -1714,6 +1724,7 @@ function runApparelGenderUnmappable() {
     options: f.options,
     allow_omit: f.allow_omit,
     omit_when_unknown_enum: f.omit_when_unknown_enum,
+    options_unverified: f.options_unverified,
   }));
   const product: ShopifyProduct = {
     id: "shopify-apparel-no-gender",
@@ -1735,6 +1746,176 @@ function runApparelGenderUnmappable() {
   assert(
     (mapped.missing_required || []).includes("Gender"),
     `Apparel: missing_required includes Gender when unresolvable (got ${JSON.stringify(mapped.missing_required)})`,
+  );
+}
+
+// Case 25: bundled Apparel Article options are unverified — even a value
+// that matches the guessed list (e.g. "Outerwear") must NOT be emitted.
+// Direct repro of the rejection from deploy e897310: Canada Goose Kids
+// SKU 3103K61-4 was rejected with "Article is not included in the list"
+// after the previous fix sent Article="Outerwear" from the bundled list.
+function runApparelArticleNeverGuessed() {
+  console.log("Case 25: Apparel — bundled Article options are unverified; Article never sent");
+  const apparelFallback = FALLBACK_CATEGORY_SCHEMAS.Apparel.map((f) => ({
+    field: f.field,
+    required: f.required,
+    type: f.type,
+    options: f.options,
+    allow_omit: f.allow_omit,
+    omit_when_unknown_enum: f.omit_when_unknown_enum,
+    options_unverified: f.options_unverified,
+  }));
+  const product: ShopifyProduct = {
+    id: "shopify-cg-3103K61-4",
+    title: "Canada Goose Kids Black Outerwear",
+    body_html: "<p>Kids outerwear in black.</p>",
+    vendor: "Canada Goose",
+    product_type: "OUTW",
+    tags: ["Kids", "Outerwear"],
+    images: [{ src: "https://example.com/cg.jpg" }],
+    options: [{ name: "Size", values: ["4"] }],
+    variants: [
+      { id: 30001, sku: "3103K61-4", price: "650.00", inventory_quantity: 1, option1: "4" },
+    ],
+    metafields: [
+      { namespace: "custom", key: "color", value: "BLACK", name: "Color" },
+      { namespace: "custom", key: "ff_designer_id", value: "3103K61" },
+    ],
+  };
+  const mapped = mapShopifyToJomashop(product, apparelFallback, "Apparel");
+  // Article must NOT appear in mapped.properties — the bundled options list
+  // is unverified, so we never emit a guess (even "Outerwear", which the
+  // previous code mistakenly trusted).
+  assert(
+    !("Article" in mapped.properties),
+    `Apparel: Article omitted from mapped.properties when options unverified (got ${JSON.stringify(mapped.properties.Article)})`,
+  );
+  // The build path's payload must also be free of Article.
+  const { payload, pushDebug } = buildJomashopProductPayload(mapped, undefined, {
+    category: "Apparel",
+    brand: "Canada Goose",
+    manufacturer_id: 2774,
+    category_id: 35,
+  });
+  const props = (payload.properties as Record<string, unknown>) || {};
+  assert(
+    !("Article" in props),
+    `Apparel: payload.properties.Article omitted when options unverified (got ${JSON.stringify(props.Article)})`,
+  );
+  // No preflight block — Article is optional. pushDebug records nothing
+  // unusual; unverifiedRequiredOptions is empty.
+  assert(
+    Array.isArray(pushDebug.unverifiedRequiredOptions) && pushDebug.unverifiedRequiredOptions.length === 0,
+    `Apparel: optional Article does not trigger unverifiedRequiredOptions (got ${JSON.stringify(pushDebug.unverifiedRequiredOptions)})`,
+  );
+}
+
+// Case 26: when a LIVE schema response carries explicit options for the
+// Article field, those options are trusted (options_unverified is not set)
+// and Article IS emitted when the canonical value matches.
+function runApparelArticleSentFromLiveSchema() {
+  console.log("Case 26: Apparel — live schema options for Article are trusted and emitted");
+  const liveSchema: SchemaPropertyDescriptor[] = [
+    { field: "Gender", label: "Gender", required: true, type: "enum", options: ["Men", "Women", "Unisex"] },
+    { field: "Age", label: "Age", required: true, type: "enum", options: ["Adult", "Kids"] },
+    { field: "Apparel Type", label: "Apparel Type", required: true, options: ["Outerwear", "Pants"] },
+    { field: "Detailed Description", label: "Detailed Description", required: true, type: "string" },
+    { field: "Total Number of Pieces", label: "Total Number of Pieces", required: true, type: "string" },
+    { field: "Color", label: "Color", required: true, type: "string" },
+    // Live options reported by Jomashop — the only set we trust.
+    { field: "Article", label: "Article", required: false, type: "enum", options: ["Down Parka", "Bomber"] },
+  ];
+  const product: ShopifyProduct = {
+    id: "shopify-cg-live-1",
+    title: "Canada Goose Down Parka",
+    body_html: "<p>Down parka.</p>",
+    vendor: "Canada Goose",
+    product_type: "OUTW",
+    tags: ["Kids"],
+    images: [],
+    options: [{ name: "Size", values: ["M"] }],
+    variants: [{ id: 1, sku: "CG-LIVE-1", price: "650.00", inventory_quantity: 1, option1: "M" }],
+    metafields: [
+      { namespace: "custom", key: "color", value: "Black", name: "Color" },
+      { namespace: "custom", key: "Article", value: "Down Parka", name: "Article" },
+    ],
+  };
+  const mapped = mapShopifyToJomashop(product, liveSchema, "Apparel");
+  assert(
+    mapped.properties.Article === "Down Parka",
+    `Apparel: live-schema Article option emitted verbatim (got ${JSON.stringify(mapped.properties.Article)})`,
+  );
+}
+
+// Case 27: a required field whose options are unverified must block the
+// push at preflight with a clear actionable message — never a guess that
+// would be rejected by Jomashop.
+function runApparelRequiredUnverifiedBlocksPreflight() {
+  console.log(
+    "Case 27: required field with options_unverified triggers preflight block",
+  );
+  const schemaWithRequiredUnverified: SchemaPropertyDescriptor[] = [
+    { field: "Gender", required: true, type: "enum", options: ["Men", "Women", "Unisex"] },
+    { field: "Age", required: true, type: "enum", options: ["Adult", "Kids"] },
+    { field: "Apparel Type", required: true, type: "enum", options: ["Outerwear"] },
+    { field: "Detailed Description", required: true, type: "string" },
+    { field: "Total Number of Pieces", required: true, type: "string" },
+    { field: "Color", required: true, type: "string" },
+    // Required + unverified — must block preflight.
+    {
+      field: "Article",
+      required: true,
+      type: "enum",
+      options: ["Outerwear", "Pants"],
+      options_unverified: true,
+    },
+  ];
+  const product: ShopifyProduct = {
+    id: "shopify-cg-required-unverified-1",
+    title: "Canada Goose Kids Black Outerwear",
+    body_html: "<p>Kids outerwear.</p>",
+    vendor: "Canada Goose",
+    product_type: "OUTW",
+    tags: ["Kids"],
+    images: [],
+    options: [{ name: "Size", values: ["4"] }],
+    variants: [{ id: 1, sku: "REQ-UNV-1", price: "650.00", inventory_quantity: 1, option1: "4" }],
+    metafields: [{ namespace: "custom", key: "color", value: "Black", name: "Color" }],
+  };
+  const mapped = mapShopifyToJomashop(product, schemaWithRequiredUnverified, "Apparel");
+  // Article must surface as a required-field block via missing_required AND
+  // via unverified_required_options.
+  assert(
+    (mapped.missing_required || []).includes("Article"),
+    `Required+unverified Article surfaces in missing_required (got ${JSON.stringify(mapped.missing_required)})`,
+  );
+  assert(
+    (mapped.unverified_required_options || []).some((u) => u.field === "Article"),
+    `Required+unverified Article surfaces in unverified_required_options (got ${JSON.stringify(mapped.unverified_required_options)})`,
+  );
+  // Article must NOT be emitted as a value — even though a canonical value
+  // ("Outerwear" via OUTW code) is available.
+  const articleVal = mapped.properties.Article;
+  assert(
+    articleVal === null || articleVal === undefined,
+    `Required+unverified Article is not emitted with a guess (got ${JSON.stringify(articleVal)})`,
+  );
+  const { pushDebug, missingRequired, unverifiedRequiredOptions } = buildJomashopProductPayload(
+    mapped,
+    undefined,
+    { category: "Apparel", brand: "Canada Goose", manufacturer_id: 1, category_id: 35 },
+  );
+  assert(
+    missingRequired.length > 0,
+    `Required+unverified Article: missingRequired carries the field (got ${JSON.stringify(missingRequired)})`,
+  );
+  assert(
+    unverifiedRequiredOptions.some((u) => u.field === "Article"),
+    `buildJomashopProductPayload: unverifiedRequiredOptions surfaces Article (got ${JSON.stringify(unverifiedRequiredOptions)})`,
+  );
+  assert(
+    pushDebug.unverifiedRequiredOptions.some((u) => u.field === "Article"),
+    `pushDebug.unverifiedRequiredOptions surfaces Article (got ${JSON.stringify(pushDebug.unverifiedRequiredOptions)})`,
   );
 }
 
@@ -1763,6 +1944,9 @@ runCanadaGooseApparelRejectionFix();
 runFootwearUnknownCountry();
 runHandbagsStyleEnumDrop();
 runApparelGenderUnmappable();
+runApparelArticleNeverGuessed();
+runApparelArticleSentFromLiveSchema();
+runApparelRequiredUnverifiedBlocksPreflight();
 
 if (failures > 0) {
   console.error(`\n${failures} assertion(s) failed.`);

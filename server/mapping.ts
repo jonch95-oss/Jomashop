@@ -51,6 +51,10 @@ export type MappedProduct = {
   /** Optional schema fields that were dropped from the outgoing properties
    *  because their canonical value could not be mapped (allow_omit). */
   omitted_optional_fields?: string[];
+  /** Required schema fields whose option list is `options_unverified` —
+   *  the push must be blocked because Jomashop's accepted set isn't known.
+   *  Each entry includes the canonical value (if any) we'd have sent. */
+  unverified_required_options?: Array<{ field: string; value?: string }>;
   category: SupportedCategory;
   /** True when this mapping was produced from a built-in demo fixture rather
    *  than a real Shopify product. The UI uses this to block pushes and label
@@ -596,6 +600,13 @@ export type SchemaPropertyDescriptor = {
    *  the field is dropped from the payload rather than sent with an invalid
    *  value. Avoids Jomashop's "X is not included in the list" rejections. */
   omit_when_unknown_enum?: boolean;
+  /** When true, the `options` list is a best-guess from the bundled fallback
+   *  rather than confirmed by Jomashop. The payload builder refuses to emit
+   *  ANY value for this field until live options arrive — optional fields
+   *  are dropped, required fields surface as a preflight blocker. Set on
+   *  enum fields like Apparel's "Article" where the public guess list does
+   *  not match Jomashop's actual accepted set. */
+  options_unverified?: boolean;
 };
 
 /** Collapse a label/field to a single comparable token. */
@@ -990,12 +1001,19 @@ export function buildSchemaProperties(
   /** Fields that were dropped from the payload because the value could not
    *  be mapped to an accepted option AND the field allows omission. */
   omittedFields: string[];
+  /** Required schema fields whose option list is `options_unverified` —
+   *  the push cannot proceed because emitting a guess risks Jomashop's
+   *  "X is not included in the list" rejection. Surfaced as a preflight
+   *  blocker; the operator must load the live option list (or map values)
+   *  before the field can be sent. */
+  unverifiedRequiredOptions: Array<{ field: string; value?: string }>;
 } {
   const properties: Record<string, string | number | boolean | null> = {};
   const missingRequired: string[] = [];
   const schemaLabels: string[] = [];
   const invalidEnums: Array<{ field: string; value: string; options: string[] }> = [];
   const omittedFields: string[] = [];
+  const unverifiedRequiredOptions: Array<{ field: string; value?: string }> = [];
 
   for (const prop of schema) {
     if (!prop || typeof prop.field !== "string" || prop.field.trim() === "" || prop.field === "undefined") {
@@ -1007,6 +1025,27 @@ export function buildSchemaProperties(
     let value: string | undefined = canonicalKey ? (canonical[canonicalKey] as string | undefined) : undefined;
     if (typeof value === "string") value = value.trim() || undefined;
     const rawValueForReporting = value;
+
+    // options_unverified short-circuit: the bundled `options` list is a
+    // best-guess and may not match Jomashop's actual accepted set. We
+    // refuse to emit ANY value for this field — even a value that matches
+    // the guess — to avoid the "X is not included in the list" rejection.
+    if (prop.options_unverified) {
+      if (prop.required) {
+        // Required field with unverified options → preflight block. The
+        // missingRequired entry triggers the existing pre-flight 422 path;
+        // the unverifiedRequiredOptions detail gives the operator the
+        // exact next step (load the live option list).
+        missingRequired.push(outKey);
+        unverifiedRequiredOptions.push({ field: outKey, value: rawValueForReporting });
+        properties[outKey] = null;
+      } else {
+        // Optional field with unverified options → drop entirely. Never
+        // a guess; the absent key is safer than an invalid enum value.
+        omittedFields.push(outKey);
+      }
+      continue;
+    }
 
     // Normalize against schema options if present. A canonical value that
     // doesn't match any option is dropped here — sending an invalid enum
@@ -1047,7 +1086,14 @@ export function buildSchemaProperties(
       properties[outKey] = value;
     }
   }
-  return { properties, missingRequired, schemaLabels, invalidEnums, omittedFields };
+  return {
+    properties,
+    missingRequired,
+    schemaLabels,
+    invalidEnums,
+    omittedFields,
+    unverifiedRequiredOptions,
+  };
 }
 
 /**
@@ -1181,6 +1227,7 @@ export function mapShopifyToJomashop(
   const missingRequiredProps: string[] = [];
   let invalidEnums: Array<{ field: string; value: string; options: string[] }> = [];
   let omittedOptionalFields: string[] = [];
+  let unverifiedRequiredOptions: Array<{ field: string; value?: string }> = [];
 
   if (usesLiveSchemaLabels) {
     let canonical = buildCanonicalProductFields(product);
@@ -1205,9 +1252,15 @@ export function mapShopifyToJomashop(
     }
     invalidEnums = built.invalidEnums;
     omittedOptionalFields = built.omittedFields;
+    unverifiedRequiredOptions = built.unverifiedRequiredOptions;
     for (const inv of invalidEnums) {
       warnings.push(
         `Value "${inv.value}" for ${category} field "${inv.field}" is not in Jomashop's accepted list (${inv.options.slice(0, 8).join(", ")}${inv.options.length > 8 ? "…" : ""}). Add a mapping or correct the source metafield.`,
+      );
+    }
+    for (const u of unverifiedRequiredOptions) {
+      warnings.push(
+        `Required ${category} field "${u.field}" has no confirmed Jomashop option list. Load the live category schema (or supply a mapping) before pushing — sending a guess will trigger "${u.field} is not included in the list".`,
       );
     }
   } else for (const prop of schemaProperties) {
@@ -1468,6 +1521,7 @@ export function mapShopifyToJomashop(
     missing_top_level: missingTopLevelFields,
     invalid_enums: invalidEnums,
     omitted_optional_fields: omittedOptionalFields,
+    unverified_required_options: unverifiedRequiredOptions,
     category,
     is_sample: sampleFixture,
     raw_category: rawCategory,
@@ -1564,6 +1618,7 @@ export function buildJomashopProductPayload(
   missingTopLevel: string[];
   invalidEnums: Array<{ field: string; value: string; options: string[] }>;
   omittedOptionalFields: string[];
+  unverifiedRequiredOptions: Array<{ field: string; value?: string }>;
   pushDebug: {
     category: string;
     schemaLabelsExact: boolean;
@@ -1572,6 +1627,7 @@ export function buildJomashopProductPayload(
     fallbackUnsafe: boolean;
     invalidEnums: Array<{ field: string; value: string; options: string[] }>;
     omittedOptionalFields: string[];
+    unverifiedRequiredOptions: Array<{ field: string; value?: string }>;
   };
 } {
   const variant =
@@ -1668,6 +1724,7 @@ export function buildJomashopProductPayload(
 
   const invalidEnums = mapped.invalid_enums || [];
   const omittedOptionalFields = mapped.omitted_optional_fields || [];
+  const unverifiedRequiredOptions = mapped.unverified_required_options || [];
 
   const pushDebug = {
     category: (overrides.category && overrides.category.trim()) || mapped.category,
@@ -1677,6 +1734,7 @@ export function buildJomashopProductPayload(
     fallbackUnsafe,
     invalidEnums,
     omittedOptionalFields,
+    unverifiedRequiredOptions,
   };
 
   return {
@@ -1686,6 +1744,7 @@ export function buildJomashopProductPayload(
     missingTopLevel,
     invalidEnums,
     omittedOptionalFields,
+    unverifiedRequiredOptions,
     pushDebug,
   };
 }

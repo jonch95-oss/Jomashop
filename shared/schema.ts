@@ -381,6 +381,17 @@ export type FallbackPropertyDef = {
   example?: string;
   allow_omit?: boolean;
   omit_when_unknown_enum?: boolean;
+  // When true, the bundled `options` list is a best-guess that Jomashop has
+  // NOT confirmed as the live accepted set. The payload builder treats this
+  // field as unsafe to send:
+  //   - optional + options_unverified → field is omitted entirely from the
+  //     payload (never guessed), even when the canonical value matches one
+  //     of the guessed options.
+  //   - required + options_unverified → preflight blocks the push with a
+  //     "load live options for X" error rather than emitting a guess that
+  //     would trigger Jomashop's "X is not included in the list" rejection.
+  // Lifted as soon as a live schema response provides confirmed options.
+  options_unverified?: boolean;
 };
 
 export const FALLBACK_CATEGORY_SCHEMAS: Record<SupportedCategory, FallbackPropertyDef[]> = {
@@ -392,10 +403,13 @@ export const FALLBACK_CATEGORY_SCHEMAS: Record<SupportedCategory, FallbackProper
   // deliberately absent from this schema. The schema-driven payload builder
   // refuses to send keys not in the schema for the category, so Material
   // simply never reaches Jomashop for Apparel pushes.
-  // Article carries Jomashop's accepted apparel-type list. A canonical value
-  // that doesn't match (e.g. "Canada Goose Kids Black Outerwear") is dropped
-  // rather than sent verbatim — Jomashop rejects free-text Article values
-  // with "Article is not included in the list".
+  // Article is a Jomashop enum whose accepted list is NOT published — the
+  // bundled APPAREL_TYPE_OPTIONS_INTERNAL guesses (Outerwear, Pants, ...) do
+  // NOT match what Jomashop actually accepts (it rejected "Outerwear" on the
+  // live Apparel category). We tag Article with `options_unverified: true`
+  // so the payload builder NEVER sends a guess: when live options haven't
+  // been loaded the field is dropped entirely. The Apparel Type field carries
+  // the broad apparel-class signal instead.
   // Country of Origin carries the published Jomashop country list. Values
   // outside the list (e.g. "Canada", which Jomashop rejected) are dropped
   // via omit_when_unknown_enum so the push isn't blocked.
@@ -424,6 +438,7 @@ export const FALLBACK_CATEGORY_SCHEMAS: Record<SupportedCategory, FallbackProper
       options: APPAREL_TYPE_OPTIONS_INTERNAL,
       allow_omit: true,
       omit_when_unknown_enum: true,
+      options_unverified: true,
     },
     {
       field: "Apparel Size Type",
@@ -637,6 +652,7 @@ export const FALLBACK_CATEGORY_SCHEMAS: Record<SupportedCategory, FallbackProper
       options: APPAREL_TYPE_OPTIONS_INTERNAL,
       allow_omit: true,
       omit_when_unknown_enum: true,
+      options_unverified: true,
     },
     {
       field: "Apparel Size Type",

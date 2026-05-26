@@ -746,6 +746,100 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.json({ source, name, schema });
   });
 
+  // Admin/debug: list accepted enum options for every enum field of a
+  // category. Surfaces both the live-schema options (when available) and the
+  // bundled fallback options, plus a per-field `verified` flag that is true
+  // when the option list came from Jomashop (live) or is explicitly trusted
+  // in the bundled schema. Fields tagged `options_unverified: true` (e.g.
+  // Apparel "Article") return `verified: false` so the operator knows the
+  // push will be blocked until the live list is loaded or a mapping is
+  // supplied. Used by the Products page debug panel to render the accepted
+  // options next to each field.
+  app.get("/api/jomashop/category-enum-options/:name", async (req, res) => {
+    const name = String(req.params.name);
+    if (!SUPPORTED_CATEGORIES.includes(name as SupportedCategory)) {
+      return res.status(400).json({
+        ok: false,
+        error: `Unsupported category. Use one of: ${SUPPORTED_CATEGORIES.join(", ")}`,
+      });
+    }
+
+    // 1. Bundled fallback — always present, gives us the field list and
+    //    whether each field's options are verified or guessed.
+    const fallback = FALLBACK_CATEGORY_SCHEMAS[name as SupportedCategory] || [];
+    type EnumFieldOut = {
+      field: string;
+      required: boolean;
+      type: string;
+      options: string[];
+      source: "live" | "fallback" | "fallback-unverified";
+      verified: boolean;
+      preflightBlocking: boolean;
+      note?: string;
+    };
+    const byField = new Map<string, EnumFieldOut>();
+    for (const f of fallback) {
+      if (f.type !== "enum" || !f.options || f.options.length === 0) continue;
+      byField.set(f.field, {
+        field: f.field,
+        required: f.required,
+        type: f.type,
+        options: [...f.options],
+        source: f.options_unverified ? "fallback-unverified" : "fallback",
+        verified: !f.options_unverified,
+        preflightBlocking: Boolean(f.options_unverified && f.required),
+        note: f.options_unverified
+          ? "Bundled list is a best-guess; Jomashop has not confirmed it. Load the live category schema to verify."
+          : undefined,
+      });
+    }
+
+    // 2. Live category record + schema — if reachable. Resolve the category
+    //    id from /i1/categories, then fetch /i1/categories/:id and pull the
+    //    real per-field option list. Options here override the bundled
+    //    guess and flip `verified` to true.
+    let liveCategoryId: number | string | null = null;
+    let liveError: string | null = null;
+    if (jomashopConfigured()) {
+      const catResolve = await resolveCategoryRecord(name).catch(() => null);
+      if (catResolve && "ok" in catResolve && catResolve.ok && "configured" in catResolve && catResolve.configured && catResolve.exact) {
+        liveCategoryId = catResolve.exact.id;
+      }
+      if (liveCategoryId !== null) {
+        const propsResp = await getCategoryPropertiesI1(liveCategoryId).catch((e: unknown) => ({
+          ok: false as const,
+          status: 0,
+          error: (e as Error).message,
+        }));
+        if (propsResp.ok && propsResp.data) {
+          const liveSchema = normalizeI1CategorySchema(propsResp.data);
+          for (const p of liveSchema) {
+            if (!p.options || p.options.length === 0) continue;
+            byField.set(p.field, {
+              field: p.field,
+              required: p.required,
+              type: p.type || "enum",
+              options: [...p.options],
+              source: "live",
+              verified: true,
+              preflightBlocking: false,
+            });
+          }
+        } else if (!propsResp.ok) {
+          liveError = propsResp.error || `HTTP ${propsResp.status}`;
+        }
+      }
+    }
+
+    res.json({
+      ok: true,
+      category: name,
+      liveCategoryId,
+      liveError,
+      fields: Array.from(byField.values()),
+    });
+  });
+
   app.get("/api/jomashop/products", async (req, res) => {
     if (!jomashopConfigured()) return res.json({ configured: false, items: [] });
     const result = await jomashopRequest({
@@ -1012,6 +1106,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             options: f.options,
             allow_omit: f.allow_omit,
             omit_when_unknown_enum: f.omit_when_unknown_enum,
+            options_unverified: f.options_unverified,
           }))
         : [];
       const bundledIsExactForCat =
@@ -1770,6 +1865,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         options: f.options,
         allow_omit: f.allow_omit,
         omit_when_unknown_enum: f.omit_when_unknown_enum,
+        options_unverified: f.options_unverified,
       }));
 
     let mapped = mapShopifyToJomashop(body.product, props, body.forcedCategory);
@@ -1875,6 +1971,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         options: f.options,
         allow_omit: f.allow_omit,
         omit_when_unknown_enum: f.omit_when_unknown_enum,
+        options_unverified: f.options_unverified,
       }));
       mapped = mapShopifyToJomashop(body.product, bundledProps, body.forcedCategory);
       ({ payload, variant, missingRequired, missingTopLevel, pushDebug } =
@@ -2031,6 +2128,55 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         payloadPreview: payload,
         envelopePreview: buildI1ProductEnvelope(payload, variant),
         mapped,
+      });
+    }
+
+    // Preflight: refuse the push when a REQUIRED schema field's option list
+    // is `options_unverified` — Jomashop's actual accepted set isn't known,
+    // so any value we'd send is a guess that will likely trigger
+    // "X is not included in the list". This is distinct from the
+    // invalid-enum block below (which fires when we DO know the options and
+    // none match). We block early with an actionable message so the operator
+    // loads the live category schema (or supplies a mapping) before retrying.
+    const unverifiedRequiredOptions = pushDebug.unverifiedRequiredOptions || [];
+    if (unverifiedRequiredOptions.length > 0) {
+      const detail = unverifiedRequiredOptions
+        .map(
+          (u) =>
+            `${u.field}${u.value ? `: tried "${u.value}"` : ""} — Jomashop accepted options unknown`,
+        )
+        .join("; ");
+      storage.updateSyncJob(job.id, {
+        status: "failed",
+        finishedAt: Date.now(),
+        errorItems: 1,
+        summary: `Preflight unverified enum: ${detail.slice(0, 120)}`,
+      });
+      storage.appendLog({
+        jobId: job.id,
+        level: "error",
+        message: `Push aborted before API call: required field(s) have unverified Jomashop option list for ${payload.sku ?? mapped.vendor_sku}`,
+        detailsJson: JSON.stringify({
+          unverifiedRequiredOptions,
+          schemaSource: liveSchemaSource,
+        }),
+        createdAt: Date.now(),
+      });
+      const fieldNames = unverifiedRequiredOptions.map((u) => u.field).join(", ");
+      return res.status(422).json({
+        ok: false,
+        stage: "preflight_unverified_enum",
+        error: `Jomashop accepted option list for required ${pushDebug.category} field(s) ${fieldNames} has not been loaded. Refusing to send a guess that would be rejected. ${detail}. Load the live category schema via /api/jomashop/i1-categories/${overrides.category_id ?? ":id"}/properties (or /api/jomashop/category-enum-options/${pushDebug.category}) and map the value, then retry.`,
+        unverifiedRequiredOptions,
+        invalidEnums: pushDebug.invalidEnums,
+        omittedOptionalFields: pushDebug.omittedOptionalFields,
+        missingRequired,
+        missingTopLevel,
+        warnings: mapped.warnings,
+        payloadPreview: payload,
+        pushDebug,
+        mapped,
+        schemaSource: liveSchemaSource,
       });
     }
 
