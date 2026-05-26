@@ -10,6 +10,13 @@ import {
   resolveCategorySchema,
   clearToken,
   currentToken,
+  getManufacturers,
+  getCategoriesI1,
+  getCategoryPropertiesI1,
+  resolveManufacturer,
+  resolveCategoryRecord,
+  createManufacturer,
+  clearI1Cache,
 } from "./jomashop";
 import {
   FALLBACK_CATEGORY_SCHEMAS,
@@ -19,6 +26,7 @@ import {
 import {
   mapShopifyToJomashop,
   buildJomashopProductPayload,
+  buildI1ProductEnvelope,
   isSampleProduct,
   normalizeCategoryCode,
   SAMPLE_SHOPIFY_PRODUCTS,
@@ -355,6 +363,109 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     });
   });
 
+  // ---------- /i1 (live manufacturer + category records) ----------
+  //
+  // The portal calls these to populate the brand and category dropdowns. We
+  // expose them so the Products UI can render exact ids alongside names
+  // ("Jomashop category: Footwear (id: 12)") and so the brand mapping flow
+  // can show "did you mean Tod's?" fuzzy matches against the real list.
+  app.get("/api/jomashop/manufacturers", async (req, res) => {
+    if (!jomashopConfigured()) {
+      return res.status(503).json({ ok: false, configured: false, error: "Jomashop not configured" });
+    }
+    const refresh = req.query.refresh === "1" || req.query.refresh === "true";
+    const result = await getManufacturers({ refresh });
+    if (!result.ok) return res.status(502).json({ ok: false, error: result.error });
+    res.json({
+      ok: true,
+      configured: true,
+      count: result.items.length,
+      fromCache: result.fromCache,
+      items: result.items.map((m) => ({ id: m.id, name: m.name })),
+    });
+  });
+
+  app.get("/api/jomashop/i1-categories", async (req, res) => {
+    if (!jomashopConfigured()) {
+      return res.status(503).json({ ok: false, configured: false, error: "Jomashop not configured" });
+    }
+    const refresh = req.query.refresh === "1" || req.query.refresh === "true";
+    const result = await getCategoriesI1({ refresh });
+    if (!result.ok) return res.status(502).json({ ok: false, error: result.error });
+    res.json({
+      ok: true,
+      configured: true,
+      count: result.items.length,
+      fromCache: result.fromCache,
+      items: result.items.map((c) => ({ id: c.id, name: c.name })),
+    });
+  });
+
+  app.get("/api/jomashop/i1-categories/:id/properties", async (req, res) => {
+    if (!jomashopConfigured()) {
+      return res.status(503).json({ ok: false, error: "Jomashop not configured" });
+    }
+    const result = await getCategoryPropertiesI1(req.params.id);
+    if (!result.ok) return res.status(502).json({ ok: false, error: result.error });
+    res.json({ ok: true, data: result.data });
+  });
+
+  app.get("/api/jomashop/resolve-brand", async (req, res) => {
+    const name = String(req.query.name || "").trim();
+    if (!name) return res.status(400).json({ ok: false, error: "Missing ?name=" });
+    const result = await resolveManufacturer(name);
+    if (!("ok" in result) || !result.ok) {
+      return res.status(502).json(result);
+    }
+    res.json(result);
+  });
+
+  app.get("/api/jomashop/resolve-category", async (req, res) => {
+    const name = String(req.query.name || "").trim();
+    if (!name) return res.status(400).json({ ok: false, error: "Missing ?name=" });
+    const result = await resolveCategoryRecord(name);
+    if (!("ok" in result) || !result.ok) {
+      return res.status(502).json(result);
+    }
+    res.json(result);
+  });
+
+  // Guarded: explicit confirm required. Creates a manufacturer record on
+  // Jomashop's side. The operator must type the exact spelling and click
+  // confirm in the UI before this fires.
+  app.post("/api/jomashop/manufacturers", async (req, res) => {
+    if (!jomashopConfigured()) {
+      return res.status(503).json({ ok: false, error: "Jomashop not configured" });
+    }
+    const { name, confirm } = (req.body ?? {}) as { name?: string; confirm?: boolean };
+    if (!confirm) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "Missing confirmation. Set `confirm: true` to acknowledge this will create a brand on Jomashop's catalog.",
+      });
+    }
+    const trimmed = (name || "").trim();
+    if (!trimmed) {
+      return res.status(400).json({ ok: false, error: "Missing brand name" });
+    }
+    const result = await createManufacturer(trimmed);
+    storage.appendLog({
+      level: result.ok ? "info" : "error",
+      message: result.ok
+        ? `Created Jomashop manufacturer "${trimmed}"`
+        : `Failed to create Jomashop manufacturer "${trimmed}" (${result.status})`,
+      detailsJson: JSON.stringify({ result }),
+      createdAt: Date.now(),
+    });
+    if (!result.ok) {
+      return res.status(502).json({ ok: false, status: result.status, error: result.error });
+    }
+    // Bust the cache so subsequent resolves see the new record.
+    clearI1Cache();
+    res.json({ ok: true, data: result.data });
+  });
+
   app.get("/api/jomashop/categories", async (_req, res) => {
     if (!jomashopConfigured()) {
       return res.json({
@@ -514,6 +625,35 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       return names.length > 0 ? names : null;
     })();
 
+    // Live /i1 manufacturer + category records — used by readiness to flip a
+    // row out of "ready" when the outbound brand/category isn't on the live
+    // Jomashop list. When /i1 is unavailable we degrade gracefully: readiness
+    // falls back to the legacy /v1/categories name comparison only.
+    const i1Categories = await getCategoriesI1().catch(() => null);
+    const i1Manufacturers = await getManufacturers().catch(() => null);
+    const i1CategoryByKey = new Map<string, { id: number | string; name: string }>();
+    if (i1Categories && i1Categories.ok) {
+      for (const c of i1Categories.items) {
+        i1CategoryByKey.set(
+          String(c.name).toLowerCase().trim().replace(/[^a-z0-9]+/g, ""),
+          { id: c.id, name: c.name },
+        );
+      }
+    }
+    const i1ManufacturerByKey = new Map<string, { id: number | string; name: string }>();
+    if (i1Manufacturers && i1Manufacturers.ok) {
+      for (const m of i1Manufacturers.items) {
+        i1ManufacturerByKey.set(
+          String(m.name).toLowerCase().trim().replace(/[^a-z0-9]+/g, ""),
+          { id: m.id, name: m.name },
+        );
+      }
+    }
+    const i1ManufacturerNames: string[] = i1Manufacturers && i1Manufacturers.ok
+      ? i1Manufacturers.items.map((m) => m.name)
+      : [];
+    const i1Available = i1CategoryByKey.size > 0 || i1ManufacturerByKey.size > 0;
+
     // Push-status index by Shopify SKU so we can attach pushed/rejected/etc
     // metadata to each mapped product.
     const pushIndex = new Map<
@@ -627,6 +767,61 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         status?.state === "rejected" &&
         (rejectedCategoryDiffers || rejectedBrandDiffers);
 
+      // Resolve outbound brand + category against the live /i1 records so
+      // readiness can require an exact manufacturer match (not just a
+      // nonblank brand string). When /i1 isn't available we keep the legacy
+      // behaviour — fall back to liveCategoryNames check only.
+      const brandKeyForResolve = String(outboundBrand)
+        .toLowerCase()
+        .trim()
+        .replace(/[^a-z0-9]+/g, "");
+      const categoryKeyForResolve = String(outboundCategory)
+        .toLowerCase()
+        .trim()
+        .replace(/[^a-z0-9]+/g, "");
+      const resolvedManufacturer = brandKeyForResolve
+        ? i1ManufacturerByKey.get(brandKeyForResolve) ?? null
+        : null;
+      const resolvedCategoryRecord = categoryKeyForResolve
+        ? i1CategoryByKey.get(categoryKeyForResolve) ?? null
+        : null;
+      // Fuzzy "did you mean" — only computed when no exact match. Cheap
+      // O(N) scan over the live name list. Capped to 1 suggestion to keep
+      // the payload small.
+      let manufacturerSuggestion: { id: number | string; name: string } | null = null;
+      if (!resolvedManufacturer && brandKeyForResolve && i1Manufacturers && i1Manufacturers.ok) {
+        let bestDist = Infinity;
+        for (const m of i1Manufacturers.items) {
+          const k = m.name.toLowerCase().trim().replace(/[^a-z0-9]+/g, "");
+          if (!k) continue;
+          let d = 0;
+          // Cheap Levenshtein inline (small strings).
+          if (k !== brandKeyForResolve) {
+            const a = k;
+            const b = brandKeyForResolve;
+            const dp: number[] = Array(b.length + 1).fill(0);
+            for (let j = 0; j <= b.length; j++) dp[j] = j;
+            for (let i = 1; i <= a.length; i++) {
+              let prev = dp[0];
+              dp[0] = i;
+              for (let j = 1; j <= b.length; j++) {
+                const tmp = dp[j];
+                if (a[i - 1] === b[j - 1]) dp[j] = prev;
+                else dp[j] = 1 + Math.min(prev, dp[j], dp[j - 1]);
+                prev = tmp;
+              }
+            }
+            d = dp[b.length];
+          }
+          if (d < bestDist) {
+            bestDist = d;
+            manufacturerSuggestion = { id: m.id, name: m.name };
+          }
+        }
+        const maxAllowed = Math.max(2, Math.ceil(brandKeyForResolve.length * 0.25));
+        if (manufacturerSuggestion && bestDist > maxAllowed) manufacturerSuggestion = null;
+      }
+
       let readiness: "ready" | "missing" | "needs-category-verification" | "rejected" | "sample" = "missing";
       if (m.is_sample) readiness = "sample";
       else if (
@@ -647,10 +842,15 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         hasUndefinedProp
       ) {
         readiness = "missing";
+      } else if (i1Available) {
+        // /i1 records are available: require BOTH brand and category to
+        // match a live record. Anything less goes to needs-category-
+        // verification so the operator sees the row in the right bucket.
+        const brandOk = i1ManufacturerByKey.size === 0 || Boolean(resolvedManufacturer);
+        const categoryOk = i1CategoryByKey.size === 0 || Boolean(resolvedCategoryRecord);
+        readiness = brandOk && categoryOk ? "ready" : "needs-category-verification";
       } else if (liveCategoryNames && liveCategoryNames.length > 0) {
-        // The category override sent at push time may differ from the
-        // inferred enum — but at preview time we only have m.category +
-        // m.suggested_category. Treat ready iff one of those is in the list.
+        // Legacy /v1/categories fallback when /i1 isn't reachable.
         const proposed = (m.suggested_category || m.category || "").toLowerCase();
         const ok = liveCategoryNames.some((n) => n.toLowerCase() === proposed);
         readiness = ok ? "ready" : "needs-category-verification";
@@ -667,6 +867,17 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         last_invalid_params: status?.lastInvalidParams ?? null,
         last_rejected_category: status?.lastRejectedCategory ?? null,
         last_rejected_brand: status?.lastRejectedBrand ?? null,
+        // Live /i1 resolution context so the UI can render:
+        //   "Jomashop category: Footwear (id: 12)"
+        //   "Brand: Tods not found; did you mean Tod's?"
+        jomashop_resolution: {
+          outbound_brand: outboundBrand,
+          outbound_category: outboundCategory,
+          manufacturer: resolvedManufacturer,
+          manufacturer_suggestion: resolvedManufacturer ? null : manufacturerSuggestion,
+          category_record: resolvedCategoryRecord,
+          i1_available: i1Available,
+        },
         readiness,
       };
     });
@@ -687,6 +898,18 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       fallbackReason,
       fetchError,
       liveCategoryNames,
+      jomashopManufacturers: {
+        available: i1Manufacturers !== null && i1Manufacturers.ok,
+        count: i1ManufacturerByKey.size,
+        sample: i1ManufacturerNames.slice(0, 50),
+      },
+      jomashopI1Categories: {
+        available: i1Categories !== null && i1Categories.ok,
+        count: i1CategoryByKey.size,
+        sample: i1Categories && i1Categories.ok
+          ? i1Categories.items.slice(0, 50).map((c) => ({ id: c.id, name: c.name }))
+          : [],
+      },
       note: usingSamples
         ? "Sample fixtures only — connect Shopify and load live products before pushing to Jomashop."
         : `Live Shopify products from ${shopDomain ?? "connected store"}. No data sent to Jomashop.`,
@@ -1022,6 +1245,51 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         overrides.brand = brandHit.jomashopBrand;
       }
     }
+
+    // Resolve the outbound brand against the live /i1/manufacturers list so
+    // we can populate `manufacturer_id` on the payload AND short-circuit a
+    // "Brand must exist" rejection before hitting the network. Same for the
+    // outbound category against /i1/categories.
+    const outboundBrandForResolve =
+      (overrides.brand && overrides.brand.trim()) || mapped.brand || "";
+    const outboundCategoryForResolve =
+      (overrides.category && overrides.category.trim()) ||
+      (mapped as any).suggested_category ||
+      mapped.category ||
+      "";
+    let manufacturerResolution: Awaited<ReturnType<typeof resolveManufacturer>> | null = null;
+    let categoryResolution: Awaited<ReturnType<typeof resolveCategoryRecord>> | null = null;
+    if (outboundBrandForResolve) {
+      manufacturerResolution = await resolveManufacturer(outboundBrandForResolve);
+      if (
+        manufacturerResolution.ok &&
+        "configured" in manufacturerResolution &&
+        manufacturerResolution.configured &&
+        manufacturerResolution.exact
+      ) {
+        if (overrides.manufacturer_id === undefined || overrides.manufacturer_id === null) {
+          overrides.manufacturer_id = manufacturerResolution.exact.id;
+        }
+        // Use the canonical Jomashop spelling so the payload's brand string
+        // is exactly what Jomashop has on record.
+        overrides.brand = manufacturerResolution.exact.name;
+      }
+    }
+    if (outboundCategoryForResolve) {
+      categoryResolution = await resolveCategoryRecord(outboundCategoryForResolve);
+      if (
+        categoryResolution.ok &&
+        "configured" in categoryResolution &&
+        categoryResolution.configured &&
+        categoryResolution.exact
+      ) {
+        if (overrides.category_id === undefined || overrides.category_id === null) {
+          overrides.category_id = categoryResolution.exact.id;
+        }
+        overrides.category = categoryResolution.exact.name;
+      }
+    }
+
     const { payload, variant, missingRequired, missingTopLevel } = buildJomashopProductPayload(
       mapped,
       body.variantSku,
@@ -1039,6 +1307,114 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       errorItems: 0,
       summary: `Push ${mapped.vendor_sku} (${mapped.category})`,
     });
+
+    // Pre-flight validation: refuse to call the API when the brand/category
+    // can't be matched to a live record. Surfacing this as a 422 (with the
+    // resolution context) lets the UI render "Brand 'Tods' not found in
+    // Jomashop manufacturers; did you mean 'Tod's'?" without burning a push.
+    const brandUnresolved =
+      manufacturerResolution !== null &&
+      manufacturerResolution.ok &&
+      "configured" in manufacturerResolution &&
+      manufacturerResolution.configured &&
+      !manufacturerResolution.exact;
+    const categoryUnresolved =
+      categoryResolution !== null &&
+      categoryResolution.ok &&
+      "configured" in categoryResolution &&
+      categoryResolution.configured &&
+      !categoryResolution.exact;
+    if (brandUnresolved || categoryUnresolved) {
+      const detail = [
+        brandUnresolved ? `Brand not found in Jomashop manufacturers: ${outboundBrandForResolve}` : null,
+        categoryUnresolved ? `Category not found in Jomashop categories: ${outboundCategoryForResolve}` : null,
+      ]
+        .filter(Boolean)
+        .join("; ");
+      storage.updateSyncJob(job.id, {
+        status: "failed",
+        finishedAt: Date.now(),
+        errorItems: 1,
+        summary: `Pre-flight: ${detail}`,
+      });
+      storage.appendLog({
+        jobId: job.id,
+        level: "error",
+        message: `Push aborted before API call: ${detail}`,
+        detailsJson: JSON.stringify({
+          outboundBrand: outboundBrandForResolve,
+          outboundCategory: outboundCategoryForResolve,
+          brandSuggestion:
+            manufacturerResolution &&
+            "configured" in manufacturerResolution &&
+            manufacturerResolution.configured
+              ? manufacturerResolution.suggestion
+              : null,
+          categorySuggestion:
+            categoryResolution &&
+            "configured" in categoryResolution &&
+            categoryResolution.configured
+              ? categoryResolution.suggestion
+              : null,
+        }),
+        createdAt: Date.now(),
+      });
+      // Persist rejection state so the Products UI flips to "Rejected — needs
+      // fix" until the operator addresses the missing brand/category.
+      if (mapped.source.shopify_product_id) {
+        const shopDomainForPush =
+          getActiveShopifyConnection()?.shopDomain ??
+          storage.listStores().find((s) => s.oauthStatus === "connected")?.shopDomain ??
+          "unknown";
+        try {
+          storage.upsertPushStatus({
+            shopDomain: shopDomainForPush,
+            shopifyProductId: String(mapped.source.shopify_product_id),
+            shopifyVariantId: variant
+              ? String(
+                  body.product.variants?.find((v) => v.sku === variant.vendor_sku)?.id ??
+                    mapped.source.shopify_variant_ids[0] ??
+                    "",
+                )
+              : null,
+            shopifySku: String(variant?.vendor_sku ?? mapped.vendor_sku),
+            jomashopSku: String(payload.vendor_sku ?? mapped.vendor_sku),
+            state: "rejected",
+            lastStatus: 422,
+            lastError: detail,
+            lastPayloadJson: JSON.stringify({
+              category: mapped.category,
+              outbound_category: payload.category ?? null,
+              outbound_brand: payload.brand ?? null,
+              price: mapped.jomashop_price,
+              msrp: mapped.msrp,
+              variants: mapped.variants,
+            }),
+            lastInvalidParams: JSON.stringify(
+              [brandUnresolved ? "brand" : null, categoryUnresolved ? "category" : null].filter(
+                Boolean,
+              ),
+            ),
+            lastRejectedCategory: payload.category ? String(payload.category) : null,
+            lastRejectedBrand: payload.brand ? String(payload.brand) : null,
+            lastPushedAt: Date.now(),
+            updatedAt: Date.now(),
+          });
+        } catch {
+          // non-fatal
+        }
+      }
+      return res.status(422).json({
+        ok: false,
+        stage: "resolve",
+        error: detail,
+        brandResolution: manufacturerResolution,
+        categoryResolution,
+        payloadPreview: payload,
+        mapped,
+        schemaSource: source,
+      });
+    }
 
     if (missingRequired.length > 0 || missingTopLevel.length > 0) {
       storage.updateSyncJob(job.id, {
@@ -1069,16 +1445,43 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     storage.appendLog({
       jobId: job.id,
       level: "info",
-      message: `POST /v1/products for ${mapped.vendor_sku} (${mapped.category})`,
-      detailsJson: JSON.stringify({ schemaSource: source, vendorSku: payload.vendor_sku }),
+      message: `POST /i1/products/ for ${mapped.vendor_sku} (${mapped.category})`,
+      detailsJson: JSON.stringify({
+        schemaSource: source,
+        vendorSku: payload.vendor_sku,
+        manufacturerId: payload.manufacturer_id,
+        categoryId: payload.category_id,
+      }),
       createdAt: Date.now(),
     });
 
-    const productResp = await jomashopRequest({
+    // Try the new /i1/products/ envelope first (portal-style payload with
+    // product.manufacturer_id + product.category_id + stock block). Fall
+    // back to the legacy /v1/products flat payload only when /i1 returns
+    // 404 (endpoint not deployed) so behaviour on existing tenants is
+    // unchanged.
+    const envelope = buildI1ProductEnvelope(payload, variant);
+    let productResp = await jomashopRequest({
       method: "POST",
-      path: "/v1/products",
-      body: payload,
+      path: "/i1/products/",
+      body: envelope,
     });
+    let pushPath = "/i1/products/";
+    if (!productResp.ok && productResp.status === 404) {
+      storage.appendLog({
+        jobId: job.id,
+        level: "warn",
+        message: `/i1/products/ returned 404 — falling back to /v1/products`,
+        detailsJson: null,
+        createdAt: Date.now(),
+      });
+      productResp = await jomashopRequest({
+        method: "POST",
+        path: "/v1/products",
+        body: payload,
+      });
+      pushPath = "/v1/products";
+    }
 
     if (!productResp.ok) {
       const errBody = productResp.errorData as
@@ -1088,13 +1491,13 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         status: "failed",
         finishedAt: Date.now(),
         errorItems: 1,
-        summary: `POST /v1/products failed (${productResp.status})`,
+        summary: `POST ${pushPath} failed (${productResp.status})`,
       });
       storage.appendLog({
         jobId: job.id,
         level: "error",
-        message: `Jomashop product push failed (${productResp.status})`,
-        detailsJson: JSON.stringify({ error: productResp.error, errorData: errBody, payload }),
+        message: `Jomashop product push failed (${productResp.status}) via ${pushPath}`,
+        detailsJson: JSON.stringify({ error: productResp.error, errorData: errBody, payload, pushPath }),
         createdAt: Date.now(),
       });
       // Record rejected state so the Products UI can show "Rejected — needs
@@ -1157,6 +1560,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         status: productResp.status,
         payloadSent: payload,
         payloadPreview: payload,
+        envelopePreview: envelope,
+        pushPath,
+        brandResolution: manufacturerResolution,
+        categoryResolution,
         mapped,
         schemaSource: source,
       });
@@ -1255,6 +1662,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       schemaSource: source,
       mapped,
       payloadPreview: payload,
+      envelopePreview: envelope,
+      pushPath,
+      brandResolution: manufacturerResolution,
+      categoryResolution,
       product: { status: productResp.status, data: productResp.data },
       inventory: inventoryResp
         ? { status: inventoryResp.status, ok: inventoryResp.ok, data: inventoryResp.data, error: inventoryResp.error }

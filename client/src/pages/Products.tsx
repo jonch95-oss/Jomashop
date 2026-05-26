@@ -217,6 +217,20 @@ export default function Products() {
     },
   });
 
+  const createManufacturer = useMutation({
+    mutationFn: async (args: { name: string }) => {
+      const res = await apiRequest("POST", "/api/jomashop/manufacturers", {
+        name: args.name,
+        confirm: true,
+      });
+      return (await res.json()) as { ok: boolean; error?: string; data?: unknown };
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/jomashop/manufacturers"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/products/cache"] });
+    },
+  });
+
   const push = useMutation({
     mutationFn: async (target: PushTarget): Promise<PushResult> => {
       const trimmedOverrides = Object.fromEntries(
@@ -632,7 +646,15 @@ export default function Products() {
                           </div>
                           <div>
                             <span className="text-muted-foreground">Jomashop category: </span>
-                            {p.readiness === "ready" ? (
+                            {p.jomashop_resolution?.category_record ? (
+                              <code
+                                className="font-mono text-emerald-600 dark:text-emerald-400"
+                                data-testid={`text-jomashop-category-${p.vendor_sku}`}
+                              >
+                                {p.jomashop_resolution.category_record.name} (id:{" "}
+                                {String(p.jomashop_resolution.category_record.id)})
+                              </code>
+                            ) : p.readiness === "ready" ? (
                               <code
                                 className="font-mono text-emerald-600 dark:text-emerald-400"
                                 data-testid={`text-jomashop-category-${p.vendor_sku}`}
@@ -646,12 +668,41 @@ export default function Products() {
                               >
                                 {p.ambiguous_category
                                   ? "needs verification (ambiguous code)"
-                                  : p.readiness === "needs-category-verification"
-                                    ? "needs verification (no schema loaded)"
-                                    : "needs verification"}
+                                  : p.jomashop_resolution?.i1_available
+                                    ? `not found in /i1/categories: ${p.jomashop_resolution.outbound_category || p.category}`
+                                    : p.readiness === "needs-category-verification"
+                                      ? "needs verification (no schema loaded)"
+                                      : "needs verification"}
                               </span>
                             )}
                           </div>
+                          {p.jomashop_resolution && p.jomashop_resolution.i1_available && (
+                            <div>
+                              <span className="text-muted-foreground">Jomashop brand: </span>
+                              {p.jomashop_resolution.manufacturer ? (
+                                <code
+                                  className="font-mono text-emerald-600 dark:text-emerald-400"
+                                  data-testid={`text-jomashop-brand-${p.vendor_sku}`}
+                                >
+                                  {p.jomashop_resolution.manufacturer.name} (id:{" "}
+                                  {String(p.jomashop_resolution.manufacturer.id)})
+                                </code>
+                              ) : (
+                                <span
+                                  className="font-mono text-amber-600 dark:text-amber-400"
+                                  data-testid={`text-jomashop-brand-missing-${p.vendor_sku}`}
+                                >
+                                  Brand "{p.jomashop_resolution.outbound_brand || p.brand}" not found in Jomashop manufacturers
+                                  {p.jomashop_resolution.manufacturer_suggestion && (
+                                    <>
+                                      {" "}— did you mean "
+                                      {p.jomashop_resolution.manufacturer_suggestion.name}"?
+                                    </>
+                                  )}
+                                </span>
+                              )}
+                            </div>
+                          )}
                         </div>
                         <div className="mt-3 text-[10px] uppercase tracking-wider text-muted-foreground">Shopify price</div>
                         <div className="mt-1 text-sm tabular-nums">
@@ -1128,9 +1179,82 @@ export default function Products() {
                       placeholder="e.g. Off-White"
                       className="h-8 font-mono text-xs"
                     />
-                    <div className="mt-1 text-[10px] text-amber-500">
-                      Warning: Brand must match Jomashop exactly. There is no brand lookup API, so this value cannot be verified before push.
-                    </div>
+                    {pushTarget?.mapped.jomashop_resolution?.i1_available ? (
+                      pushTarget.mapped.jomashop_resolution.manufacturer ? (
+                        <div className="mt-1 text-[10px] text-emerald-500">
+                          Matched Jomashop manufacturer:{" "}
+                          <code className="font-mono">
+                            {pushTarget.mapped.jomashop_resolution.manufacturer.name} (id:{" "}
+                            {String(pushTarget.mapped.jomashop_resolution.manufacturer.id)})
+                          </code>
+                        </div>
+                      ) : (
+                        <div className="mt-1 space-y-1 text-[10px] text-amber-500">
+                          <div>
+                            Brand "{pushTarget.mapped.jomashop_resolution.outbound_brand || pushTarget.mapped.brand}" not found in Jomashop manufacturers.
+                            {pushTarget.mapped.jomashop_resolution.manufacturer_suggestion && (
+                              <>
+                                {" "}Did you mean{" "}
+                                <button
+                                  type="button"
+                                  data-testid="button-apply-brand-suggestion"
+                                  className="underline"
+                                  onClick={() =>
+                                    setOverrides((o) => ({
+                                      ...o,
+                                      brand:
+                                        pushTarget.mapped.jomashop_resolution!
+                                          .manufacturer_suggestion!.name,
+                                    }))
+                                  }
+                                >
+                                  "{pushTarget.mapped.jomashop_resolution.manufacturer_suggestion.name}"
+                                </button>
+                                ?
+                              </>
+                            )}
+                          </div>
+                          {overrides.brand.trim() !== "" && (
+                            <div className="flex items-center gap-2">
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                data-testid="button-create-jomashop-manufacturer"
+                                disabled={createManufacturer.isPending}
+                                onClick={() => {
+                                  if (
+                                    typeof window !== "undefined" &&
+                                    !window.confirm(
+                                      `Create new Jomashop brand "${overrides.brand.trim()}"? This adds it to Jomashop's global catalog.`,
+                                    )
+                                  ) {
+                                    return;
+                                  }
+                                  createManufacturer.mutate({ name: overrides.brand.trim() });
+                                }}
+                              >
+                                {createManufacturer.isPending ? (
+                                  <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+                                ) : null}
+                                Create Jomashop brand "{overrides.brand.trim()}"
+                              </Button>
+                              {createManufacturer.data?.ok && (
+                                <span className="text-[10px] text-emerald-500">created</span>
+                              )}
+                              {createManufacturer.data?.ok === false && (
+                                <span className="text-[10px] text-red-500">
+                                  {createManufacturer.data.error || "create failed"}
+                                </span>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      )
+                    ) : (
+                      <div className="mt-1 text-[10px] text-amber-500">
+                        Warning: Brand must match Jomashop exactly. /i1/manufacturers lookup not available — value cannot be verified before push.
+                      </div>
+                    )}
                     {overrides.brand.trim() !== "" &&
                       pushTarget &&
                       overrides.brand.trim() !==

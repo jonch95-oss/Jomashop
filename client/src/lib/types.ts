@@ -99,6 +99,17 @@ export type MappedProduct = {
    *  "Ready to push" filter so products with missing fields, unverified
    *  categories, or known-rejected pushes never show as ready. */
   readiness?: "ready" | "missing" | "needs-category-verification" | "rejected" | "sample";
+  /** Live /i1 resolution context attached by the server so the UI can show
+   *  "Jomashop category: Footwear (id: 12)" or "Brand not found; did you
+   *  mean Tod's?" without re-hitting /api/jomashop/resolve-brand per row. */
+  jomashop_resolution?: {
+    outbound_brand: string;
+    outbound_category: string;
+    manufacturer: { id: number | string; name: string } | null;
+    manufacturer_suggestion: { id: number | string; name: string } | null;
+    category_record: { id: number | string; name: string } | null;
+    i1_available: boolean;
+  };
   /** Compact echo of the raw Shopify metafields + options the mapper saw.
    *  Surfaced in the UI as an expandable debug panel for diagnosing
    *  missing-field complaints. */

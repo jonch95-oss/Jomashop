@@ -20,6 +20,7 @@
 
 import {
   BUILT_IN_CATEGORY_OVERRIDES,
+  buildI1ProductEnvelope,
   buildJomashopProductPayload,
   coerceJomashopToSupported,
   isAmbiguousCategoryCode,
@@ -337,12 +338,137 @@ function runBrandKeyNormalization() {
   );
 }
 
+function runManufacturerIdCarriedThrough() {
+  console.log(
+    "Case 7: resolved manufacturer_id + category_id flow through buildJomashopProductPayload",
+  );
+  // Mirrors what the push route does after resolveManufacturer /
+  // resolveCategoryRecord succeed: it sets overrides.manufacturer_id +
+  // overrides.category_id and the canonical brand/category names. The
+  // payload must carry both ids AND the canonical names so /i1/products/
+  // can accept the create and /v1/products fallback still works.
+  const product: ShopifyProduct = {
+    id: "shopify-tods-boot-2",
+    title: "Tods Womens Multicolored Boot",
+    vendor: "Tods",
+    product_type: "BOOT",
+    options: [{ name: "Size", values: ["35.5"] }],
+    variants: [
+      {
+        id: 9200,
+        sku: "XXW83B0BR70THYG409-35.5",
+        price: "1200.00",
+        inventory_quantity: 1,
+        option1: "35.5",
+      },
+    ],
+    metafields: [
+      { namespace: "custom", key: "ff_designer_id", value: "XXW83B0BR70THYG409" },
+      { namespace: "custom", key: "color", value: "Multicolor", name: "Color" },
+      { namespace: "custom", key: "composition", value: "Leather" },
+    ],
+  };
+  const mapped = mapShopifyToJomashop(product, clothingSchema());
+  const { payload, variant } = buildJomashopProductPayload(mapped, undefined, {
+    category: "Footwear",
+    brand: "Tod's",
+    manufacturer_id: 421,
+    category_id: 12,
+  });
+  assert(
+    payload.manufacturer_id === 421,
+    `payload.manufacturer_id propagated (got ${JSON.stringify(payload.manufacturer_id)})`,
+  );
+  assert(
+    payload.category_id === 12,
+    `payload.category_id propagated (got ${JSON.stringify(payload.category_id)})`,
+  );
+  assert(
+    payload.brand === "Tod's",
+    `payload.brand uses canonical Jomashop spelling (got ${JSON.stringify(payload.brand)})`,
+  );
+  assert(
+    payload.category === "Footwear",
+    `payload.category uses canonical Jomashop spelling (got ${JSON.stringify(payload.category)})`,
+  );
+
+  // /i1 envelope split: product node carries the brand/category ids; stock
+  // node carries quantity/price/status from the variant.
+  const envelope = buildI1ProductEnvelope(payload, variant);
+  const productNode = envelope.product as Record<string, unknown>;
+  const stockNode = envelope.stock as Record<string, unknown>;
+  assert(
+    productNode && productNode.manufacturer_id === 421,
+    `envelope.product.manufacturer_id present`,
+  );
+  assert(
+    productNode && productNode.category_id === 12,
+    `envelope.product.category_id present`,
+  );
+  assert(
+    productNode && productNode.sku === "XXW83B0BR70THYG409-35.5",
+    `envelope.product.sku present (got ${JSON.stringify(productNode?.sku)})`,
+  );
+  assert(
+    stockNode && typeof stockNode.quantity === "number" && stockNode.quantity === 1,
+    `envelope.stock.quantity reflects variant.quantity (got ${JSON.stringify(stockNode?.quantity)})`,
+  );
+  assert(
+    stockNode && stockNode.price !== undefined && stockNode.price !== null,
+    `envelope.stock.price populated`,
+  );
+}
+
+function runResolvedRecordsRequiredForReadiness() {
+  console.log(
+    "Case 8: readiness logic requires resolved manufacturer record (simulated)",
+  );
+  // We can't call /i1/manufacturers from the unit test (no network), but we
+  // can verify the resolver helpers behave correctly given an in-memory list
+  // and that the per-product readiness contract is "exact manufacturer
+  // match required". Mirrors the inline Levenshtein in routes.ts.
+  function lookupKey(s: string): string {
+    return s.toLowerCase().trim().replace(/[^a-z0-9]+/g, "");
+  }
+  const manufacturers = [
+    { id: 421, name: "Tod's" },
+    { id: 102, name: "Gucci" },
+    { id: 303, name: "Saint Laurent" },
+  ];
+  const byKey = new Map(manufacturers.map((m) => [lookupKey(m.name), m]));
+  // "Tods" should normalize to the same key as "Tod's" — exact match.
+  assert(
+    byKey.has(lookupKey("Tods")),
+    `"Tods" exact-matches "Tod's" after normalization (apostrophe stripped)`,
+  );
+  // A misspelled brand should NOT exact-match.
+  assert(
+    !byKey.has(lookupKey("Guucci")),
+    `"Guucci" does not exact-match anything in the live list`,
+  );
+  // Readiness contract: when /i1 is available and there's no exact
+  // manufacturer match, the product MUST go to needs-category-verification
+  // (not ready). We simulate the routes.ts check here.
+  const i1Available = byKey.size > 0;
+  function isReady(brand: string): boolean {
+    if (!i1Available) return true; // legacy fallback
+    return byKey.has(lookupKey(brand));
+  }
+  assert(isReady("Tods") === true, `Readiness flips ready for resolvable "Tods"`);
+  assert(
+    isReady("Unknown Brand") === false,
+    `Readiness flips needs-verification for unknown brand`,
+  );
+}
+
 runColorNavyCase();
 runDefinitionNameOnlyCase();
 runVariantSelectedOptionFallback();
 runListTypeMetafield();
 runBuiltInCategoryDefaults();
 runBrandKeyNormalization();
+runManufacturerIdCarriedThrough();
+runResolvedRecordsRequiredForReadiness();
 
 if (failures > 0) {
   console.error(`\n${failures} assertion(s) failed.`);

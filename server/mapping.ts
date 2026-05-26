@@ -113,6 +113,13 @@ export type PushOverrides = {
   brand?: string;
   sku?: string;
   manufacturer_number?: string;
+  /** Live Jomashop manufacturer record id (from /i1/manufacturers). When
+   *  present the payload sends `product.manufacturer_id` so the new
+   *  /i1/products/ endpoint can accept the create without a name lookup. */
+  manufacturer_id?: number | string;
+  /** Live Jomashop category record id (from /i1/categories). Same role as
+   *  manufacturer_id for the category side. */
+  category_id?: number | string;
 };
 
 /**
@@ -889,6 +896,17 @@ export function buildJomashopProductPayload(
   // vendor "Tods" pulled into the brand property earlier.
   payload.category = category;
   payload.brand = brand;
+  // Live /i1 record ids (when the caller resolved them against
+  // /i1/manufacturers and /i1/categories). The new /i1/products/ endpoint
+  // expects manufacturer_id + category_id; we always send them as top-level
+  // fields when known so the legacy /v1/products fallback can also consume
+  // them.
+  if (overrides.manufacturer_id !== undefined && overrides.manufacturer_id !== null) {
+    payload.manufacturer_id = overrides.manufacturer_id;
+  }
+  if (overrides.category_id !== undefined && overrides.category_id !== null) {
+    payload.category_id = overrides.category_id;
+  }
 
   const missingRequired = mapped.warnings.filter((w) => /Missing required/.test(w));
   const missingTopLevel: string[] = [];
@@ -897,6 +915,52 @@ export function buildJomashopProductPayload(
     if (v === null || v === undefined || String(v).trim() === "") missingTopLevel.push(k);
   }
   return { payload, variant, missingRequired, missingTopLevel };
+}
+
+/**
+ * Wrap the flat product payload into the envelope expected by /i1/products/.
+ * Portal-side JS posts `{ product: { manufacturer_id, category_id, name,
+ * sku, manufacturer_number, properties, images, ... }, stock: { quantity,
+ * price, status, ... } }`. We split the already-built flat payload into the
+ * two halves so the same `buildJomashopProductPayload` output can be sent to
+ * either /v1/products (flat) or /i1/products/ (enveloped).
+ */
+export function buildI1ProductEnvelope(
+  payload: Record<string, unknown>,
+  variant: MappedProduct["variants"][number] | null,
+): Record<string, unknown> {
+  const productKeys = new Set([
+    "manufacturer_id",
+    "category_id",
+    "name",
+    "sku",
+    "vendor_sku",
+    "manufacturer_number",
+    "description",
+    "images",
+    "properties",
+    "brand",
+    "category",
+  ]);
+  const product: Record<string, unknown> = {};
+  for (const k of Object.keys(payload)) {
+    if (productKeys.has(k)) product[k] = payload[k];
+  }
+  // Carry the unknown / schema-driven property fields onto the product node
+  // as well so the API can pick them up either via product.properties or
+  // top-level (depending on which shape it accepts).
+  for (const [k, v] of Object.entries(payload)) {
+    if (productKeys.has(k)) continue;
+    if (k === "price" || k === "msrp") continue;
+    product[k] = v;
+  }
+  const stock: Record<string, unknown> = {
+    quantity: variant?.quantity ?? 0,
+    price: variant?.jomashop_price ?? payload.price ?? null,
+    status: variant?.status ?? "active",
+  };
+  if (payload.msrp !== undefined && payload.msrp !== null) stock.msrp = payload.msrp;
+  return { product, stock };
 }
 
 /**
