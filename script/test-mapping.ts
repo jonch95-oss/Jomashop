@@ -38,7 +38,7 @@ import {
   lookupBrandOverride,
   normalizeBrandKey,
 } from "../server/brand_mapping";
-import { FALLBACK_CATEGORY_SCHEMAS } from "../shared/schema";
+import { FALLBACK_CATEGORY_SCHEMAS, SUPPORTED_CATEGORIES } from "../shared/schema";
 
 let failures = 0;
 
@@ -104,18 +104,21 @@ function runColorNavyCase() {
   };
 
   const mapped = mapShopifyToJomashop(product, clothingSchema());
-  assert(mapped.properties.color === "NAVY", `properties.color === "NAVY" (got ${JSON.stringify(mapped.properties.color)})`);
   assert(
-    typeof mapped.properties.material === "string" && /cotton/i.test(String(mapped.properties.material)),
-    `properties.material populated from Composition (got ${JSON.stringify(mapped.properties.material)})`,
+    mapped.properties.Color === "NAVY",
+    `properties.Color === "NAVY" (got ${JSON.stringify(mapped.properties.Color)})`,
   );
   assert(
-    !(mapped.missing_required || []).includes("color"),
-    `missing_required does not include "color" (got ${JSON.stringify(mapped.missing_required)})`,
+    typeof mapped.properties.Material === "string" && /cotton/i.test(String(mapped.properties.Material)),
+    `properties.Material populated from Composition (got ${JSON.stringify(mapped.properties.Material)})`,
   );
   assert(
-    !(mapped.missing_required || []).includes("material"),
-    `missing_required does not include "material"`,
+    !(mapped.missing_required || []).includes("Color"),
+    `missing_required does not include "Color" (got ${JSON.stringify(mapped.missing_required)})`,
+  );
+  assert(
+    !(mapped.missing_required || []).includes("Material"),
+    `missing_required does not include "Material"`,
   );
   assert(mapped.debug_raw && mapped.debug_raw.metafields.length === 4, "debug_raw.metafields populated");
 }
@@ -143,12 +146,12 @@ function runDefinitionNameOnlyCase() {
 
   const mapped = mapShopifyToJomashop(product, clothingSchema());
   assert(
-    mapped.properties.color === "RED",
-    `definition-name match: properties.color === "RED" (got ${JSON.stringify(mapped.properties.color)})`,
+    mapped.properties.Color === "RED",
+    `definition-name match: properties.Color === "RED" (got ${JSON.stringify(mapped.properties.Color)})`,
   );
   assert(
-    !(mapped.missing_required || []).includes("color"),
-    `missing_required does not include "color" via definition-name match`,
+    !(mapped.missing_required || []).includes("Color"),
+    `missing_required does not include "Color" via definition-name match`,
   );
 }
 
@@ -182,8 +185,8 @@ function runVariantSelectedOptionFallback() {
   };
   const mapped = mapShopifyToJomashop(product, clothingSchema());
   assert(
-    mapped.properties.color === "Beige",
-    `variant option fallback: properties.color === "Beige" (got ${JSON.stringify(mapped.properties.color)})`,
+    mapped.properties.Color === "Beige",
+    `variant option fallback: properties.Color === "Beige" (got ${JSON.stringify(mapped.properties.Color)})`,
   );
 }
 
@@ -205,12 +208,12 @@ function runListTypeMetafield() {
   };
   const mapped = mapShopifyToJomashop(product, clothingSchema());
   assert(
-    mapped.properties.color === "NAVY",
-    `list metafield unpacked: properties.color === "NAVY" (got ${JSON.stringify(mapped.properties.color)})`,
+    mapped.properties.Color === "NAVY",
+    `list metafield unpacked: properties.Color === "NAVY" (got ${JSON.stringify(mapped.properties.Color)})`,
   );
   assert(
-    mapped.properties.material === "cotton",
-    `quoted scalar unwrapped: properties.material === "cotton" (got ${JSON.stringify(mapped.properties.material)})`,
+    mapped.properties.Material === "cotton",
+    `quoted scalar unwrapped: properties.Material === "cotton" (got ${JSON.stringify(mapped.properties.Material)})`,
   );
 }
 
@@ -247,14 +250,23 @@ function runBuiltInCategoryDefaults() {
     lookupBuiltInCategoryDefault("ZZZZ-UNKNOWN") === null,
     `unknown code returns null`,
   );
-  // Coercion from Jomashop name → SupportedCategory.
-  assert(coerceJomashopToSupported("Footwear") === "Shoes", `Footwear → Shoes`);
+  // Coercion from Jomashop name → SupportedCategory. Now that "Footwear" /
+  // "Accessories" / "Apparel" / "Eyewear" / "Rings" / "Necklaces" are
+  // first-class entries in SUPPORTED_CATEGORIES (with exact Title-Case
+  // schemas), they coerce to themselves rather than collapsing into the
+  // legacy "Shoes" / "Clothing" buckets.
+  assert(coerceJomashopToSupported("Footwear") === "Footwear", `Footwear → Footwear`);
   assert(
-    coerceJomashopToSupported("Accessories") === "Clothing",
-    `Accessories → Clothing`,
+    coerceJomashopToSupported("Accessories") === "Accessories",
+    `Accessories → Accessories`,
   );
+  assert(coerceJomashopToSupported("Apparel") === "Apparel", `Apparel → Apparel`);
+  assert(coerceJomashopToSupported("Eyewear") === "Eyewear", `Eyewear → Eyewear`);
+  assert(coerceJomashopToSupported("Rings") === "Rings", `Rings → Rings`);
+  assert(coerceJomashopToSupported("Necklaces") === "Necklaces", `Necklaces → Necklaces`);
   assert(coerceJomashopToSupported("Handbags") === "Handbags", `Handbags → Handbags`);
   assert(coerceJomashopToSupported("Clothing") === "Clothing", `Clothing → Clothing`);
+  assert(coerceJomashopToSupported("Shoes") === "Shoes", `Shoes → Shoes`);
   // Ambiguity: WALL/CARD have built-in defaults, so they no longer surface
   // as ambiguous (operator decision already made via the seed mapping).
   assert(
@@ -341,17 +353,25 @@ function runBrandKeyNormalization() {
   };
   const props = clothingSchema();
   const mapped = mapShopifyToJomashop(product, props);
-  const { payload } = buildJomashopProductPayload(mapped, undefined, {
+  const { payload, pushDebug } = buildJomashopProductPayload(mapped, undefined, {
     category: "Boots",
     brand: "Tod's",
   });
+  // The strict /i1 payload no longer carries legacy top-level "brand" /
+  // "category" — they are conveyed by manufacturer_id/category_id and the
+  // schema-driven properties. pushDebug.category records the operator
+  // override for traceability.
   assert(
-    payload.category === "Boots",
-    `payload.category honours override (got ${JSON.stringify(payload.category)})`,
+    !("brand" in payload),
+    `payload no longer carries legacy top-level "brand" (got ${JSON.stringify(payload.brand)})`,
   );
   assert(
-    payload.brand === "Tod's",
-    `payload.brand honours override (got ${JSON.stringify(payload.brand)})`,
+    !("category" in payload),
+    `payload no longer carries legacy top-level "category" (got ${JSON.stringify(payload.category)})`,
+  );
+  assert(
+    pushDebug.category === "Boots",
+    `pushDebug.category honours override (got ${JSON.stringify(pushDebug.category)})`,
   );
   assert(
     payload.sku === "XXW83B0BR70THYG409-35.5",
@@ -404,13 +424,17 @@ function runManufacturerIdCarriedThrough() {
     payload.category_id === 12,
     `payload.category_id propagated (got ${JSON.stringify(payload.category_id)})`,
   );
+  // Brand/category names no longer travel as top-level legacy fields. The
+  // /i1 endpoint reads them off manufacturer_id/category_id and schema
+  // properties; pushDebug retains the canonical operator-supplied names for
+  // logs and the rejected-state UI.
   assert(
-    payload.brand === "Tod's",
-    `payload.brand uses canonical Jomashop spelling (got ${JSON.stringify(payload.brand)})`,
+    !("brand" in payload),
+    `payload no longer carries legacy top-level "brand"`,
   );
   assert(
-    payload.category === "Footwear",
-    `payload.category uses canonical Jomashop spelling (got ${JSON.stringify(payload.category)})`,
+    !("category" in payload),
+    `payload no longer carries legacy top-level "category"`,
   );
 
   // /i1 envelope split: product node carries the brand/category ids; stock
@@ -1008,6 +1032,207 @@ function runCanonicalFieldsExtraction() {
   );
 }
 
+// ---------- Case 16: per-category strict-shape payload contract ----------
+//
+// The push route's contract: for EVERY supported category, the outgoing
+// payload must
+//   (a) carry NO forbidden lowercase top-level fields,
+//   (b) put schema properties under exact Title Case labels,
+//   (c) split into product+stock envelopes with the strict allow-list.
+// This test exercises Apparel + Footwear + Handbags + Accessories + Eyewear
+// + Rings + Necklaces so a future category addition that re-introduces the
+// lowercase emit path fails CI rather than reaching Jomashop.
+function runStrictShapePerCategory() {
+  console.log("Case 16: strict-shape payload contract per category");
+  const baseVariant = {
+    id: 9999,
+    sku: "STRICT-TEST-1",
+    price: "200.00",
+    inventory_quantity: 1,
+    option1: "M",
+  };
+  const baseProduct = (category: string, vendor: string): ShopifyProduct => ({
+    id: `shopify-strict-${category}`,
+    title: `${vendor} ${category} fixture`,
+    body_html: `<p>${category} item.</p>`,
+    vendor,
+    product_type: category,
+    tags: ["Men"],
+    images: [{ src: "https://example.com/img.jpg" }],
+    options: [{ name: "Size", values: ["M"] }],
+    variants: [{ ...baseVariant }],
+    metafields: [
+      { namespace: "custom", key: "color", value: "Black", name: "Color" },
+      { namespace: "custom", key: "composition", value: "Leather" },
+      { namespace: "custom", key: "ff_designer_id", value: "STRICT-TEST-1" },
+      { namespace: "custom", key: "country_of_origin", value: "Italy" },
+    ],
+  });
+
+  const supportedToTest = [
+    "Apparel",
+    "Footwear",
+    "Handbags",
+    "Accessories",
+    "Eyewear",
+    "Rings",
+    "Necklaces",
+  ] as const;
+
+  for (const category of supportedToTest) {
+    const schema = FALLBACK_CATEGORY_SCHEMAS[category].map((f) => ({
+      field: f.field,
+      required: f.required,
+      type: f.type,
+      options: f.options,
+    }));
+    const product = baseProduct(category, "Gucci");
+    const mapped = mapShopifyToJomashop(product, schema, category);
+    const { payload, pushDebug } = buildJomashopProductPayload(mapped, undefined, {
+      category,
+      brand: "Gucci",
+      manufacturer_id: 1,
+      category_id: 2,
+    });
+
+    // (a) NO forbidden lowercase keys at the top level.
+    const forbidden = [
+      "brand",
+      "category",
+      "gender",
+      "size",
+      "size_system",
+      "color",
+      "material",
+      "category_type",
+      "country_of_origin",
+      "age",
+      "apparel_type",
+      "style",
+      "hardware",
+      "model",
+      "composition",
+    ];
+    const topLevelKeys = Object.keys(payload);
+    for (const k of forbidden) {
+      assert(
+        !topLevelKeys.includes(k),
+        `[${category}] payload top-level excludes forbidden "${k}" (got top-level ${JSON.stringify(topLevelKeys)})`,
+      );
+    }
+    // (b) properties keys are Title Case / spaced.
+    const propKeys = Object.keys((payload.properties as Record<string, unknown>) || {});
+    if (propKeys.length > 0) {
+      assert(
+        propKeys.every((k) => /[A-Z]/.test(k) || /\s/.test(k)),
+        `[${category}] payload.properties uses exact Title Case labels (got ${JSON.stringify(propKeys)})`,
+      );
+    }
+    // (c) /i1 envelope split — product node strict allow-list only.
+    const envelope = buildI1ProductEnvelope(payload, mapped.variants[0]);
+    const productNode = envelope.product as Record<string, unknown>;
+    const stockNode = envelope.stock as Record<string, unknown>;
+    const allowedProductKeys = new Set([
+      "manufacturer_id",
+      "category_id",
+      "name",
+      "sku",
+      "vendor_sku",
+      "manufacturer_number",
+      "description",
+      "images",
+      "properties",
+    ]);
+    for (const k of Object.keys(productNode)) {
+      assert(
+        allowedProductKeys.has(k),
+        `[${category}] envelope.product carries only strict allow-list key (saw "${k}")`,
+      );
+    }
+    assert(productNode.manufacturer_id === 1, `[${category}] envelope.product.manufacturer_id propagated`);
+    assert(productNode.category_id === 2, `[${category}] envelope.product.category_id propagated`);
+    assert(
+      typeof stockNode.quantity === "number",
+      `[${category}] envelope.stock.quantity present`,
+    );
+
+    // (d) pushDebug surfaces schema source + property keys.
+    assert(pushDebug.schemaLabelsExact === true, `[${category}] pushDebug.schemaLabelsExact === true`);
+    assert(pushDebug.fallbackUnsafe === false, `[${category}] pushDebug.fallbackUnsafe === false`);
+    assert(Array.isArray(pushDebug.propertyKeys), `[${category}] pushDebug.propertyKeys is array`);
+  }
+}
+
+// ---------- Case 17: fallbackUnsafe trips when schema is lowercase-only ----------
+//
+// Simulates the exact production failure: /i1/categories/:id returns nothing,
+// and the route falls back to a lowercase-only schema. The payload builder
+// MUST flag pushDebug.fallbackUnsafe = true so the route can refuse the push
+// at preflight instead of sending fields Jomashop will reject.
+function runFallbackUnsafeGate() {
+  console.log("Case 17: fallbackUnsafe gate refuses lowercase-only schemas");
+  const lowercaseSchema = [
+    { field: "color", type: "string" as const, required: true },
+    { field: "material", type: "string" as const, required: false },
+  ];
+  const product: ShopifyProduct = {
+    id: "shopify-fallback-1",
+    title: "Fixture",
+    vendor: "Gucci",
+    product_type: "Apparel",
+    options: [{ name: "Size", values: ["M"] }],
+    variants: [{ id: 1, sku: "FB-1", price: "100.00", inventory_quantity: 1, option1: "M" }],
+    metafields: [
+      { namespace: "custom", key: "color", value: "Black" },
+      { namespace: "custom", key: "composition", value: "Leather" },
+    ],
+  };
+  const mapped = mapShopifyToJomashop(product, lowercaseSchema);
+  // Legacy lowercase keys end up in mapped.properties (the legacy emit
+  // branch). The builder must DROP them and flag fallbackUnsafe so the route
+  // returns a 422 instead of POSTing to /i1.
+  const { payload, pushDebug } = buildJomashopProductPayload(mapped, undefined, {
+    category: "Apparel",
+    brand: "Gucci",
+    manufacturer_id: 1,
+    category_id: 2,
+  });
+  assert(
+    pushDebug.fallbackUnsafe === true,
+    `lowercase schema → pushDebug.fallbackUnsafe === true (got ${pushDebug.fallbackUnsafe})`,
+  );
+  assert(
+    pushDebug.removedLegacyKeys.length > 0,
+    `pushDebug.removedLegacyKeys lists the stripped lowercase keys (got ${JSON.stringify(pushDebug.removedLegacyKeys)})`,
+  );
+  const props = (payload.properties as Record<string, unknown>) || {};
+  assert(
+    !("color" in props) && !("material" in props),
+    `payload.properties strips lowercase keys defensively (got ${JSON.stringify(Object.keys(props))})`,
+  );
+}
+
+// ---------- Case 18: every SUPPORTED_CATEGORIES entry has exact-label fallback ----------
+//
+// Guard rail. A future category addition that forgets to put exact Title
+// Case labels in FALLBACK_CATEGORY_SCHEMAS would silently regress the
+// production push to lowercase-fallback again.
+function runEverySupportedCategoryHasExactLabels() {
+  console.log("Case 18: every SUPPORTED_CATEGORIES entry has exact-label fallback");
+  for (const cat of SUPPORTED_CATEGORIES) {
+    const schema = FALLBACK_CATEGORY_SCHEMAS[cat];
+    assert(
+      Array.isArray(schema) && schema.length > 0,
+      `FALLBACK_CATEGORY_SCHEMAS.${String(cat)} is a non-empty array`,
+    );
+    const allExact = schema.every((p) => /[A-Z]/.test(p.field) || /\s/.test(p.field));
+    assert(
+      allExact,
+      `FALLBACK_CATEGORY_SCHEMAS.${String(cat)} uses ONLY exact Title Case labels (got ${JSON.stringify(schema.map((p) => p.field))})`,
+    );
+  }
+}
+
 runColorNavyCase();
 runDefinitionNameOnlyCase();
 runVariantSelectedOptionFallback();
@@ -1024,6 +1249,9 @@ runHandbagSchemaDriven();
 runMissingRequiredSurfacesExactLabels();
 runI1SchemaNormalization();
 runCanonicalFieldsExtraction();
+runStrictShapePerCategory();
+runFallbackUnsafeGate();
+runEverySupportedCategoryHasExactLabels();
 
 if (failures > 0) {
   console.error(`\n${failures} assertion(s) failed.`);

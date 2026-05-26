@@ -187,13 +187,11 @@ async function buildMissingExportRows(): Promise<{
     return { rows: [], shopDomain: null, fetchedCount: 0, pageCount: 0, hasMore: false };
   }
 
-  // Resolve schemas for the three categories (live preferred). Done once
-  // up-front so each streamed page can map without re-fetching.
-  const schemas: Record<SupportedCategory, Array<any>> = {
-    Shoes: [],
-    Handbags: [],
-    Clothing: [],
-  };
+  // Resolve schemas for the legacy three-category bucket bulk repair was
+  // built around (live preferred). Done once up-front so each streamed page
+  // can map without re-fetching. Newer categories (Apparel/Footwear/etc.)
+  // flow through the single-product push route directly.
+  const schemas: Partial<Record<SupportedCategory, Array<any>>> = {};
   for (const cat of ["Shoes", "Handbags", "Clothing"] as const) {
     const { schema } = await resolveCategorySchema(cat);
     const props =
@@ -214,7 +212,7 @@ async function buildMissingExportRows(): Promise<{
       fetchedCount += 1;
       if (isSampleProduct(product)) continue;
       const tmp = mapShopifyToJomashop(product, []);
-      const props = schemas[tmp.category];
+      const props = schemas[tmp.category] ?? [];
       const mapped = mapShopifyToJomashop(product, props);
       const missing = [
         ...(mapped.missing_top_level ?? []),
@@ -703,10 +701,12 @@ async function pushRowToJomashop(row: ParsedRow): Promise<JomashopPushResult> {
     out.error = "Sample/demo product — push refused.";
     return out;
   }
-  const { payload, missingRequired, missingTopLevel } = buildJomashopProductPayload(
-    remapped.mapped,
-    row.sku || undefined,
-  );
+  const { payload, missingRequired, missingTopLevel, pushDebug } =
+    buildJomashopProductPayload(remapped.mapped, row.sku || undefined);
+  if (pushDebug.fallbackUnsafe) {
+    out.error = `Live category schema for "${pushDebug.category}" unavailable; bundled fallback would emit lowercase labels Jomashop rejects.`;
+    return out;
+  }
   if (missingRequired.length > 0 || missingTopLevel.length > 0) {
     out.error = "Required fields are still missing after Shopify update.";
     out.missingRequired = missingRequired;

@@ -229,7 +229,29 @@ export type WebhookEvent = typeof webhookEvents.$inferSelect;
 export type InsertWebhookEvent = z.infer<typeof insertWebhookEventSchema>;
 
 // ---------- Shared domain constants ----------
-export const SUPPORTED_CATEGORIES = ["Shoes", "Handbags", "Clothing"] as const;
+// SupportedCategory enumerates every Jomashop top-level category this app
+// pushes to. Each entry must have a corresponding entry in
+// FALLBACK_CATEGORY_SCHEMAS using the EXACT property labels Jomashop accepts
+// (Title Case / spaced) — never lowercase legacy field names. Adding a new
+// category here without a matching schema entry will cause schema-driven
+// payload construction to fail visibly at preflight (this is intentional).
+export const SUPPORTED_CATEGORIES = [
+  // Original three (kept for backward compatibility with existing data).
+  "Shoes",
+  "Handbags",
+  "Clothing",
+  // Categories Jomashop accepts and the app maps to via BUILT_IN_CATEGORY_OVERRIDES.
+  "Apparel",
+  "Footwear",
+  "Accessories",
+  "Eyewear",
+  "Rings",
+  "Necklaces",
+  "Bracelets",
+  "Earrings",
+  "Pins & Brooches",
+  "Home Decor",
+] as const;
 export type SupportedCategory = (typeof SUPPORTED_CATEGORIES)[number];
 
 export const INVENTORY_STATUSES = ["active", "out_of_stock", "inactive"] as const;
@@ -245,43 +267,136 @@ export const ORDER_STATUSES = [
 ] as const;
 export type OrderStatus = (typeof ORDER_STATUSES)[number];
 
-// Static fallback schema used when /v1/categories cannot be reached.
-// The app prefers fetching live category schemas from Jomashop.
+// Static fallback schema used when /i1/categories/:id cannot be reached.
+// The app prefers fetching live category schemas from Jomashop, but when the
+// live lookup fails these are used as a last-resort source of EXACT property
+// labels (Title Case / spaced) — never legacy lowercase names. When push-time
+// payload construction sees only lowercase fallback labels it refuses the
+// push at preflight rather than producing a payload Jomashop will reject
+// (the rejected /i1 endpoint requires Title Case labels and forbids the
+// legacy lowercase fields).
 export const FALLBACK_CATEGORY_SCHEMAS: Record<
   SupportedCategory,
   { field: string; type: "string" | "number" | "enum" | "boolean"; required: boolean; options?: string[]; example?: string }[]
 > = {
-  Shoes: [
-    { field: "brand", type: "string", required: true, example: "Gucci" },
-    { field: "model", type: "string", required: true, example: "Ace Sneaker" },
-    { field: "gender", type: "enum", required: true, options: ["Men", "Women", "Unisex", "Kids"] },
-    { field: "size", type: "string", required: true, example: "US 10" },
-    { field: "size_system", type: "enum", required: true, options: ["US", "EU", "UK"] },
-    { field: "color", type: "string", required: true, example: "Black" },
-    { field: "material", type: "string", required: false, example: "Leather" },
-    { field: "style", type: "string", required: false, example: "Low-top sneaker" },
-    { field: "country_of_origin", type: "string", required: false, example: "Italy" },
+  // ----- Apparel (Title Case Jomashop labels per /i1/categories/Apparel) -----
+  Apparel: [
+    { field: "Gender", type: "enum", required: true, options: ["Men", "Women", "Unisex", "Kids"] },
+    { field: "Age", type: "enum", required: true, options: ["Adult", "Kids"] },
+    { field: "Apparel Type", type: "string", required: true },
+    { field: "Detailed Description", type: "string", required: true },
+    { field: "Total Number of Pieces", type: "string", required: true, example: "1" },
+    { field: "Color", type: "string", required: true },
+    { field: "Article", type: "string", required: false },
+    { field: "Apparel Size Type", type: "enum", required: false, options: ["US", "EU", "UK", "IT", "FR"] },
+    { field: "Apparel Size", type: "string", required: false },
+    { field: "Material", type: "string", required: false },
+    { field: "Country of Origin", type: "string", required: false },
   ],
+  // ----- Footwear -----
+  Footwear: [
+    { field: "Gender", type: "enum", required: true, options: ["Men", "Women", "Unisex", "Kids"] },
+    { field: "Shoe Size", type: "string", required: true },
+    { field: "Shoe Size Type", type: "enum", required: true, options: ["US", "EU", "UK", "IT", "FR"] },
+    { field: "Color", type: "string", required: true },
+    { field: "Material", type: "string", required: false },
+    { field: "Style", type: "string", required: false },
+    { field: "Country of Origin", type: "string", required: false },
+  ],
+  // ----- Handbags -----
   Handbags: [
-    { field: "brand", type: "string", required: true, example: "Saint Laurent" },
-    { field: "model", type: "string", required: true, example: "Loulou Small" },
-    { field: "color", type: "string", required: true, example: "Noir" },
-    { field: "material", type: "string", required: true, example: "Calfskin leather" },
-    { field: "style", type: "enum", required: false, options: ["Shoulder", "Tote", "Crossbody", "Clutch", "Backpack", "Top-handle"] },
-    { field: "hardware", type: "enum", required: false, options: ["Gold", "Silver", "Gunmetal", "Mixed"] },
-    { field: "interior_material", type: "string", required: false },
-    { field: "dimensions", type: "string", required: false, example: "9.4 x 6.7 x 3.5 in" },
-    { field: "country_of_origin", type: "string", required: false, example: "Italy" },
+    { field: "Color", type: "string", required: true, example: "Noir" },
+    { field: "Material", type: "string", required: true, example: "Calfskin leather" },
+    { field: "Style", type: "enum", required: false, options: ["Shoulder", "Tote", "Crossbody", "Clutch", "Backpack", "Top-handle"] },
+    { field: "Hardware", type: "enum", required: false, options: ["Gold", "Silver", "Gunmetal", "Mixed"] },
+    { field: "Interior Material", type: "string", required: false },
+    { field: "Dimensions", type: "string", required: false },
+    { field: "Country of Origin", type: "string", required: false },
+  ],
+  // ----- Accessories (wallets/belts/cardholders) -----
+  Accessories: [
+    { field: "Gender", type: "enum", required: false, options: ["Men", "Women", "Unisex", "Kids"] },
+    { field: "Color", type: "string", required: true },
+    { field: "Material", type: "string", required: false },
+    { field: "Style", type: "string", required: false },
+    { field: "Country of Origin", type: "string", required: false },
+  ],
+  // ----- Eyewear -----
+  Eyewear: [
+    { field: "Gender", type: "enum", required: true, options: ["Men", "Women", "Unisex", "Kids"] },
+    { field: "Frame Color", type: "string", required: true },
+    { field: "Lens Color", type: "string", required: false },
+    { field: "Frame Material", type: "string", required: false },
+    { field: "Country of Origin", type: "string", required: false },
+  ],
+  // ----- Jewelry sub-categories — Rings -----
+  Rings: [
+    { field: "Gender", type: "enum", required: true, options: ["Men", "Women", "Unisex"] },
+    { field: "Metal", type: "string", required: true },
+    { field: "Ring Size", type: "string", required: false },
+    { field: "Stone", type: "string", required: false },
+    { field: "Country of Origin", type: "string", required: false },
+  ],
+  // ----- Necklaces -----
+  Necklaces: [
+    { field: "Gender", type: "enum", required: true, options: ["Men", "Women", "Unisex"] },
+    { field: "Metal", type: "string", required: true },
+    { field: "Length", type: "string", required: false },
+    { field: "Stone", type: "string", required: false },
+    { field: "Country of Origin", type: "string", required: false },
+  ],
+  // ----- Bracelets -----
+  Bracelets: [
+    { field: "Gender", type: "enum", required: true, options: ["Men", "Women", "Unisex"] },
+    { field: "Metal", type: "string", required: true },
+    { field: "Length", type: "string", required: false },
+    { field: "Stone", type: "string", required: false },
+    { field: "Country of Origin", type: "string", required: false },
+  ],
+  // ----- Earrings -----
+  Earrings: [
+    { field: "Gender", type: "enum", required: true, options: ["Men", "Women", "Unisex"] },
+    { field: "Metal", type: "string", required: true },
+    { field: "Stone", type: "string", required: false },
+    { field: "Country of Origin", type: "string", required: false },
+  ],
+  // ----- Pins & Brooches -----
+  "Pins & Brooches": [
+    { field: "Metal", type: "string", required: true },
+    { field: "Color", type: "string", required: true },
+    { field: "Stone", type: "string", required: false },
+    { field: "Country of Origin", type: "string", required: false },
+  ],
+  // ----- Home Decor -----
+  "Home Decor": [
+    { field: "Color", type: "string", required: true },
+    { field: "Material", type: "string", required: false },
+    { field: "Dimensions", type: "string", required: false },
+    { field: "Country of Origin", type: "string", required: false },
+  ],
+  // ----- Legacy buckets kept for backward compatibility -----
+  // Shoes / Clothing predate the strict-label rewrite and are aliased to the
+  // new schemas below so older code paths still resolve. New code should
+  // route to "Footwear" / "Apparel".
+  Shoes: [
+    { field: "Gender", type: "enum", required: true, options: ["Men", "Women", "Unisex", "Kids"] },
+    { field: "Shoe Size", type: "string", required: true },
+    { field: "Shoe Size Type", type: "enum", required: true, options: ["US", "EU", "UK", "IT", "FR"] },
+    { field: "Color", type: "string", required: true },
+    { field: "Material", type: "string", required: false },
+    { field: "Country of Origin", type: "string", required: false },
   ],
   Clothing: [
-    { field: "brand", type: "string", required: true, example: "Burberry" },
-    { field: "model", type: "string", required: false, example: "Vintage Check Shirt" },
-    { field: "gender", type: "enum", required: true, options: ["Men", "Women", "Unisex", "Kids"] },
-    { field: "size", type: "string", required: true, example: "M" },
-    { field: "size_system", type: "enum", required: true, options: ["US", "EU", "UK", "IT", "FR"] },
-    { field: "color", type: "string", required: true, example: "Beige" },
-    { field: "material", type: "string", required: true, example: "Cotton" },
-    { field: "category_type", type: "enum", required: false, options: ["Tops", "Bottoms", "Outerwear", "Dresses", "Suits", "Activewear"] },
-    { field: "country_of_origin", type: "string", required: false },
+    { field: "Gender", type: "enum", required: true, options: ["Men", "Women", "Unisex", "Kids"] },
+    { field: "Age", type: "enum", required: true, options: ["Adult", "Kids"] },
+    { field: "Apparel Type", type: "string", required: true },
+    { field: "Detailed Description", type: "string", required: true },
+    { field: "Total Number of Pieces", type: "string", required: true, example: "1" },
+    { field: "Color", type: "string", required: true },
+    { field: "Article", type: "string", required: false },
+    { field: "Apparel Size Type", type: "enum", required: false, options: ["US", "EU", "UK", "IT", "FR"] },
+    { field: "Apparel Size", type: "string", required: false },
+    { field: "Material", type: "string", required: false },
+    { field: "Country of Origin", type: "string", required: false },
   ],
 };

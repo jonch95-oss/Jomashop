@@ -842,7 +842,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     // Resolve live category schemas + the canonical category-name list so we
     // can label readiness ("Needs category verification" when the live list
     // isn't available, "Rejected" when previously failed).
-    const schemas: Record<SupportedCategory, any> = { Shoes: null, Handbags: null, Clothing: null };
+    const schemas: Partial<Record<SupportedCategory, any>> = {};
     for (const cat of SUPPORTED_CATEGORIES) {
       const { source, schema } = await resolveCategorySchema(cat);
       schemas[cat] = { source, schema };
@@ -1785,11 +1785,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
     }
 
-    const { payload, variant, missingRequired, missingTopLevel } = buildJomashopProductPayload(
-      mapped,
-      body.variantSku,
-      overrides,
-    );
+    const { payload, variant, missingRequired, missingTopLevel, pushDebug } =
+      buildJomashopProductPayload(mapped, body.variantSku, overrides);
 
     const startedAt = Date.now();
     const job = storage.createSyncJob({
@@ -1911,6 +1908,38 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       });
     }
 
+    // Refuse the push when the schema lookup degraded to a lowercase-only
+    // bundled fallback. The /i1/products/ endpoint validates property labels
+    // against the live category schema and rejects lowercase keys with
+    // "Invalid Record, schema fallback" — the exact error the operator
+    // reported. Better to surface the missing schema clearly than to send
+    // a payload Jomashop will reject.
+    if (pushDebug.fallbackUnsafe) {
+      storage.updateSyncJob(job.id, {
+        status: "failed",
+        finishedAt: Date.now(),
+        errorItems: 1,
+        summary: `Pre-flight: live schema unavailable for ${pushDebug.category}`,
+      });
+      storage.appendLog({
+        jobId: job.id,
+        level: "error",
+        message: `Push aborted: live category schema for ${pushDebug.category} unavailable and bundled fallback would emit lowercase labels Jomashop rejects`,
+        detailsJson: JSON.stringify({ pushDebug, schemaSource: liveSchemaSource }),
+        createdAt: Date.now(),
+      });
+      return res.status(422).json({
+        ok: false,
+        stage: "preflight_schema",
+        error: `Live category schema for "${pushDebug.category}" is unavailable and the bundled fallback for this category would emit lowercase property labels (${pushDebug.propertyKeys.join(", ")}) that Jomashop's /i1 endpoint rejects. Add the category to FALLBACK_CATEGORY_SCHEMAS with exact Title Case labels, or restore /i1/categories/${pushDebug.category} on the Jomashop side, before retrying.`,
+        pushDebug,
+        schemaSource: liveSchemaSource,
+        payloadPreview: payload,
+        envelopePreview: buildI1ProductEnvelope(payload, variant),
+        mapped,
+      });
+    }
+
     if (missingRequired.length > 0 || missingTopLevel.length > 0) {
       storage.updateSyncJob(job.id, {
         status: "failed",
@@ -1932,6 +1961,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         missingTopLevel,
         warnings: mapped.warnings,
         payloadPreview: payload,
+        pushDebug,
         mapped,
         schemaSource: liveSchemaSource,
       });
@@ -2060,6 +2090,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         brandResolution: manufacturerResolution,
         categoryResolution,
         mapped,
+        pushDebug,
         schemaSource: liveSchemaSource,
       });
     }
@@ -2161,6 +2192,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       pushPath,
       brandResolution: manufacturerResolution,
       categoryResolution,
+      pushDebug,
       product: { status: productResp.status, data: productResp.data },
       inventory: inventoryResp
         ? { status: inventoryResp.status, ok: inventoryResp.ok, data: inventoryResp.data, error: inventoryResp.error }

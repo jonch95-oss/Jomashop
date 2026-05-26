@@ -1034,20 +1034,15 @@ export function mapShopifyToJomashop(
     ]) ||
     (resolvedSku ? resolvedSku : null);
 
-  // Build a properties object using the category schema. Two paths:
-  //   1. Live/portal schemas → schema-driven mapping (exact labels only).
-  //      Uses the canonical product field bag + flexible label matching so
-  //      e.g. live "Apparel Type" + "Detailed Description" properties get
-  //      populated from the same canonical fields as the lowercase
-  //      "category_type" + "description" of the bundled fallback schema.
-  //   2. Bundled fallback schemas (FALLBACK_CATEGORY_SCHEMAS) → legacy
-  //      lowercase-field mapping (preserved exactly).
-  // Schema-driven path is taken when ANY schema field label contains an
-  // uppercase letter or a space — a marker that the live API responded
-  // with portal-shaped labels rather than the lowercase bundled ones.
-  const usesLiveSchemaLabels = schemaProperties.some(
-    (s) => s && typeof s.field === "string" && (/[A-Z\s]/.test(s.field) || (s.label && /[A-Z\s]/.test(s.label))),
-  );
+  // Build a properties object using the category schema. Schema-driven
+  // mapping always uses EXACT live/Title-Case labels so the /i1/products/
+  // endpoint accepts the payload. The bundled FALLBACK_CATEGORY_SCHEMAS were
+  // rewritten to use Title Case labels too — the legacy lowercase emit path
+  // (preserved below) only runs when the schema itself was already
+  // lowercase, which is unreachable for any production category. It is
+  // retained as a defensive mapping for tests / external callers that hand
+  // in an explicitly-lowercase schema.
+  const usesLiveSchemaLabels = schemaUsesExactLabels(schemaProperties);
   const properties: Record<string, string | number | boolean | null> = {};
   const missingRequiredProps: string[] = [];
 
@@ -1350,16 +1345,62 @@ export function mapShopifyToJomashop(
 }
 
 /**
- * Build the JSON payload sent to Jomashop `POST /v1/products`.
+ * Forbidden legacy lowercase fields. Jomashop's /i1 push endpoint validates
+ * payloads against the live category schema and rejects records that contain
+ * any of these top-level keys (e.g. "brand: Invalid Record, schema fallback").
+ * The schema-driven mapper writes these values out under the EXACT live
+ * labels ("Color", "Apparel Type", ...) instead — these constants exist so
+ * the payload builder can strip them defensively and surface them in
+ * push-time debug output.
+ */
+export const FORBIDDEN_TOP_LEVEL_LEGACY_FIELDS: ReadonlyArray<string> = [
+  "brand",
+  "model",
+  "gender",
+  "size",
+  "size_system",
+  "color",
+  "material",
+  "category_type",
+  "country_of_origin",
+  "age",
+  "apparel_type",
+  "category",
+  "style",
+  "hardware",
+  "interior_material",
+  "composition",
+  "dimensions",
+];
+
+/** True when ANY schema label uses Title Case / spaces — i.e. the schema is
+ *  the exact-label live (or post-rewrite fallback) shape, not the legacy
+ *  lowercase one that Jomashop now rejects. */
+export function schemaUsesExactLabels(
+  schema: Array<{ field: string; label?: string }>,
+): boolean {
+  return schema.some(
+    (s) => s && typeof s.field === "string" && (/[A-Z\s]/.test(s.field) || (s.label && /[A-Z\s]/.test(s.label))),
+  );
+}
+
+/**
+ * Build the JSON payload sent to Jomashop. The output contains ONLY the
+ * fields the /i1/products/ endpoint accepts:
  *
- * Picks the requested variant (or the first one) and produces a flat
- * product-level payload that includes the dynamic category properties as
- * top-level fields plus a `properties` block. Real Jomashop accepts the
- * dynamic schema fields at the top level; we send both so the API can pick
- * whichever shape matches the live schema.
+ *   - sku, vendor_sku, manufacturer_number — variant identifiers
+ *   - name, description, images          — product metadata
+ *   - price, msrp                        — pricing (extracted into `stock` by
+ *                                          buildI1ProductEnvelope)
+ *   - manufacturer_id, category_id       — required by /i1
+ *   - properties                         — exact-label schema properties
  *
- * Returns `{ payload, variant, missingRequired }` so the caller can surface
- * validation issues before hitting the network.
+ * Forbidden legacy lowercase fields (brand, gender, size, ...) are NEVER
+ * emitted at the top level. The third return value is `pushDebug`, a record
+ * of category, schema source, exact property keys, and any forbidden keys
+ * that were stripped — surfaced in route responses for operator inspection.
+ *
+ * Returns `{ payload, variant, missingRequired, missingTopLevel, pushDebug }`.
  */
 export function buildJomashopProductPayload(
   mapped: MappedProduct,
@@ -1370,6 +1411,13 @@ export function buildJomashopProductPayload(
   variant: MappedProduct["variants"][number] | null;
   missingRequired: string[];
   missingTopLevel: string[];
+  pushDebug: {
+    category: string;
+    schemaLabelsExact: boolean;
+    propertyKeys: string[];
+    removedLegacyKeys: string[];
+    fallbackUnsafe: boolean;
+  };
 } {
   const variant =
     (variantSku && mapped.variants.find((v) => v.vendor_sku === variantSku)) ||
@@ -1377,23 +1425,32 @@ export function buildJomashopProductPayload(
     null;
 
   const properties: Record<string, unknown> = {};
+  const removedLegacyKeys: string[] = [];
   for (const [k, v] of Object.entries(mapped.properties)) {
-    if (v !== null && v !== undefined && v !== "") properties[k] = v;
-  }
-  // Schema labels with uppercase letters or spaces indicate live Jomashop
-  // labels (e.g. "Apparel Type", "Detailed Description"). In that mode we
-  // do NOT inject generic lowercase size/color from variant options into
-  // `properties` because the live schema may explicitly forbid them — the
-  // canonical fields are already mapped to the exact live labels.
-  const propertiesUseLiveLabels = Object.keys(properties).some((k) => /[A-Z\s]/.test(k));
-  if (variant && !propertiesUseLiveLabels) {
-    for (const [k, v] of Object.entries(variant.options)) {
-      const key = k.toLowerCase();
-      if (key === "size" || key === "color" || key === "colour") {
-        properties[key === "colour" ? "color" : key] = v;
-      }
+    if (v === null || v === undefined || v === "") continue;
+    // Drop legacy lowercase keys from outgoing properties — Jomashop's /i1
+    // schema validator rejects them with "<field>: Invalid Record, schema
+    // fallback" when the live category requires the Title Case form.
+    if (FORBIDDEN_TOP_LEVEL_LEGACY_FIELDS.includes(k)) {
+      removedLegacyKeys.push(`properties.${k}`);
+      continue;
     }
+    properties[k] = v;
   }
+  const propertiesUseLiveLabels = schemaUsesExactLabels(
+    Object.keys(properties).map((field) => ({ field })),
+  );
+  // The mapper produced lowercase-only output — the schema we were handed
+  // must be the legacy lowercase fallback, which is unsafe to push because
+  // /i1 rejects those keys. We detect this either when the surviving
+  // properties are still all lowercase, OR when EVERY property emitted by
+  // the upstream mapper was a lowercase legacy key (meaning we just
+  // stripped them and there are no exact-label survivors).
+  const hadAnyLegacyEmissions = removedLegacyKeys.length > 0;
+  const hadAnyLiveEmissions = Object.keys(properties).length > 0 && propertiesUseLiveLabels;
+  const fallbackUnsafe =
+    (Object.keys(properties).length > 0 && !propertiesUseLiveLabels) ||
+    (hadAnyLegacyEmissions && !hadAnyLiveEmissions);
 
   const price = variant?.jomashop_price ?? mapped.jomashop_price;
   const msrp = mapped.msrp ?? null;
@@ -1410,12 +1467,9 @@ export function buildJomashopProductPayload(
     (mapped.manufacturer_number && String(mapped.manufacturer_number).trim()) ||
     (sku ? sku : "");
 
-  const category =
-    (overrides.category && overrides.category.trim()) || mapped.category;
-
-  const brand =
-    (overrides.brand && overrides.brand.trim()) || mapped.brand;
-
+  // Strict-shape /i1 payload. Generic lowercase fields are NEVER spread to
+  // the top level — they would be rejected by the live schema validator
+  // (this is exactly the bug the user reported).
   const payload: Record<string, unknown> = {
     sku,
     vendor_sku: sku,
@@ -1427,26 +1481,8 @@ export function buildJomashopProductPayload(
     images: mapped.images,
     properties,
   };
-  // For the legacy bundled-schema path (lowercase fields), also surface
-  // schema fields as top-level so /v1/products can pick them up. When the
-  // schema is live (uppercase/spaced labels) we omit this — Jomashop's new
-  // /i1/products/ endpoint reads exclusively from `properties` and rejects
-  // generic lowercase top-level fields it doesn't recognize.
-  if (!propertiesUseLiveLabels) {
-    for (const [k, v] of Object.entries(properties)) payload[k] = v;
-  }
-  // Apply top-level overrides AFTER the property spread so that
-  // properties.brand / properties.category (populated from the live
-  // category schema) never clobber the operator-supplied outbound values.
-  // Without this, an override of "Tod's" gets overwritten by the Shopify
-  // vendor "Tods" pulled into the brand property earlier.
-  payload.category = category;
-  payload.brand = brand;
-  // Live /i1 record ids (when the caller resolved them against
-  // /i1/manufacturers and /i1/categories). The new /i1/products/ endpoint
-  // expects manufacturer_id + category_id; we always send them as top-level
-  // fields when known so the legacy /v1/products fallback can also consume
-  // them.
+  // Live /i1 record ids — required by /i1/products/. We always send them
+  // when known so the legacy /v1/products fallback can also consume them.
   if (overrides.manufacturer_id !== undefined && overrides.manufacturer_id !== null) {
     payload.manufacturer_id = overrides.manufacturer_id;
   }
@@ -1454,28 +1490,54 @@ export function buildJomashopProductPayload(
     payload.category_id = overrides.category_id;
   }
 
+  // Validation surfaces (used by the push route to refuse the call when
+  // either schema-required props or top-level identifiers are missing).
   const missingRequired = mapped.warnings.filter((w) => /Missing required/.test(w));
   const missingTopLevel: string[] = [];
-  for (const k of ["category", "brand", "sku", "manufacturer_number"] as const) {
-    const v = payload[k];
-    if (v === null || v === undefined || String(v).trim() === "") missingTopLevel.push(k);
+  if (!sku) {
+    missingTopLevel.push("sku");
   }
-  return { payload, variant, missingRequired, missingTopLevel };
+  if (!manufacturerNumber) {
+    missingTopLevel.push("manufacturer_number");
+  }
+  // manufacturer_id / category_id are required by /i1/products/. The push
+  // route resolves them upstream against /i1/{manufacturers,categories} and
+  // then calls this builder; an unresolved id is an unrecoverable preflight
+  // failure here.
+  if (overrides.manufacturer_id === undefined || overrides.manufacturer_id === null) {
+    missingTopLevel.push("manufacturer_id");
+  }
+  if (overrides.category_id === undefined || overrides.category_id === null) {
+    missingTopLevel.push("category_id");
+  }
+
+  const pushDebug = {
+    category: (overrides.category && overrides.category.trim()) || mapped.category,
+    schemaLabelsExact: propertiesUseLiveLabels,
+    propertyKeys: Object.keys(properties),
+    removedLegacyKeys,
+    fallbackUnsafe,
+  };
+
+  return { payload, variant, missingRequired, missingTopLevel, pushDebug };
 }
 
 /**
  * Wrap the flat product payload into the envelope expected by /i1/products/.
  * Portal-side JS posts `{ product: { manufacturer_id, category_id, name,
  * sku, manufacturer_number, properties, images, ... }, stock: { quantity,
- * price, status, ... } }`. We split the already-built flat payload into the
- * two halves so the same `buildJomashopProductPayload` output can be sent to
- * either /v1/products (flat) or /i1/products/ (enveloped).
+ * price, status, ... } }`. The product node carries ONLY the strict
+ * /i1-accepted fields — no legacy lowercase identifiers — so Jomashop's
+ * schema validator never sees the keys it rejects.
  */
 export function buildI1ProductEnvelope(
   payload: Record<string, unknown>,
   variant: MappedProduct["variants"][number] | null,
 ): Record<string, unknown> {
-  const productKeys = new Set([
+  // Strict allow-list. Legacy fields (brand, category, gender, size, ...)
+  // are intentionally absent — the live category schema dictates the rest
+  // via product.properties.
+  const productKeys = [
     "manufacturer_id",
     "category_id",
     "name",
@@ -1485,26 +1547,10 @@ export function buildI1ProductEnvelope(
     "description",
     "images",
     "properties",
-    "brand",
-    "category",
-  ]);
+  ];
   const product: Record<string, unknown> = {};
-  for (const k of Object.keys(payload)) {
-    if (productKeys.has(k)) product[k] = payload[k];
-  }
-  // Carry unknown / schema-driven property fields onto the product node
-  // ONLY when they look like the legacy lowercase keys (gender, color, ...).
-  // Live schema labels (uppercase/spaced) are sent exclusively under
-  // product.properties so the /i1/products/ endpoint can't reject them as
-  // unknown top-level fields.
-  const liveLabels = Object.keys((payload.properties as Record<string, unknown> | undefined) || {}).some(
-    (k) => /[A-Z\s]/.test(k),
-  );
-  for (const [k, v] of Object.entries(payload)) {
-    if (productKeys.has(k)) continue;
-    if (k === "price" || k === "msrp") continue;
-    if (liveLabels && /[A-Z\s]/.test(k)) continue;
-    product[k] = v;
+  for (const k of productKeys) {
+    if (k in payload) product[k] = payload[k];
   }
   const stock: Record<string, unknown> = {
     quantity: variant?.quantity ?? 0,
