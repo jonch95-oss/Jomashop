@@ -531,12 +531,465 @@ function normalizeGender(raw: string): string {
 }
 
 /**
+ * Canonical property bag we extract from a Shopify product before mapping
+ * to a Jomashop category schema. Schema-driven mapping in
+ * `buildSchemaProperties` reads these by name and writes them out under the
+ * exact schema field labels — so a fixture that supplies `gender` here ends
+ * up under the live Apparel "Gender" property, the Footwear "gender" key,
+ * or whatever label the live schema uses.
+ *
+ * Every value is a trimmed string when present, or undefined when missing.
+ */
+export type CanonicalProductFields = {
+  brand?: string;
+  model?: string;
+  name?: string;
+  article?: string;
+  gender?: string;
+  age?: string;
+  size?: string;
+  size_system?: string;
+  size_type?: string;
+  color?: string;
+  material?: string;
+  composition?: string;
+  category_type?: string;
+  apparel_type?: string;
+  style?: string;
+  country_of_origin?: string;
+  description?: string;
+  pieces?: string;
+  hardware?: string;
+  dimensions?: string;
+  interior_material?: string;
+  raw_category_code?: string;
+};
+
+/**
+ * A normalized view of a single live Jomashop schema property. Different
+ * portal builds put the human-readable label under different keys
+ * (`label`, `name`, `title`, `field`). This shape captures all of them in
+ * one place so the downstream label-matcher doesn't have to peer into the
+ * raw payload again.
+ */
+export type SchemaPropertyDescriptor = {
+  /** Outgoing key sent to Jomashop. Exact label-cased when live, lowercase
+   *  for the fallback bundled schemas. */
+  field: string;
+  /** Human-readable label shown in the portal UI, if distinct from the
+   *  outgoing field key. */
+  label?: string;
+  required: boolean;
+  type?: string;
+  options?: string[];
+};
+
+/** Collapse a label/field to a single comparable token. */
+function labelToken(s: string | null | undefined): string {
+  if (!s) return "";
+  return String(s).toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+/**
+ * Extract canonical product fields from a Shopify product. Reads metafields
+ * (namespaced or definition-name), product options, vendor, and tags. The
+ * resulting bag is fed to `buildSchemaProperties` which writes the values
+ * out under the exact Jomashop schema labels.
+ */
+export function buildCanonicalProductFields(p: ShopifyProduct): CanonicalProductFields {
+  const sizeOpt = resolveOption(p, ["size"]);
+  const colorOpt = resolveOption(p, ["color", "colour"]);
+  const firstVariant = p.variants?.[0];
+  const tagList = (Array.isArray(p.tags) ? p.tags : (p.tags || "").split(","))
+    .map((t) => t.trim())
+    .filter(Boolean);
+
+  const brand =
+    readMetafieldAny(p, ["Designer Id", "designer_id", "ff_designer", "brand", "Brand"]) ||
+    p.vendor ||
+    undefined;
+
+  const color =
+    readMetafieldAny(p, [
+      "Color",
+      "color",
+      "Colour",
+      "colour",
+      "primary_color",
+      "Primary Color",
+      "ff_color",
+      "FF Color",
+      "custom.color",
+      "luxe.color",
+      "ff.color",
+      "global.color",
+      "custom.colour",
+      "luxe.colour",
+      "custom.primary_color",
+      "luxe.primary_color",
+      "custom.ff_color",
+      "luxe.ff_color",
+    ]) ||
+    (colorOpt && firstVariant ? ((firstVariant[colorOpt] as string | null) || undefined) : undefined);
+
+  const size =
+    readMetafieldAny(p, ["Size", "size", "custom.size", "luxe.size"]) ||
+    (sizeOpt && firstVariant ? ((firstVariant[sizeOpt] as string | null) || undefined) : undefined);
+
+  const rawSizeSystem = readMetafieldAny(p, [
+    "size_system",
+    "Size Scale",
+    "size_scale",
+    "custom.size_scale",
+    "luxe.size_scale",
+    "Size System",
+    "size type",
+    "Size Type",
+    "Apparel Size Type",
+  ]);
+  const size_system = rawSizeSystem ? normalizeSizeSystem(rawSizeSystem) : undefined;
+
+  const rawGender =
+    readMetafieldAny(p, ["Gender", "gender", "custom.gender", "luxe.gender"]) ||
+    tagList.find((t) => /^(Men|Mens|Women|Womens|Unisex|Kids|Kid|Boy|Boys|Girl|Girls|Child|Children|Baby|Infant|Toddler)s?$/i.test(t));
+  const gender = rawGender ? normalizeGender(rawGender) : undefined;
+
+  // Age inference: explicit metafield, otherwise derive Kids/Adult from gender.
+  let age =
+    readMetafieldAny(p, ["Age", "age", "Age Group", "age_group", "custom.age", "luxe.age"]) || undefined;
+  if (!age) {
+    if (gender === "Kids" || /\b(kid|kids|child|children|baby|infant|toddler|boy|boys|girl|girls)\b/i.test((p.title || "") + " " + tagList.join(" "))) {
+      age = "Kids";
+    } else if (gender === "Men" || gender === "Women" || gender === "Unisex") {
+      age = "Adult";
+    }
+  }
+
+  const material = readMetafieldAny(p, [
+    "material",
+    "Material",
+    "composition",
+    "Composition",
+    "custom.composition",
+    "luxe.composition",
+    "custom.material",
+    "luxe.material",
+  ]);
+
+  const country_of_origin = readMetafieldAny(p, [
+    "ff_country_of_origin",
+    "country_of_origin",
+    "Country of Origin",
+    "Country",
+    "custom.ff_country_of_origin",
+    "luxe.ff_country_of_origin",
+    "custom.country_of_origin",
+    "luxe.country_of_origin",
+  ]);
+
+  const style =
+    readMetafieldAny(p, ["style", "Style", "custom.style", "luxe.style"]) || undefined;
+
+  const rawCategoryCode =
+    readMetafieldAny(p, ["category", "Category", "ff_category"]) || p.product_type || undefined;
+
+  const category_type =
+    readMetafieldAny(p, ["category_type", "Category Type", "custom.category_type", "luxe.category_type"]) ||
+    rawCategoryCode ||
+    undefined;
+
+  // Apparel-specific type label (e.g. "Outerwear", "Pants"). Falls back to
+  // category_type / product_type / a code lookup so live "Apparel Type" /
+  // "Type" schema properties resolve for OUTW, PANT, DRSH, etc.
+  const apparel_type =
+    readMetafieldAny(p, ["Apparel Type", "apparel_type", "Type", "type"]) ||
+    APPAREL_TYPE_BY_CODE[normalizeCategoryCode(rawCategoryCode || "")] ||
+    category_type ||
+    undefined;
+
+  const description = (p.body_html || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim() || undefined;
+
+  const pieces =
+    readMetafieldAny(p, ["Pieces", "pieces", "Total Number of Pieces", "total_pieces", "piece_count"]) ||
+    "1";
+
+  const article =
+    readMetafieldAny(p, ["Article", "article", "model", "Model"]) || p.title || undefined;
+
+  const hardware = readMetafieldAny(p, ["hardware", "Hardware"]);
+  const dimensions = readMetafieldAny(p, ["dimensions", "Dimensions"]);
+  const interior_material = readMetafieldAny(p, ["interior_material", "Interior Material"]);
+
+  return {
+    brand: brand || undefined,
+    model: p.title || undefined,
+    name: p.title || undefined,
+    article: article || undefined,
+    gender,
+    age,
+    size: size || undefined,
+    size_system,
+    size_type: size_system,
+    color: color || undefined,
+    material: material || undefined,
+    composition: material || undefined,
+    category_type,
+    apparel_type,
+    style,
+    country_of_origin: country_of_origin || undefined,
+    description,
+    pieces,
+    hardware: hardware || undefined,
+    dimensions: dimensions || undefined,
+    interior_material: interior_material || undefined,
+    raw_category_code: rawCategoryCode || undefined,
+  };
+}
+
+/**
+ * Mapping from Shopify product-type codes (DRSH, OUTW, PANT, ...) to the
+ * value Jomashop expects under live "Apparel Type" / "Type" properties.
+ * Independent from the BUILT_IN_CATEGORY_OVERRIDES table (which maps to the
+ * Jomashop top-level category like "Apparel" / "Footwear") — this drives
+ * the live per-category property value.
+ */
+const APPAREL_TYPE_BY_CODE: Record<string, string> = {
+  outw: "Outerwear",
+  scoat: "Outerwear",
+  coat: "Outerwear",
+  blzr: "Outerwear",
+  jack: "Jackets",
+  vest: "Vests",
+  pant: "Pants",
+  trou: "Pants",
+  jean: "Jeans",
+  swpa: "Sweatpants",
+  jogg: "Joggers",
+  shor: "Shorts",
+  shrt: "Shirts",
+  shir: "Shirts",
+  drsh: "Dress Shirts",
+  polo: "Polo Shirts",
+  tshr: "T-Shirts",
+  tank: "Tank Tops",
+  tops: "Tops",
+  blou: "Blouses",
+  swtr: "Sweaters",
+  hood: "Hoodies",
+  crew: "Sweatshirts",
+  swsh: "Sweatshirts",
+  pull: "Pullovers",
+  dres: "Dresses",
+  skrt: "Skirts",
+  suit: "Suits",
+  tuxe: "Tuxedos",
+  swim: "Swimwear",
+  legg: "Leggings",
+  sock: "Socks",
+  undw: "Underwear",
+  paja: "Pajamas",
+  robe: "Robes",
+  body: "Bodysuits",
+  jump: "Jumpsuits",
+  actv: "Activewear",
+  bras: "Bras",
+  cape: "Capes",
+  scrf: "Scarves",
+  beanie: "Hats",
+  hat1: "Hats",
+  cbund: "Cummerbunds",
+  heac: "Headwear",
+  mask: "Masks",
+};
+
+/**
+ * Flexible label-matcher: pick the best canonical field for a given
+ * Jomashop schema property descriptor. Inspects the field name AND label,
+ * collapsed to alphanumeric tokens, then matches against a series of
+ * keyword tests ordered most-specific first.
+ *
+ * Returns the canonical field name (key into CanonicalProductFields) or
+ * null if nothing matches.
+ */
+function pickCanonicalField(prop: SchemaPropertyDescriptor): keyof CanonicalProductFields | null {
+  const tokens = [labelToken(prop.field), labelToken(prop.label)].filter((s) => s.length > 0);
+  if (tokens.length === 0) return null;
+  const has = (sub: string) => tokens.some((t) => t.includes(sub));
+  // Most-specific first so "Apparel Size Type" doesn't fall through to "size".
+  if (has("apparelsizetype") || has("sizetype") || has("sizesystem") || has("sizescale")) return "size_system";
+  if (has("apparelsize") || has("size")) return "size";
+  if (has("countryoforigin") || has("origin") || has("madein") || has("country")) return "country_of_origin";
+  if (has("detaileddescription") || has("description") || has("details")) return "description";
+  if (has("totalnumberofpieces") || has("pieces") || has("piececount")) return "pieces";
+  if (has("article")) return "article";
+  if (has("apparelttype") || has("appareltype")) return "apparel_type";
+  if (has("categorytype")) return "category_type";
+  if (has("type") && !has("sizetype")) return "apparel_type";
+  if (has("agegroup") || has("age")) return "age";
+  if (has("gender") || has("sex")) return "gender";
+  if (has("color") || has("colour")) return "color";
+  if (has("composition")) return "composition";
+  if (has("material") || has("fabric")) return "material";
+  if (has("interiormaterial")) return "interior_material";
+  if (has("hardware")) return "hardware";
+  if (has("dimensions") || has("measurements")) return "dimensions";
+  if (has("style")) return "style";
+  if (has("brand") || has("manufacturer") || has("designer")) return "brand";
+  if (has("model") || has("name")) return "model";
+  return null;
+}
+
+/**
+ * If a schema property has an enum/options list, pick the option whose
+ * normalized form matches the canonical value. Returns the canonical option
+ * spelling (so the payload uses the exact case Jomashop expects), or
+ * undefined when no match is found.
+ */
+function matchSchemaOption(value: string, options: string[] | undefined): string | undefined {
+  if (!options || options.length === 0) return value;
+  const v = labelToken(value);
+  if (!v) return undefined;
+  for (const opt of options) {
+    if (labelToken(opt) === v) return opt;
+  }
+  // Substring fallback: option contains the value, or vice versa.
+  for (const opt of options) {
+    const o = labelToken(opt);
+    if (o.includes(v) || v.includes(o)) return opt;
+  }
+  return undefined;
+}
+
+/**
+ * Normalize the raw /i1/categories/:id response into a uniform list of
+ * schema property descriptors. The portal returns one of many shapes
+ * depending on tenant config — some flavours nest the property list under
+ * `properties`, `attributes`, `fields`, or `category.properties`; each
+ * entry may name its label `name`, `label`, `title`, or `field`. We collect
+ * all of them so the schema-driven mapper has a single source of truth.
+ *
+ * Returns an empty array when no recognizable property list is present
+ * (which signals the caller to fall back to the bundled schema).
+ */
+export function normalizeI1CategorySchema(raw: unknown): SchemaPropertyDescriptor[] {
+  if (!raw || typeof raw !== "object") return [];
+  const root = raw as Record<string, unknown>;
+  const candidates: unknown[] = [
+    root.properties,
+    root.attributes,
+    root.fields,
+    (root.category as { properties?: unknown })?.properties,
+    (root.category as { attributes?: unknown })?.attributes,
+    (root.data as { properties?: unknown })?.properties,
+    (root.data as { attributes?: unknown })?.attributes,
+  ];
+  let list: unknown[] = [];
+  for (const c of candidates) {
+    if (Array.isArray(c) && c.length > 0) {
+      list = c;
+      break;
+    }
+  }
+  if (list.length === 0) return [];
+  const out: SchemaPropertyDescriptor[] = [];
+  for (const item of list) {
+    if (!item || typeof item !== "object") continue;
+    const it = item as Record<string, unknown>;
+    const label =
+      (typeof it.label === "string" && it.label) ||
+      (typeof it.name === "string" && it.name) ||
+      (typeof it.title === "string" && it.title) ||
+      (typeof it.field === "string" && it.field) ||
+      (typeof it.key === "string" && it.key) ||
+      "";
+    const field =
+      (typeof it.field === "string" && it.field) ||
+      (typeof it.key === "string" && it.key) ||
+      (typeof it.label === "string" && it.label) ||
+      (typeof it.name === "string" && it.name) ||
+      "";
+    if (!field || typeof field !== "string" || !field.trim()) continue;
+    const required = Boolean(it.required || it.is_required || it.mandatory);
+    const type = typeof it.type === "string" ? it.type : undefined;
+    const options: string[] = [];
+    const optsRaw = it.options ?? it.values ?? it.enum;
+    if (Array.isArray(optsRaw)) {
+      for (const o of optsRaw) {
+        if (typeof o === "string" && o.trim()) options.push(o);
+        else if (o && typeof o === "object") {
+          const v = (o as Record<string, unknown>).value ?? (o as Record<string, unknown>).label ?? (o as Record<string, unknown>).name;
+          if (typeof v === "string" && v.trim()) options.push(v);
+        }
+      }
+    }
+    out.push({
+      field,
+      label: typeof label === "string" ? label : undefined,
+      required,
+      type,
+      options: options.length > 0 ? options : undefined,
+    });
+  }
+  return out;
+}
+
+/**
+ * Build the outgoing `properties` object from a live Jomashop schema and a
+ * canonical product field bag. Output keys are the exact schema field
+ * labels — never generic lowercase names — so a live Apparel schema with
+ * "Gender" / "Apparel Type" / "Detailed Description" properties produces
+ * exactly those keys, not the legacy `gender` / `category_type` keys.
+ *
+ * Returns the populated properties plus the exact labels of required
+ * schema properties that could not be filled, so readiness/UI surfaces the
+ * exact missing field names.
+ */
+export function buildSchemaProperties(
+  schema: SchemaPropertyDescriptor[],
+  canonical: CanonicalProductFields,
+): {
+  properties: Record<string, string | number | boolean | null>;
+  missingRequired: string[];
+  schemaLabels: string[];
+} {
+  const properties: Record<string, string | number | boolean | null> = {};
+  const missingRequired: string[] = [];
+  const schemaLabels: string[] = [];
+
+  for (const prop of schema) {
+    if (!prop || typeof prop.field !== "string" || prop.field.trim() === "" || prop.field === "undefined") {
+      continue;
+    }
+    const outKey = prop.field;
+    schemaLabels.push(outKey);
+    const canonicalKey = pickCanonicalField(prop);
+    let value: string | undefined = canonicalKey ? (canonical[canonicalKey] as string | undefined) : undefined;
+    if (typeof value === "string") value = value.trim() || undefined;
+
+    // Normalize against schema options if present. If the canonical value
+    // doesn't match any option, drop it — sending an invalid enum value is
+    // worse than sending nothing (Jomashop rejects the whole payload).
+    if (value && prop.options && prop.options.length > 0) {
+      value = matchSchemaOption(value, prop.options);
+    }
+
+    if (!value) {
+      properties[outKey] = null;
+      if (prop.required) missingRequired.push(outKey);
+    } else {
+      properties[outKey] = value;
+    }
+  }
+  return { properties, missingRequired, schemaLabels };
+}
+
+/**
  * Map a Shopify product to a Jomashop product payload.
  * `properties` schema is either fetched live or falls back to FALLBACK_CATEGORY_SCHEMAS.
  */
 export function mapShopifyToJomashop(
   product: ShopifyProduct,
-  schemaProperties: Array<{ field: string; required: boolean; type?: string; options?: string[] }>,
+  schemaProperties: Array<{ field: string; required: boolean; type?: string; options?: string[]; label?: string }>,
   forcedCategory?: SupportedCategory,
 ): MappedProduct {
   const category = forcedCategory || inferCategory(product) || "Clothing";
@@ -581,12 +1034,39 @@ export function mapShopifyToJomashop(
     ]) ||
     (resolvedSku ? resolvedSku : null);
 
-  // Build a properties object using the category schema. For each schema
-  // property we look first at metafields (namespaced), then at common Shopify
-  // fields, then leave it null and emit a warning if required.
+  // Build a properties object using the category schema. Two paths:
+  //   1. Live/portal schemas → schema-driven mapping (exact labels only).
+  //      Uses the canonical product field bag + flexible label matching so
+  //      e.g. live "Apparel Type" + "Detailed Description" properties get
+  //      populated from the same canonical fields as the lowercase
+  //      "category_type" + "description" of the bundled fallback schema.
+  //   2. Bundled fallback schemas (FALLBACK_CATEGORY_SCHEMAS) → legacy
+  //      lowercase-field mapping (preserved exactly).
+  // Schema-driven path is taken when ANY schema field label contains an
+  // uppercase letter or a space — a marker that the live API responded
+  // with portal-shaped labels rather than the lowercase bundled ones.
+  const usesLiveSchemaLabels = schemaProperties.some(
+    (s) => s && typeof s.field === "string" && (/[A-Z\s]/.test(s.field) || (s.label && /[A-Z\s]/.test(s.label))),
+  );
   const properties: Record<string, string | number | boolean | null> = {};
   const missingRequiredProps: string[] = [];
-  for (const prop of schemaProperties) {
+
+  if (usesLiveSchemaLabels) {
+    const canonical = buildCanonicalProductFields(product);
+    const built = buildSchemaProperties(
+      schemaProperties as SchemaPropertyDescriptor[],
+      canonical,
+    );
+    for (const [k, v] of Object.entries(built.properties)) {
+      properties[k] = v;
+    }
+    for (const label of built.missingRequired) {
+      missingRequiredProps.push(label);
+      warnings.push(
+        `Missing required ${category} field "${label}" — add via metafield, product option, or vendor field.`,
+      );
+    }
+  } else for (const prop of schemaProperties) {
     // Defensive: schema entries with an empty/undefined field name are
     // surfaced as "Needs category verification" rather than emitted as a
     // property keyed "undefined".
@@ -773,7 +1253,27 @@ export function mapShopifyToJomashop(
     product.product_type ||
     null;
 
-  const brand = (properties.brand as string | null) || product.vendor || "";
+  // Locate the brand for top-level use. When the schema labels are live
+  // (e.g. "Brand", "Manufacturer"), properties.brand won't exist — search
+  // for any property whose label normalizes to brand/manufacturer/designer.
+  function findBrandInProperties(): string | null {
+    if (typeof properties.brand === "string" && properties.brand.trim() !== "") {
+      return properties.brand as string;
+    }
+    for (const [k, v] of Object.entries(properties)) {
+      if (typeof v !== "string" || v.trim() === "") continue;
+      const tok = labelToken(k);
+      if (tok.includes("brand") || tok.includes("manufacturer") || tok.includes("designer")) {
+        return v;
+      }
+    }
+    return null;
+  }
+  const canonicalBrandFallback = usesLiveSchemaLabels
+    ? buildCanonicalProductFields(product).brand
+    : undefined;
+  const brand =
+    findBrandInProperties() || canonicalBrandFallback || product.vendor || "";
 
   const missingTopLevelFields: string[] = [];
   if (!category) missingTopLevelFields.push("category");
@@ -880,7 +1380,13 @@ export function buildJomashopProductPayload(
   for (const [k, v] of Object.entries(mapped.properties)) {
     if (v !== null && v !== undefined && v !== "") properties[k] = v;
   }
-  if (variant) {
+  // Schema labels with uppercase letters or spaces indicate live Jomashop
+  // labels (e.g. "Apparel Type", "Detailed Description"). In that mode we
+  // do NOT inject generic lowercase size/color from variant options into
+  // `properties` because the live schema may explicitly forbid them — the
+  // canonical fields are already mapped to the exact live labels.
+  const propertiesUseLiveLabels = Object.keys(properties).some((k) => /[A-Z\s]/.test(k));
+  if (variant && !propertiesUseLiveLabels) {
     for (const [k, v] of Object.entries(variant.options)) {
       const key = k.toLowerCase();
       if (key === "size" || key === "color" || key === "colour") {
@@ -920,8 +1426,15 @@ export function buildJomashopProductPayload(
     msrp,
     images: mapped.images,
     properties,
-    ...properties,
   };
+  // For the legacy bundled-schema path (lowercase fields), also surface
+  // schema fields as top-level so /v1/products can pick them up. When the
+  // schema is live (uppercase/spaced labels) we omit this — Jomashop's new
+  // /i1/products/ endpoint reads exclusively from `properties` and rejects
+  // generic lowercase top-level fields it doesn't recognize.
+  if (!propertiesUseLiveLabels) {
+    for (const [k, v] of Object.entries(properties)) payload[k] = v;
+  }
   // Apply top-level overrides AFTER the property spread so that
   // properties.brand / properties.category (populated from the live
   // category schema) never clobber the operator-supplied outbound values.
@@ -979,12 +1492,18 @@ export function buildI1ProductEnvelope(
   for (const k of Object.keys(payload)) {
     if (productKeys.has(k)) product[k] = payload[k];
   }
-  // Carry the unknown / schema-driven property fields onto the product node
-  // as well so the API can pick them up either via product.properties or
-  // top-level (depending on which shape it accepts).
+  // Carry unknown / schema-driven property fields onto the product node
+  // ONLY when they look like the legacy lowercase keys (gender, color, ...).
+  // Live schema labels (uppercase/spaced) are sent exclusively under
+  // product.properties so the /i1/products/ endpoint can't reject them as
+  // unknown top-level fields.
+  const liveLabels = Object.keys((payload.properties as Record<string, unknown> | undefined) || {}).some(
+    (k) => /[A-Z\s]/.test(k),
+  );
   for (const [k, v] of Object.entries(payload)) {
     if (productKeys.has(k)) continue;
     if (k === "price" || k === "msrp") continue;
+    if (liveLabels && /[A-Z\s]/.test(k)) continue;
     product[k] = v;
   }
   const stock: Record<string, unknown> = {

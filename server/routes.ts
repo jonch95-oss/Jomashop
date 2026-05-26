@@ -29,9 +29,11 @@ import {
   buildI1ProductEnvelope,
   isSampleProduct,
   normalizeCategoryCode,
+  normalizeI1CategorySchema,
   SAMPLE_SHOPIFY_PRODUCTS,
   type PushOverrides,
   type ShopifyProduct,
+  type SchemaPropertyDescriptor,
 } from "./mapping";
 import {
   encryptToken,
@@ -655,6 +657,27 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       : [];
     const i1Available = i1CategoryByKey.size > 0 || i1ManufacturerByKey.size > 0;
 
+    // Cache of live /i1/categories/:id property schemas keyed by category id.
+    // Filled on demand from inside the per-product loop below so we only
+    // fetch each schema once per preview build.
+    const i1SchemaCache = new Map<string, SchemaPropertyDescriptor[] | null>();
+    async function loadI1Schema(categoryId: number | string): Promise<SchemaPropertyDescriptor[] | null> {
+      const key = String(categoryId);
+      if (i1SchemaCache.has(key)) return i1SchemaCache.get(key) ?? null;
+      try {
+        const resp = await getCategoryPropertiesI1(categoryId);
+        if (resp.ok && resp.data) {
+          const norm = normalizeI1CategorySchema(resp.data);
+          i1SchemaCache.set(key, norm.length > 0 ? norm : null);
+          return norm.length > 0 ? norm : null;
+        }
+      } catch {
+        // network issue — silently fall back
+      }
+      i1SchemaCache.set(key, null);
+      return null;
+    }
+
     // Push-status index by Shopify SKU so we can attach pushed/rejected/etc
     // metadata to each mapped product.
     const pushIndex = new Map<
@@ -690,7 +713,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       });
     }
 
-    const mapped = products.map((p) => {
+    const mapped = await Promise.all(products.map(async (p) => {
       const tmp = mapShopifyToJomashop(p, []);
       // Apply operator-supplied category override (XLSX-driven). When set, the
       // override pins the SupportedCategory used for schema resolution AND the
@@ -699,10 +722,35 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       // ready without a full Shopify re-pagination.
       const override = lookupCategoryOverride(tmp.raw_category);
       const cat = (override?.supportedCategory ?? tmp.category) as SupportedCategory;
-      const schemaWrap = schemas[cat];
-      const props =
-        (schemaWrap?.schema?.properties as Array<any>) ||
-        FALLBACK_CATEGORY_SCHEMAS[cat].map((f) => ({ field: f.field, required: f.required, type: f.type, options: f.options }));
+      // Determine the outbound category name early so we can resolve to a
+      // live /i1 category id and fetch the EXACT schema. We try the
+      // override → suggested → mapped category in that order.
+      const outboundCategoryName =
+        override?.jomashopCategory || tmp.suggested_category || tmp.category || "";
+      const outboundCategoryKey = String(outboundCategoryName)
+        .toLowerCase()
+        .trim()
+        .replace(/[^a-z0-9]+/g, "");
+      const resolvedI1Cat = outboundCategoryKey
+        ? i1CategoryByKey.get(outboundCategoryKey) ?? null
+        : null;
+      let props: Array<any>;
+      if (resolvedI1Cat) {
+        const liveSchema = await loadI1Schema(resolvedI1Cat.id);
+        if (liveSchema && liveSchema.length > 0) {
+          props = liveSchema;
+        } else {
+          const schemaWrap = schemas[cat];
+          props =
+            (schemaWrap?.schema?.properties as Array<any>) ||
+            FALLBACK_CATEGORY_SCHEMAS[cat].map((f) => ({ field: f.field, required: f.required, type: f.type, options: f.options }));
+        }
+      } else {
+        const schemaWrap = schemas[cat];
+        props =
+          (schemaWrap?.schema?.properties as Array<any>) ||
+          FALLBACK_CATEGORY_SCHEMAS[cat].map((f) => ({ field: f.field, required: f.required, type: f.type, options: f.options }));
+      }
       const m = mapShopifyToJomashop(p, props, override?.supportedCategory ?? undefined);
       if (override) {
         m.suggested_category = override.jomashopCategory;
@@ -881,7 +929,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         },
         readiness,
       };
-    });
+    }));
 
     const usingSamples = dataSource === "sample";
     return {
@@ -1233,7 +1281,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         options: f.options,
       }));
 
-    const mapped = mapShopifyToJomashop(body.product, props, body.forcedCategory);
+    let mapped = mapShopifyToJomashop(body.product, props, body.forcedCategory);
     const overrides: PushOverrides = { ...(body.overrides || {}) };
     // Brand override precedence at push time:
     //   1. Explicit operator-supplied overrides.brand on this push call.
@@ -1288,6 +1336,26 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           overrides.category_id = categoryResolution.exact.id;
         }
         overrides.category = categoryResolution.exact.name;
+      }
+    }
+
+    // Schema-driven property mapping: once we know the resolved Jomashop
+    // category id, fetch its live property list and re-map the Shopify
+    // product against EXACT live labels. Falls back silently to the bundled
+    // schema when /i1/categories/:id is unavailable.
+    let liveSchemaSource: "live-i1" | "live-v1" | "fallback" = source === "live" ? "live-v1" : "fallback";
+    if (overrides.category_id !== undefined && overrides.category_id !== null) {
+      try {
+        const i1SchemaResp = await getCategoryPropertiesI1(overrides.category_id);
+        if (i1SchemaResp.ok && i1SchemaResp.data) {
+          const liveSchema = normalizeI1CategorySchema(i1SchemaResp.data);
+          if (liveSchema.length > 0) {
+            mapped = mapShopifyToJomashop(body.product, liveSchema, body.forcedCategory);
+            liveSchemaSource = "live-i1";
+          }
+        }
+      } catch {
+        // network issue — keep bundled schema mapping
       }
     }
 
@@ -1413,7 +1481,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         categoryResolution,
         payloadPreview: payload,
         mapped,
-        schemaSource: source,
+        schemaSource: liveSchemaSource,
       });
     }
 
@@ -1428,7 +1496,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         jobId: job.id,
         level: "error",
         message: `Push aborted before API call: missing fields for ${payload.sku ?? mapped.vendor_sku}`,
-        detailsJson: JSON.stringify({ missingRequired, missingTopLevel, schemaSource: source }),
+        detailsJson: JSON.stringify({ missingRequired, missingTopLevel, schemaSource: liveSchemaSource }),
         createdAt: Date.now(),
       });
       return res.status(422).json({
@@ -1439,7 +1507,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         warnings: mapped.warnings,
         payloadPreview: payload,
         mapped,
-        schemaSource: source,
+        schemaSource: liveSchemaSource,
       });
     }
 
@@ -1448,7 +1516,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       level: "info",
       message: `POST /i1/products/ for ${mapped.vendor_sku} (${mapped.category})`,
       detailsJson: JSON.stringify({
-        schemaSource: source,
+        schemaSource: liveSchemaSource,
         vendorSku: payload.vendor_sku,
         manufacturerId: payload.manufacturer_id,
         categoryId: payload.category_id,
@@ -1566,7 +1634,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         brandResolution: manufacturerResolution,
         categoryResolution,
         mapped,
-        schemaSource: source,
+        schemaSource: liveSchemaSource,
       });
     }
 
@@ -1660,7 +1728,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     return res.json({
       ok: true,
       jobId: job.id,
-      schemaSource: source,
+      schemaSource: liveSchemaSource,
       mapped,
       payloadPreview: payload,
       envelopePreview: envelope,

@@ -15,7 +15,7 @@ const ADMIN_API_VERSION = "2024-10";
 // Bump this whenever the normalization / mapping logic changes in a way that
 // invalidates cached preview payloads (e.g. a new metafield extraction rule).
 // Cached previews carrying a different mapperVersion are ignored on read.
-export const MAPPER_VERSION = 4;
+export const MAPPER_VERSION = 5;
 
 // We pass all metafields through the mapper rather than restricting to a
 // namespace+key allowlist. Shopify shops use a wide range of namespaces
