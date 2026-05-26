@@ -44,6 +44,12 @@ import {
 import { registerBulkRepairRoutes } from "./bulk_repair";
 import { registerCategoryMappingRoutes, lookupCategoryOverride } from "./category_mapping";
 import { registerBrandMappingRoutes, lookupBrandOverride, normalizeBrandKey } from "./brand_mapping";
+import {
+  registerEnumMappingRoutes,
+  lookupEnumOverride,
+  normalizeEnumSourceValue,
+  BUILT_IN_ENUM_OVERRIDES,
+} from "./enum_mapping";
 import { registerResolutionAuditRoutes } from "./resolution_audit";
 import { registerWebhookRoutes, registerShopifyWebhooks } from "./webhooks";
 import { logMemory } from "./memlog";
@@ -127,6 +133,7 @@ type CompactMappedProduct = {
   warnings: string[];
   missing_required: string[];
   missing_top_level: string[];
+  unverified_required_options: Array<{ field: string; value?: string }>;
   source: { shopify_product_id?: string | number; shopify_variant_ids: Array<string | number> };
   // Push state (preserved as-is from the original payload).
   push_state: string;
@@ -229,6 +236,14 @@ function compactifyMapped(m: any): CompactMappedProduct {
     warnings: Array.isArray(m.warnings) ? m.warnings.slice(0, 8) : [],
     missing_required: Array.isArray(m.missing_required) ? m.missing_required : [],
     missing_top_level: Array.isArray(m.missing_top_level) ? m.missing_top_level : [],
+    unverified_required_options: Array.isArray(m.unverified_required_options)
+      ? m.unverified_required_options
+          .filter((u: any) => u && typeof u.field === "string" && u.field)
+          .map((u: any) => ({
+            field: String(u.field),
+            value: u.value !== undefined && u.value !== null ? String(u.value) : undefined,
+          }))
+      : [],
     source: {
       shopify_product_id: m.source?.shopify_product_id,
       shopify_variant_ids: Array.isArray(m.source?.shopify_variant_ids)
@@ -1146,7 +1161,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         props = bundledPropsForCat;
         schemaSource = "fallback";
       }
-      const m = mapShopifyToJomashop(p, props, override?.supportedCategory ?? undefined);
+      const m = mapShopifyToJomashop(p, props, override?.supportedCategory ?? undefined, {
+        resolveEnumOverride: (cat, field, sourceValue, acceptedOptions) => {
+          const hit = lookupEnumOverride(cat, field, sourceValue, acceptedOptions);
+          return hit ? hit.jomashopOption : null;
+        },
+      });
       if (override) {
         m.suggested_category = override.jomashopCategory;
         // An operator-supplied override resolves the "ambiguous" flag — they
@@ -1596,7 +1616,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const props =
       ((schema as { properties?: Array<any> } | undefined)?.properties) ??
       FALLBACK_CATEGORY_SCHEMAS[tmp.category];
-    const mapped = mapShopifyToJomashop(found, props);
+    const mapped = mapShopifyToJomashop(found, props, undefined, {
+      resolveEnumOverride: (cat, field, sourceValue, acceptedOptions) => {
+        const hit = lookupEnumOverride(cat, field, sourceValue, acceptedOptions);
+        return hit ? hit.jomashopOption : null;
+      },
+    });
     res.json({
       ok: true,
       shopDomain: conn.shopDomain,
@@ -1852,6 +1877,19 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       });
     }
 
+    // Helper bound to the live storage-backed enum override resolver so the
+    // mapping module stays free of direct DB imports. Verifies the result
+    // against the schema's accepted options when known.
+    const enumResolver = (
+      cat: string,
+      field: string,
+      sourceValue: string,
+      acceptedOptions: string[] | undefined,
+    ): string | null => {
+      const hit = lookupEnumOverride(cat, field, sourceValue, acceptedOptions);
+      return hit ? hit.jomashopOption : null;
+    };
+
     // Resolve live (or fallback) schema for the inferred/forced category.
     const tmpMap = mapShopifyToJomashop(body.product, [], body.forcedCategory);
     const { source, schema } = await resolveCategorySchema(tmpMap.category);
@@ -1868,7 +1906,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         options_unverified: f.options_unverified,
       }));
 
-    let mapped = mapShopifyToJomashop(body.product, props, body.forcedCategory);
+    let mapped = mapShopifyToJomashop(body.product, props, body.forcedCategory, {
+      resolveEnumOverride: enumResolver,
+    });
     const overrides: PushOverrides = { ...(body.overrides || {}) };
     // Brand override precedence at push time:
     //   1. Explicit operator-supplied overrides.brand on this push call.
@@ -1947,7 +1987,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
               (p) => p && typeof p.field === "string" && (/[A-Z]/.test(p.field) || /\s/.test(p.field)),
             );
             if (liveSchemaExact || !bundledIsExact) {
-              mapped = mapShopifyToJomashop(body.product, liveSchema, body.forcedCategory);
+              mapped = mapShopifyToJomashop(body.product, liveSchema, body.forcedCategory, {
+                resolveEnumOverride: enumResolver,
+              });
               liveSchemaSource = "live-i1";
             }
           }
@@ -1973,7 +2015,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         omit_when_unknown_enum: f.omit_when_unknown_enum,
         options_unverified: f.options_unverified,
       }));
-      mapped = mapShopifyToJomashop(body.product, bundledProps, body.forcedCategory);
+      mapped = mapShopifyToJomashop(body.product, bundledProps, body.forcedCategory, {
+        resolveEnumOverride: enumResolver,
+      });
       ({ payload, variant, missingRequired, missingTopLevel, pushDebug } =
         buildJomashopProductPayload(mapped, body.variantSku, overrides));
       liveSchemaSource = "fallback";
@@ -2506,6 +2550,107 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   // ---------- Brand mapping workflow (Shopify brand → exact Jomashop brand) ----------
   registerBrandMappingRoutes(app);
+
+  // ---------- Enum mapping workflow (source value → exact Jomashop option) ----------
+  registerEnumMappingRoutes(app);
+
+  // Debug: walks the cached product preview and aggregates every required
+  // enum field that is currently unresolved (no live option list AND no
+  // operator-supplied mapping). Surfaces the source values the operator
+  // would need to map to unblock the push, grouped per category+field. Used
+  // by the Products page "Fix mapping" panel and by the audit dashboard.
+  app.get("/api/jomashop/required-enum-audit", (_req, res) => {
+    const stores = storage.listStores();
+    const connected = stores.find((s) => s.oauthStatus === "connected");
+    const shopDomain = connected?.shopDomain ?? null;
+    const cache = shopDomain ? storage.getProductCache(shopDomain) : null;
+    if (!cache) {
+      return res.json({
+        ok: true,
+        shopDomain,
+        totalProducts: 0,
+        unresolvedFields: [],
+        note:
+          "No cached product preview. Open the Products page (or POST /api/products/refresh) to populate the cache.",
+      });
+    }
+    let payload: any = null;
+    try {
+      payload = JSON.parse(cache.payloadJson);
+    } catch {
+      return res.json({
+        ok: false,
+        error: "Cached payload is not valid JSON. Refresh from Shopify to rebuild.",
+      });
+    }
+    const allMapped: any[] = Array.isArray(payload?.mapped) ? payload.mapped : [];
+    type Entry = {
+      jomashop_category: string;
+      jomashop_field: string;
+      source_value: string;
+      normalized_source_value: string;
+      product_count: number;
+      sample_skus: string[];
+      sample_titles: string[];
+      current_override: string | null;
+      current_override_source: "operator" | "built-in" | null;
+      resolved: boolean;
+    };
+    const byKey = new Map<string, Entry>();
+    for (const m of allMapped) {
+      const cat = String(m.category || "").trim();
+      const unverified = Array.isArray(m.unverified_required_options)
+        ? m.unverified_required_options
+        : [];
+      // Each entry includes the schema field + the canonical source value we
+      // tried to send (raw_category fallback). Group by (cat, field, value).
+      for (const u of unverified) {
+        const field = String((u as any)?.field || "").trim();
+        const sourceValue =
+          (u as any)?.value !== undefined && (u as any)?.value !== null
+            ? String((u as any).value)
+            : String(m.raw_category || "");
+        if (!cat || !field) continue;
+        const normValue = normalizeEnumSourceValue(sourceValue);
+        const key = `${cat.toLowerCase()}|${field.toLowerCase()}|${normValue}`;
+        const existing = byKey.get(key);
+        if (existing) {
+          existing.product_count += 1;
+          if (existing.sample_skus.length < 5 && m.vendor_sku) {
+            existing.sample_skus.push(String(m.vendor_sku));
+          }
+          if (existing.sample_titles.length < 5 && m.name) {
+            existing.sample_titles.push(String(m.name));
+          }
+        } else {
+          const override = lookupEnumOverride(cat, field, sourceValue);
+          byKey.set(key, {
+            jomashop_category: cat,
+            jomashop_field: field,
+            source_value: sourceValue || "(empty)",
+            normalized_source_value: normValue,
+            product_count: 1,
+            sample_skus: m.vendor_sku ? [String(m.vendor_sku)] : [],
+            sample_titles: m.name ? [String(m.name)] : [],
+            current_override: override?.jomashopOption ?? null,
+            current_override_source: override?.source ?? null,
+            resolved: Boolean(override),
+          });
+        }
+      }
+    }
+    const entries = Array.from(byKey.values()).sort(
+      (a, b) => b.product_count - a.product_count,
+    );
+    res.json({
+      ok: true,
+      shopDomain,
+      totalProducts: allMapped.length,
+      unresolvedFields: entries.filter((e) => !e.resolved),
+      resolvedFields: entries.filter((e) => e.resolved),
+      builtInSeedCount: Object.keys(BUILT_IN_ENUM_OVERRIDES).length,
+    });
+  });
 
   // ---------- Brand & category resolution audit (XLSX export / import / apply) ----------
   registerResolutionAuditRoutes(app);

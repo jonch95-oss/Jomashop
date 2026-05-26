@@ -988,9 +988,41 @@ export function normalizeI1CategorySchema(raw: unknown): SchemaPropertyDescripto
  * schema properties that could not be filled, so readiness/UI surfaces the
  * exact missing field names.
  */
+/**
+ * Optional dependency injected into the schema mapper to resolve operator
+ * enum overrides at mapping time. The mapper passes the resolved Jomashop
+ * category, the schema field label, and the canonical source value (the
+ * value the mapper would otherwise have sent), and expects back either an
+ * accepted Jomashop option string or null when no mapping exists. The
+ * second parameter `acceptedOptions` is the live/fallback option list the
+ * resolver should verify against; when omitted the resolver may emit a
+ * value without verifying.
+ *
+ * Kept as a function pointer (rather than a direct import from
+ * server/storage) so this module stays pure and unit-testable without
+ * touching SQLite.
+ */
+export type EnumOverrideResolver = (
+  jomashopCategory: string,
+  jomashopField: string,
+  sourceValue: string,
+  acceptedOptions: string[] | undefined,
+) => string | null;
+
 export function buildSchemaProperties(
   schema: SchemaPropertyDescriptor[],
   canonical: CanonicalProductFields,
+  context?: {
+    /** Jomashop category name for override lookups (e.g. "Apparel"). */
+    category?: string;
+    /** Resolver that returns a Jomashop-accepted option for a source value,
+     *  or null when no override is registered. See EnumOverrideResolver. */
+    resolveEnumOverride?: EnumOverrideResolver;
+    /** Extra canonical source values to try for override lookups beyond the
+     *  one the schema mapper extracted (e.g. raw Shopify product_type code).
+     *  Tried in order; the first hit wins. */
+    extraSourceValues?: Partial<Record<keyof CanonicalProductFields, string[]>>;
+  },
 ): {
   properties: Record<string, string | number | boolean | null>;
   missingRequired: string[];
@@ -1015,6 +1047,50 @@ export function buildSchemaProperties(
   const omittedFields: string[] = [];
   const unverifiedRequiredOptions: Array<{ field: string; value?: string }> = [];
 
+  // Build the prioritized list of source values to feed the enum-override
+  // resolver for a single property. The resolver checks each in order and
+  // takes the first hit so explicit `Article` metafield values still beat
+  // the apparel_type code lookup.
+  function sourceValuesFor(prop: SchemaPropertyDescriptor, canonicalValue: string | undefined): string[] {
+    const out: string[] = [];
+    if (canonicalValue) out.push(canonicalValue);
+    const ck = pickCanonicalField(prop);
+    if (ck) {
+      const extras = context?.extraSourceValues?.[ck];
+      if (Array.isArray(extras)) {
+        for (const e of extras) {
+          if (e && !out.includes(e)) out.push(e);
+        }
+      }
+    }
+    // Always try the raw Shopify category code (e.g. "OUTW") for enum
+    // fields whose canonical value otherwise comes from a sibling field.
+    // The enum override seeds for Apparel/Article are keyed on these codes.
+    const rawCode = canonical.raw_category_code;
+    if (rawCode && !out.includes(rawCode)) out.push(rawCode);
+    // De-dup empties.
+    return out.filter((s) => typeof s === "string" && s.trim().length > 0);
+  }
+
+  function resolveOverrideFor(
+    prop: SchemaPropertyDescriptor,
+    canonicalValue: string | undefined,
+  ): { value: string; source: string } | null {
+    if (!context?.resolveEnumOverride || !context.category) return null;
+    const candidates = sourceValuesFor(prop, canonicalValue);
+    const optionsForCheck = prop.options_unverified ? undefined : prop.options;
+    for (const src of candidates) {
+      const hit = context.resolveEnumOverride(
+        context.category,
+        prop.field,
+        src,
+        optionsForCheck,
+      );
+      if (hit) return { value: hit, source: src };
+    }
+    return null;
+  }
+
   for (const prop of schema) {
     if (!prop || typeof prop.field !== "string" || prop.field.trim() === "" || prop.field === "undefined") {
       continue;
@@ -1028,14 +1104,21 @@ export function buildSchemaProperties(
 
     // options_unverified short-circuit: the bundled `options` list is a
     // best-guess and may not match Jomashop's actual accepted set. We
-    // refuse to emit ANY value for this field — even a value that matches
-    // the guess — to avoid the "X is not included in the list" rejection.
+    // refuse to emit a value derived from the bundled options — but an
+    // operator-supplied (or built-in seed) enum override IS allowed to
+    // resolve the field, because that override represents a confirmed
+    // mapping rather than a guess against the unverified list.
     if (prop.options_unverified) {
+      const override = resolveOverrideFor(prop, value);
+      if (override) {
+        properties[outKey] = override.value;
+        continue;
+      }
       if (prop.required) {
-        // Required field with unverified options → preflight block. The
-        // missingRequired entry triggers the existing pre-flight 422 path;
-        // the unverifiedRequiredOptions detail gives the operator the
-        // exact next step (load the live option list).
+        // Required field with unverified options AND no override → preflight
+        // block. missingRequired triggers the existing 422 path; the
+        // unverifiedRequiredOptions detail gives the operator the exact next
+        // step (load the live option list OR add an enum mapping).
         missingRequired.push(outKey);
         unverifiedRequiredOptions.push({ field: outKey, value: rawValueForReporting });
         properties[outKey] = null;
@@ -1050,14 +1133,29 @@ export function buildSchemaProperties(
     // Normalize against schema options if present. A canonical value that
     // doesn't match any option is dropped here — sending an invalid enum
     // value triggers Jomashop's "X is not included in the list" rejection.
+    // Before dropping, we consult the operator override map: a saved mapping
+    // (Shopify code → accepted Jomashop option) takes precedence.
     let enumCoercionFailed = false;
     if (value && prop.options && prop.options.length > 0) {
       const coerced = matchSchemaOption(value, prop.options);
       if (coerced === undefined || coerced === "") {
-        enumCoercionFailed = true;
-        value = undefined;
+        const override = resolveOverrideFor(prop, value);
+        if (override) {
+          value = override.value;
+        } else {
+          enumCoercionFailed = true;
+          value = undefined;
+        }
       } else {
         value = coerced;
+      }
+    } else if (!value) {
+      // No canonical value at all — try override on the raw_category_code as
+      // a last-resort signal (e.g. OUTW → "Outerwear" for Article when no
+      // Article metafield exists).
+      const override = resolveOverrideFor(prop, undefined);
+      if (override) {
+        value = override.value;
       }
     }
 
@@ -1171,6 +1269,13 @@ export function mapShopifyToJomashop(
   product: ShopifyProduct,
   schemaProperties: Array<{ field: string; required: boolean; type?: string; options?: string[]; label?: string }>,
   forcedCategory?: SupportedCategory,
+  options?: {
+    /** Optional enum override resolver. When supplied the mapper consults
+     *  it for any enum field whose canonical value either fails the option
+     *  list check OR whose options are marked unverified. See
+     *  EnumOverrideResolver for the contract. */
+    resolveEnumOverride?: EnumOverrideResolver;
+  },
 ): MappedProduct {
   const category = forcedCategory || inferCategory(product) || "Clothing";
   const warnings: string[] = [];
@@ -1240,6 +1345,10 @@ export function mapShopifyToJomashop(
     const built = buildSchemaProperties(
       schemaProperties as SchemaPropertyDescriptor[],
       canonical,
+      {
+        category,
+        resolveEnumOverride: options?.resolveEnumOverride,
+      },
     );
     for (const [k, v] of Object.entries(built.properties)) {
       properties[k] = v;

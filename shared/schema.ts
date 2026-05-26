@@ -73,6 +73,25 @@ export const categoryOverrides = sqliteTable("category_overrides", {
   updatedAt: integer("updated_at").notNull(),
 });
 
+// ---------- Enum override (operator-supplied source value → exact Jomashop enum option) ----------
+// Saved per Jomashop category + schema-field (e.g. Apparel + Article). Keyed
+// by the lowercased Jomashop category, the normalized Jomashop field label
+// (lowercased, non-alphanumerics stripped), and a normalized source value
+// (typically the Shopify product_type / category code / metafield value).
+// Used at push time to translate ANY unverified or out-of-list source value
+// into a Jomashop-accepted option for a required enum field, so the push
+// isn't blocked indefinitely. Mirrors brand_overrides / category_overrides
+// but at the schema-property level rather than category-level.
+export const enumOverrides = sqliteTable("enum_overrides", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  jomashopCategory: text("jomashop_category").notNull(),
+  jomashopField: text("jomashop_field").notNull(),
+  sourceValue: text("source_value").notNull(),
+  jomashopOption: text("jomashop_option").notNull(),
+  notes: text("notes"),
+  updatedAt: integer("updated_at").notNull(),
+});
+
 // ---------- Brand override (operator-supplied Shopify brand → exact Jomashop brand) ----------
 // Used at push time to translate Shopify vendor/designer values into the exact
 // brand spelling Jomashop expects. Keyed by the normalized Shopify brand string
@@ -195,6 +214,7 @@ export const insertSkuMappingSchema = createInsertSchema(skuMappings).omit({ id:
 export const insertCategoryMappingSchema = createInsertSchema(categoryMappings).omit({ id: true });
 export const insertCategoryOverrideSchema = createInsertSchema(categoryOverrides).omit({ id: true });
 export const insertBrandOverrideSchema = createInsertSchema(brandOverrides).omit({ id: true });
+export const insertEnumOverrideSchema = createInsertSchema(enumOverrides).omit({ id: true });
 export const insertSyncJobSchema = createInsertSchema(syncJobs).omit({ id: true });
 export const insertSyncLogSchema = createInsertSchema(syncLogs).omit({ id: true });
 export const insertImportedOrderSchema = createInsertSchema(importedOrders).omit({ id: true });
@@ -215,6 +235,8 @@ export type CategoryOverride = typeof categoryOverrides.$inferSelect;
 export type InsertCategoryOverride = z.infer<typeof insertCategoryOverrideSchema>;
 export type BrandOverride = typeof brandOverrides.$inferSelect;
 export type InsertBrandOverride = z.infer<typeof insertBrandOverrideSchema>;
+export type EnumOverride = typeof enumOverrides.$inferSelect;
+export type InsertEnumOverride = z.infer<typeof insertEnumOverrideSchema>;
 export type SyncJob = typeof syncJobs.$inferSelect;
 export type InsertSyncJob = z.infer<typeof insertSyncJobSchema>;
 export type SyncLog = typeof syncLogs.$inferSelect;
@@ -431,13 +453,17 @@ export const FALLBACK_CATEGORY_SCHEMAS: Record<SupportedCategory, FallbackProper
     { field: "Detailed Description", type: "string", required: true },
     { field: "Total Number of Pieces", type: "string", required: true, example: "1" },
     { field: "Color", type: "string", required: true },
+    // Article is required on the live Jomashop Apparel category — pushing
+    // without it triggers "Article can't be blank". The bundled options list
+    // is a best-guess so we keep options_unverified: true so the payload
+    // builder NEVER emits a guessed value; instead, when no operator-supplied
+    // enum override resolves the source value, preflight blocks the push
+    // with an actionable "Fix mapping for Article" error.
     {
       field: "Article",
       type: "enum",
-      required: false,
+      required: true,
       options: APPAREL_TYPE_OPTIONS_INTERNAL,
-      allow_omit: true,
-      omit_when_unknown_enum: true,
       options_unverified: true,
     },
     {
@@ -645,13 +671,17 @@ export const FALLBACK_CATEGORY_SCHEMAS: Record<SupportedCategory, FallbackProper
     { field: "Detailed Description", type: "string", required: true },
     { field: "Total Number of Pieces", type: "string", required: true, example: "1" },
     { field: "Color", type: "string", required: true },
+    // Article is required on the live Jomashop Apparel category — pushing
+    // without it triggers "Article can't be blank". The bundled options list
+    // is a best-guess so we keep options_unverified: true so the payload
+    // builder NEVER emits a guessed value; instead, when no operator-supplied
+    // enum override resolves the source value, preflight blocks the push
+    // with an actionable "Fix mapping for Article" error.
     {
       field: "Article",
       type: "enum",
-      required: false,
+      required: true,
       options: APPAREL_TYPE_OPTIONS_INTERNAL,
-      allow_omit: true,
-      omit_when_unknown_enum: true,
       options_unverified: true,
     },
     {

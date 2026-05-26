@@ -51,6 +51,11 @@ export type MappedProduct = {
   missing_required?: string[];
   /** Required top-level field names that are missing (e.g. ["sku", "manufacturer_number"]). */
   missing_top_level?: string[];
+  /** Required enum fields whose accepted Jomashop options aren't verified
+   *  and no enum override resolved them. Each entry includes the canonical
+   *  source value the mapper tried, if any. UI uses this to render
+   *  "Fix mapping for Article" with an actionable reason. */
+  unverified_required_options?: Array<{ field: string; value?: string }>;
   category: "Shoes" | "Handbags" | "Clothing";
   is_sample?: boolean;
   raw_category?: string | null;

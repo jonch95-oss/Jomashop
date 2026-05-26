@@ -120,6 +120,22 @@ function isReady(p: MappedProduct): boolean {
 }
 
 /**
+ * Compact summary of required enum fields that are blocked because Jomashop's
+ * accepted option list isn't known AND no enum mapping resolves the source
+ * value. Surfaced to the row button as the reason "Fix mapping for X" is
+ * shown instead of "Push to Jomashop".
+ */
+function unresolvedRequiredEnumSummary(p: MappedProduct): string | null {
+  const u = p.unverified_required_options;
+  if (!Array.isArray(u) || u.length === 0) return null;
+  const fields = u
+    .map((entry) => entry?.field)
+    .filter((f): f is string => typeof f === "string" && f.length > 0);
+  if (fields.length === 0) return null;
+  return fields.join(", ");
+}
+
+/**
  * True when the product should NOT be pushable from the row-level button.
  * Sample fixtures, products with missing fields, and products whose
  * Jomashop category needs verification all block the row-level push so the
@@ -646,14 +662,18 @@ export default function Products() {
                               ? "Sample/demo product — cannot be pushed"
                               : p.readiness === "ready"
                                 ? undefined
-                                : "Fix mapping first — required fields, category, or schema missing"
+                                : unresolvedRequiredEnumSummary(p)
+                                  ? `Fix mapping for ${unresolvedRequiredEnumSummary(p)} — Jomashop accepted option list unknown. Open the product to add a mapping.`
+                                  : "Fix mapping first — required fields, category, or schema missing"
                           }
                         >
                           <Send className="mr-2 h-3.5 w-3.5" />
                           {p.is_sample
                             ? "Push disabled (sample)"
                             : p.readiness !== "ready"
-                              ? "Fix mapping first"
+                              ? unresolvedRequiredEnumSummary(p)
+                                ? `Fix mapping for ${unresolvedRequiredEnumSummary(p)}`
+                                : "Fix mapping first"
                               : state === "pushed"
                                 ? "Update on Jomashop"
                                 : "Push to Jomashop"}

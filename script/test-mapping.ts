@@ -38,7 +38,40 @@ import {
   lookupBrandOverride,
   normalizeBrandKey,
 } from "../server/brand_mapping";
+import {
+  BUILT_IN_ENUM_OVERRIDES,
+  normalizeEnumCategoryKey,
+  normalizeEnumFieldKey,
+  normalizeEnumSourceValue,
+} from "../server/enum_mapping";
 import { FALLBACK_CATEGORY_SCHEMAS, SUPPORTED_CATEGORIES } from "../shared/schema";
+
+// Pure (storage-free) enum override resolver that mimics the production
+// lookupEnumOverride for tests — checks only the BUILT_IN_ENUM_OVERRIDES
+// map plus a caller-supplied per-test overlay. The production resolver also
+// consults the SQLite enum_overrides table, but the mapping logic itself is
+// independent of where the mapping is stored.
+function makeTestEnumResolver(overlay: Record<string, string> = {}) {
+  return (
+    category: string,
+    field: string,
+    sourceValue: string,
+    acceptedOptions: string[] | undefined,
+  ): string | null => {
+    const cat = normalizeEnumCategoryKey(category);
+    const f = normalizeEnumFieldKey(field);
+    const v = normalizeEnumSourceValue(sourceValue);
+    if (!cat || !f || !v) return null;
+    const key = `${cat}|${f}|${v}`;
+    const candidate = overlay[key] ?? BUILT_IN_ENUM_OVERRIDES[key] ?? null;
+    if (!candidate) return null;
+    if (acceptedOptions && acceptedOptions.length > 0) {
+      const accepted = acceptedOptions.map((o) => o.toLowerCase().trim());
+      if (!accepted.includes(candidate.toLowerCase().trim())) return null;
+    }
+    return candidate;
+  };
+}
 
 let failures = 0;
 
@@ -1275,7 +1308,12 @@ function runApparelFallbackPushability() {
     omit_when_unknown_enum: f.omit_when_unknown_enum,
     options_unverified: f.options_unverified,
   }));
-  const mapped = mapShopifyToJomashop(product, apparelFallback, "Apparel");
+  // With the production enum-override resolver wired in, the built-in seed
+  // maps the "Outerwear" raw_category_code → Jomashop Article "Outerwear",
+  // so Article is satisfied and the payload is pushable end-to-end.
+  const mapped = mapShopifyToJomashop(product, apparelFallback, "Apparel", {
+    resolveEnumOverride: makeTestEnumResolver(),
+  });
   const { payload, pushDebug, missingRequired, missingTopLevel } = buildJomashopProductPayload(
     mapped,
     undefined,
@@ -1301,7 +1339,7 @@ function runApparelFallbackPushability() {
   );
   assert(
     missingRequired.length === 0,
-    `Apparel fallback push has no missing required fields when source data is present (got ${JSON.stringify(missingRequired)})`,
+    `Apparel fallback push has no missing required fields when source data + enum resolver are present (got ${JSON.stringify(missingRequired)})`,
   );
   assert(payload.manufacturer_id === 2774, `payload.manufacturer_id propagated (got ${payload.manufacturer_id})`);
   assert(payload.category_id === 35, `payload.category_id propagated (got ${payload.category_id})`);
@@ -1464,17 +1502,24 @@ function runCanadaGooseApparelRejectionFix() {
     `Apparel: Age === "Kids" (got ${JSON.stringify(mapped.properties.Age)})`,
   );
 
-  // (4) Article is now treated as `options_unverified` in the bundled
-  // Apparel fallback — Jomashop rejected "Outerwear" on the live category
-  // (the bundled options list does NOT match Jomashop's actual accepted set).
-  // The payload builder must NEVER emit Article from the unverified fallback,
-  // even when the canonical value happens to match a guessed option. The
-  // field is optional, so it is silently omitted; required-version handling
-  // is exercised separately below.
+  // (4) Article is now REQUIRED on the Apparel fallback (Jomashop rejected
+  // the push with "Article can't be blank"). The bundled options list is
+  // still tagged `options_unverified: true`, so without an enum override
+  // resolver the field must surface as a preflight block in
+  // missing_required + unverified_required_options. The OUTW source value
+  // is what the operator needs to map (raw_category code).
   const articleValue = mapped.properties.Article;
   assert(
-    articleValue === undefined || articleValue === null,
-    `Apparel: Article must NOT be emitted from unverified bundled options (got ${JSON.stringify(articleValue)})`,
+    articleValue === null || articleValue === undefined,
+    `Apparel: Article without resolver is held back from payload (got ${JSON.stringify(articleValue)})`,
+  );
+  assert(
+    (mapped.missing_required || []).includes("Article"),
+    `Apparel: Article surfaces in missing_required when no enum override resolves it (got ${JSON.stringify(mapped.missing_required)})`,
+  );
+  assert(
+    (mapped.unverified_required_options || []).some((u) => u.field === "Article"),
+    `Apparel: Article surfaces in unverified_required_options (got ${JSON.stringify(mapped.unverified_required_options)})`,
   );
 
   // (5) Country of Origin "Canada" is not in the accepted list — the
@@ -1507,24 +1552,56 @@ function runCanadaGooseApparelRejectionFix() {
     `Apparel: invalidEnums captures the Canada → accepted-list mismatch (got ${JSON.stringify(invalidEnums)})`,
   );
 
-  // (7) Article must be absent from the outgoing properties — the bundled
-  // option list is unverified, so we never guess.
+  // (7) Article must be absent from the outgoing payload properties when
+  // unresolved — sending a guess would trigger the "X is not included in
+  // the list" rejection.
   assert(
     !("Article" in payloadProps),
-    `Apparel: Article omitted from payload.properties when options unverified (got ${JSON.stringify(payloadProps.Article)})`,
+    `Apparel: Article omitted from payload.properties when unresolved (got ${JSON.stringify(payloadProps.Article)})`,
+  );
+  assert(
+    pushDebug.unverifiedRequiredOptions.some((u) => u.field === "Article"),
+    `Apparel: pushDebug.unverifiedRequiredOptions surfaces Article (got ${JSON.stringify(pushDebug.unverifiedRequiredOptions)})`,
   );
 
-  // (8) The payload must be pushable: no Material, Gender is Unisex,
-  // Article omitted, Country of Origin dropped. pushDebug
-  // confirms schemaLabelsExact and no missing required.
+  // (8) Schema labels still exact / not fallbackUnsafe.
   assert(pushDebug.schemaLabelsExact === true, `Apparel: pushDebug.schemaLabelsExact === true`);
   assert(pushDebug.fallbackUnsafe === false, `Apparel: pushDebug.fallbackUnsafe === false`);
 
-  // (9) Top-level payload must NOT carry a Material key, even though the
-  // Composition metafield was present.
+  // (9) Top-level payload must NOT carry a Material key.
   assert(
     !("Material" in payload),
     `Apparel: top-level payload excludes Material (got ${Object.keys(payload).join(",")})`,
+  );
+
+  // (10) When the resolver IS supplied (built-in OUTW → Outerwear seed),
+  // the SAME product re-maps with Article = "Outerwear" emitted, no
+  // preflight block. This is the operator-unblock path for OUTW pushes.
+  const mappedWithResolver = mapShopifyToJomashop(product, apparelFallback, "Apparel", {
+    resolveEnumOverride: makeTestEnumResolver(),
+  });
+  assert(
+    mappedWithResolver.properties.Article === "Outerwear",
+    `Apparel: with enum resolver, Article = "Outerwear" via OUTW seed (got ${JSON.stringify(mappedWithResolver.properties.Article)})`,
+  );
+  assert(
+    !(mappedWithResolver.missing_required || []).includes("Article"),
+    `Apparel: with resolver, Article is NOT missing_required (got ${JSON.stringify(mappedWithResolver.missing_required)})`,
+  );
+  assert(
+    !(mappedWithResolver.unverified_required_options || []).some((u) => u.field === "Article"),
+    `Apparel: with resolver, Article NOT in unverified_required_options (got ${JSON.stringify(mappedWithResolver.unverified_required_options)})`,
+  );
+  const resolvedPayload = buildJomashopProductPayload(mappedWithResolver, undefined, {
+    category: "Apparel",
+    brand: "Canada Goose",
+    manufacturer_id: 2774,
+    category_id: 35,
+  });
+  const resolvedProps = (resolvedPayload.payload.properties as Record<string, unknown>) || {};
+  assert(
+    resolvedProps.Article === "Outerwear",
+    `Apparel: with resolver, payload.properties.Article === "Outerwear" (got ${JSON.stringify(resolvedProps.Article)})`,
   );
 }
 
@@ -1782,15 +1859,24 @@ function runApparelArticleNeverGuessed() {
       { namespace: "custom", key: "ff_designer_id", value: "3103K61" },
     ],
   };
+  // Without an enum override resolver, the bundled Article field
+  // (required + options_unverified) must block preflight via
+  // missing_required + unverified_required_options, never emit a guessed
+  // value. The build path's payload must also be free of Article.
   const mapped = mapShopifyToJomashop(product, apparelFallback, "Apparel");
-  // Article must NOT appear in mapped.properties — the bundled options list
-  // is unverified, so we never emit a guess (even "Outerwear", which the
-  // previous code mistakenly trusted).
+  const articleVal = mapped.properties.Article;
   assert(
-    !("Article" in mapped.properties),
-    `Apparel: Article omitted from mapped.properties when options unverified (got ${JSON.stringify(mapped.properties.Article)})`,
+    articleVal === null || articleVal === undefined,
+    `Apparel: without resolver, Article must not be emitted (got ${JSON.stringify(articleVal)})`,
   );
-  // The build path's payload must also be free of Article.
+  assert(
+    (mapped.missing_required || []).includes("Article"),
+    `Apparel: missing_required includes Article when unresolved (got ${JSON.stringify(mapped.missing_required)})`,
+  );
+  assert(
+    (mapped.unverified_required_options || []).some((u) => u.field === "Article"),
+    `Apparel: unverified_required_options surfaces Article (got ${JSON.stringify(mapped.unverified_required_options)})`,
+  );
   const { payload, pushDebug } = buildJomashopProductPayload(mapped, undefined, {
     category: "Apparel",
     brand: "Canada Goose",
@@ -1800,13 +1886,11 @@ function runApparelArticleNeverGuessed() {
   const props = (payload.properties as Record<string, unknown>) || {};
   assert(
     !("Article" in props),
-    `Apparel: payload.properties.Article omitted when options unverified (got ${JSON.stringify(props.Article)})`,
+    `Apparel: payload.properties.Article omitted when unresolved (got ${JSON.stringify(props.Article)})`,
   );
-  // No preflight block — Article is optional. pushDebug records nothing
-  // unusual; unverifiedRequiredOptions is empty.
   assert(
-    Array.isArray(pushDebug.unverifiedRequiredOptions) && pushDebug.unverifiedRequiredOptions.length === 0,
-    `Apparel: optional Article does not trigger unverifiedRequiredOptions (got ${JSON.stringify(pushDebug.unverifiedRequiredOptions)})`,
+    pushDebug.unverifiedRequiredOptions.some((u) => u.field === "Article"),
+    `Apparel: pushDebug.unverifiedRequiredOptions surfaces Article (got ${JSON.stringify(pushDebug.unverifiedRequiredOptions)})`,
   );
 }
 
@@ -1919,6 +2003,244 @@ function runApparelRequiredUnverifiedBlocksPreflight() {
   );
 }
 
+// Case 28: Apparel OUTW with no Article metafield — without a resolver the
+// push must be blocked at preflight (unverified_required_options surfaces
+// Article). When the operator supplies an enum override mapping OUTW →
+// "Outerwear" the SAME product re-maps with Article emitted.
+function runApparelArticleResolverUnblocks() {
+  console.log(
+    "Case 28: Apparel OUTW Article unresolved blocks; with enum mapping override the payload includes Article",
+  );
+  const apparelFallback = FALLBACK_CATEGORY_SCHEMAS.Apparel.map((f) => ({
+    field: f.field,
+    required: f.required,
+    type: f.type,
+    options: f.options,
+    allow_omit: f.allow_omit,
+    omit_when_unknown_enum: f.omit_when_unknown_enum,
+    options_unverified: f.options_unverified,
+  }));
+  const product: ShopifyProduct = {
+    id: "shopify-cg-3103K61-4",
+    title: "Canada Goose Kids Black Outerwear",
+    body_html: "<p>Kids outerwear in black.</p>",
+    vendor: "Canada Goose",
+    product_type: "OUTW",
+    tags: ["Kids"],
+    images: [{ src: "https://example.com/cg.jpg" }],
+    options: [{ name: "Size", values: ["4"] }],
+    variants: [
+      { id: 30001, sku: "3103K61-4", price: "650.00", inventory_quantity: 1, option1: "4" },
+    ],
+    metafields: [
+      { namespace: "custom", key: "color", value: "BLACK", name: "Color" },
+      { namespace: "custom", key: "ff_designer_id", value: "3103K61" },
+      { namespace: "custom", key: "detailed_description", value: "Kids outerwear in black." },
+      { namespace: "custom", key: "total_number_of_pieces", value: "1" },
+    ],
+  };
+
+  // (a) Without a resolver — Article is blocked, payload carries no Article.
+  const mappedNoResolver = mapShopifyToJomashop(product, apparelFallback, "Apparel");
+  assert(
+    (mappedNoResolver.unverified_required_options || []).some((u) => u.field === "Article"),
+    `Case 28 (no resolver): unverified_required_options surfaces Article (got ${JSON.stringify(mappedNoResolver.unverified_required_options)})`,
+  );
+  const payloadNoResolver = buildJomashopProductPayload(mappedNoResolver, undefined, {
+    category: "Apparel",
+    brand: "Canada Goose",
+    manufacturer_id: 2774,
+    category_id: 35,
+  });
+  const propsNoResolver = (payloadNoResolver.payload.properties as Record<string, unknown>) || {};
+  assert(
+    !("Article" in propsNoResolver),
+    `Case 28 (no resolver): payload.properties has no Article (got ${JSON.stringify(propsNoResolver.Article)})`,
+  );
+  assert(
+    payloadNoResolver.pushDebug.unverifiedRequiredOptions.some((u) => u.field === "Article"),
+    `Case 28 (no resolver): pushDebug.unverifiedRequiredOptions surfaces Article`,
+  );
+
+  // (b) With operator overlay mapping OUTW → Outerwear.
+  const mappedResolved = mapShopifyToJomashop(product, apparelFallback, "Apparel", {
+    resolveEnumOverride: makeTestEnumResolver({
+      "apparel|article|outw": "Outerwear",
+    }),
+  });
+  assert(
+    mappedResolved.properties.Article === "Outerwear",
+    `Case 28 (with overlay): properties.Article === "Outerwear" (got ${JSON.stringify(mappedResolved.properties.Article)})`,
+  );
+  assert(
+    !(mappedResolved.unverified_required_options || []).some((u) => u.field === "Article"),
+    `Case 28 (with overlay): unverified_required_options does NOT include Article (got ${JSON.stringify(mappedResolved.unverified_required_options)})`,
+  );
+  const payloadResolved = buildJomashopProductPayload(mappedResolved, undefined, {
+    category: "Apparel",
+    brand: "Canada Goose",
+    manufacturer_id: 2774,
+    category_id: 35,
+  });
+  const propsResolved = (payloadResolved.payload.properties as Record<string, unknown>) || {};
+  assert(
+    propsResolved.Article === "Outerwear",
+    `Case 28 (with overlay): payload.properties.Article === "Outerwear" (got ${JSON.stringify(propsResolved.Article)})`,
+  );
+  assert(
+    payloadResolved.pushDebug.unverifiedRequiredOptions.length === 0,
+    `Case 28 (with overlay): pushDebug.unverifiedRequiredOptions empty (got ${JSON.stringify(payloadResolved.pushDebug.unverifiedRequiredOptions)})`,
+  );
+}
+
+// Case 29: Footwear "Shoe Size Type" is a required enum. A Shopify product
+// whose source size scale doesn't match Jomashop's accepted list must
+// surface as missing_required without an override, and resolve cleanly
+// with an enum override mapping "USA" → "US".
+function runFootwearRequiredEnumOverride() {
+  console.log(
+    "Case 29: Footwear Shoe Size Type required enum — unresolved blocks; override resolves it",
+  );
+  const footwearFallback = FALLBACK_CATEGORY_SCHEMAS.Footwear.map((f) => ({
+    field: f.field,
+    required: f.required,
+    type: f.type,
+    options: f.options,
+    allow_omit: f.allow_omit,
+    omit_when_unknown_enum: f.omit_when_unknown_enum,
+    options_unverified: f.options_unverified,
+  }));
+  const product: ShopifyProduct = {
+    id: "shopify-footwear-1",
+    title: "Tod's Mens Brown Boot",
+    body_html: "<p>Mens boot.</p>",
+    vendor: "Tods",
+    product_type: "BOOT",
+    tags: ["Men", "Boots"],
+    images: [{ src: "https://example.com/tods.jpg" }],
+    options: [{ name: "Size", values: ["10"] }],
+    variants: [
+      { id: 50001, sku: "TODS-BOOT-1", price: "500.00", inventory_quantity: 2, option1: "10" },
+    ],
+    metafields: [
+      { namespace: "custom", key: "color", value: "Brown", name: "Color" },
+      // Deliberate mismatch — "Brazilian" is not in the Shoe Size Type list
+      // and the bundled options aren't tagged unverified for Footwear, so
+      // enum coercion will fail. Without an override the required field is
+      // blocked.
+      { namespace: "custom", key: "size_scale", value: "Brazilian", name: "Size Scale" },
+      { namespace: "custom", key: "ff_designer_id", value: "TODS-BOOT-1" },
+    ],
+  };
+
+  // (a) Without override — missing_required carries Shoe Size Type.
+  const mappedNoOverride = mapShopifyToJomashop(product, footwearFallback, "Footwear");
+  assert(
+    (mappedNoOverride.missing_required || []).includes("Shoe Size Type"),
+    `Case 29 (no override): Shoe Size Type missing (got ${JSON.stringify(mappedNoOverride.missing_required)})`,
+  );
+
+  // (b) With operator overlay mapping Brazilian → US.
+  const mappedOverride = mapShopifyToJomashop(product, footwearFallback, "Footwear", {
+    resolveEnumOverride: makeTestEnumResolver({
+      "footwear|shoesizetype|brazilian": "US",
+    }),
+  });
+  assert(
+    mappedOverride.properties["Shoe Size Type"] === "US",
+    `Case 29 (with overlay): properties["Shoe Size Type"] === "US" (got ${JSON.stringify(mappedOverride.properties["Shoe Size Type"])})`,
+  );
+  assert(
+    !(mappedOverride.missing_required || []).includes("Shoe Size Type"),
+    `Case 29 (with overlay): Shoe Size Type NOT missing (got ${JSON.stringify(mappedOverride.missing_required)})`,
+  );
+}
+
+// Case 30: Handbags "Style" is an optional enum; an enum override should
+// still work for optional fields whose canonical value doesn't match the
+// list (e.g. operator wants to map "Shoulder-Bag" → "Shoulder").
+function runHandbagsOptionalEnumOverride() {
+  console.log(
+    "Case 30: Handbags optional Style enum — override maps an out-of-list value to an accepted option",
+  );
+  const handbagsFallback = FALLBACK_CATEGORY_SCHEMAS.Handbags.map((f) => ({
+    field: f.field,
+    required: f.required,
+    type: f.type,
+    options: f.options,
+    allow_omit: f.allow_omit,
+    omit_when_unknown_enum: f.omit_when_unknown_enum,
+    options_unverified: f.options_unverified,
+  }));
+  const product: ShopifyProduct = {
+    id: "shopify-handbags-1",
+    title: "Saint Laurent Loulou Shoulder Bag",
+    body_html: "<p>Shoulder bag.</p>",
+    vendor: "Saint Laurent",
+    product_type: "SHLD",
+    tags: ["Women", "Handbag"],
+    images: [{ src: "https://example.com/ysl.jpg" }],
+    options: [{ name: "Color", values: ["Noir"] }],
+    variants: [
+      { id: 60001, sku: "YSL-LOULOU-NOIR-2", price: "2350.00", inventory_quantity: 1, option1: "Noir" },
+    ],
+    metafields: [
+      { namespace: "custom", key: "color", value: "Noir", name: "Color" },
+      { namespace: "custom", key: "material", value: "Calfskin leather" },
+      { namespace: "custom", key: "style", value: "Shoulder-Bag", name: "Style" },
+      { namespace: "custom", key: "ff_designer_id", value: "YSL-LOULOU-NOIR-2" },
+    ],
+  };
+
+  // (a) Without override, Style "Shoulder-Bag" doesn't match accepted list;
+  // optional enum is dropped.
+  const mappedNoOverride = mapShopifyToJomashop(product, handbagsFallback, "Handbags");
+  assert(
+    !("Style" in mappedNoOverride.properties) || mappedNoOverride.properties.Style === undefined ||
+      mappedNoOverride.properties.Style === null ||
+      handbagsFallback.find((f) => f.field === "Style")?.options?.includes(String(mappedNoOverride.properties.Style)),
+    `Case 30 (no override): Style dropped or matches an accepted option (got ${JSON.stringify(mappedNoOverride.properties.Style)})`,
+  );
+
+  // (b) With overlay mapping "Shoulder-Bag" → "Shoulder".
+  const mappedOverride = mapShopifyToJomashop(product, handbagsFallback, "Handbags", {
+    resolveEnumOverride: makeTestEnumResolver({
+      "handbags|style|shoulderbag": "Shoulder",
+    }),
+  });
+  assert(
+    mappedOverride.properties.Style === "Shoulder",
+    `Case 30 (with overlay): properties.Style === "Shoulder" (got ${JSON.stringify(mappedOverride.properties.Style)})`,
+  );
+}
+
+// Case 31: the operator-overlay value MUST appear in the accepted options
+// list. A misconfigured override (e.g. mapping → "InvalidOption" not in
+// the live schema) is rejected by the resolver — the field stays
+// unresolved.
+function runEnumOverrideRespectsAcceptedOptions() {
+  console.log(
+    "Case 31: enum override value not in accepted options is ignored",
+  );
+  const resolver = makeTestEnumResolver({
+    "footwear|shoesizetype|usa": "Brazilian", // bogus override
+  });
+  const result = resolver("Footwear", "Shoe Size Type", "USA", ["US", "EU", "UK", "IT", "FR"]);
+  assert(
+    result === null,
+    `Case 31: bogus override is rejected by accepted-options check (got ${JSON.stringify(result)})`,
+  );
+
+  // Same key, valid value → returned.
+  const ok = makeTestEnumResolver({
+    "footwear|shoesizetype|usa": "US",
+  })("Footwear", "Shoe Size Type", "USA", ["US", "EU", "UK", "IT", "FR"]);
+  assert(
+    ok === "US",
+    `Case 31: valid override returns the option (got ${JSON.stringify(ok)})`,
+  );
+}
+
 runColorNavyCase();
 runDefinitionNameOnlyCase();
 runVariantSelectedOptionFallback();
@@ -1947,6 +2269,10 @@ runApparelGenderUnmappable();
 runApparelArticleNeverGuessed();
 runApparelArticleSentFromLiveSchema();
 runApparelRequiredUnverifiedBlocksPreflight();
+runApparelArticleResolverUnblocks();
+runFootwearRequiredEnumOverride();
+runHandbagsOptionalEnumOverride();
+runEnumOverrideRespectsAcceptedOptions();
 
 if (failures > 0) {
   console.error(`\n${failures} assertion(s) failed.`);

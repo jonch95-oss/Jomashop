@@ -5,6 +5,7 @@ import {
   categoryMappings,
   categoryOverrides,
   brandOverrides,
+  enumOverrides,
   syncJobs,
   syncLogs,
   importedOrders,
@@ -25,6 +26,8 @@ import type {
   InsertCategoryOverride,
   BrandOverride,
   InsertBrandOverride,
+  EnumOverride,
+  InsertEnumOverride,
   SyncJob,
   InsertSyncJob,
   SyncLog,
@@ -99,6 +102,18 @@ sqlite.exec(`
     notes TEXT,
     updated_at INTEGER NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS enum_overrides (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    jomashop_category TEXT NOT NULL,
+    jomashop_field TEXT NOT NULL,
+    source_value TEXT NOT NULL,
+    jomashop_option TEXT NOT NULL,
+    notes TEXT,
+    updated_at INTEGER NOT NULL,
+    UNIQUE (jomashop_category, jomashop_field, source_value)
+  );
+  CREATE INDEX IF NOT EXISTS enum_overrides_lookup_idx
+    ON enum_overrides (jomashop_category, jomashop_field);
   CREATE TABLE IF NOT EXISTS sync_jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     job_type TEXT NOT NULL,
@@ -226,6 +241,20 @@ export interface IStorage {
   getBrandOverride(shopifyBrand: string): BrandOverride | undefined;
   upsertBrandOverride(input: InsertBrandOverride): BrandOverride;
   deleteBrandOverride(shopifyBrand: string): void;
+
+  // Enum overrides (source value → exact Jomashop option per category+field)
+  listEnumOverrides(): EnumOverride[];
+  getEnumOverride(
+    jomashopCategory: string,
+    jomashopField: string,
+    sourceValue: string,
+  ): EnumOverride | undefined;
+  upsertEnumOverride(input: InsertEnumOverride): EnumOverride;
+  deleteEnumOverride(
+    jomashopCategory: string,
+    jomashopField: string,
+    sourceValue: string,
+  ): void;
 
   // Sync jobs/logs
   createSyncJob(input: InsertSyncJob): SyncJob;
@@ -391,6 +420,58 @@ export class DatabaseStorage implements IStorage {
   }
   deleteBrandOverride(shopifyBrand: string): void {
     db.delete(brandOverrides).where(eq(brandOverrides.shopifyBrand, shopifyBrand)).run();
+  }
+
+  listEnumOverrides(): EnumOverride[] {
+    return db.select().from(enumOverrides).all();
+  }
+  getEnumOverride(
+    jomashopCategory: string,
+    jomashopField: string,
+    sourceValue: string,
+  ): EnumOverride | undefined {
+    return db
+      .select()
+      .from(enumOverrides)
+      .where(
+        and(
+          eq(enumOverrides.jomashopCategory, jomashopCategory),
+          eq(enumOverrides.jomashopField, jomashopField),
+          eq(enumOverrides.sourceValue, sourceValue),
+        ),
+      )
+      .get();
+  }
+  upsertEnumOverride(input: InsertEnumOverride): EnumOverride {
+    const existing = this.getEnumOverride(
+      input.jomashopCategory,
+      input.jomashopField,
+      input.sourceValue,
+    );
+    if (existing) {
+      return db
+        .update(enumOverrides)
+        .set({ ...input })
+        .where(eq(enumOverrides.id, existing.id))
+        .returning()
+        .get();
+    }
+    return db.insert(enumOverrides).values(input).returning().get();
+  }
+  deleteEnumOverride(
+    jomashopCategory: string,
+    jomashopField: string,
+    sourceValue: string,
+  ): void {
+    db.delete(enumOverrides)
+      .where(
+        and(
+          eq(enumOverrides.jomashopCategory, jomashopCategory),
+          eq(enumOverrides.jomashopField, jomashopField),
+          eq(enumOverrides.sourceValue, sourceValue),
+        ),
+      )
+      .run();
   }
 
   createSyncJob(input: InsertSyncJob): SyncJob {
