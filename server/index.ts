@@ -4,6 +4,7 @@ import type { Request } from 'express';
 import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
 import { createServer } from "node:http";
+import { logMemory } from "./memlog";
 
 const app = express();
 const httpServer = createServer(app);
@@ -78,7 +79,15 @@ app.use((req, res, next) => {
     if (path.startsWith("/api")) {
       let logLine = `${req.method} ${path} ${res.statusCode} in ${duration}ms`;
       if (capturedJsonResponse) {
-        logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
+        // Avoid materializing megabyte-sized response payloads into the log
+        // line on product/cache endpoints — that would defeat the memory
+        // savings of paginating those responses. Truncate aggressively.
+        try {
+          const stringified = JSON.stringify(capturedJsonResponse);
+          logLine += ` :: ${stringified.length > 400 ? stringified.slice(0, 400) + "…" : stringified}`;
+        } catch {
+          // body wasn't JSON-serializable — skip
+        }
       }
 
       log(logLine);
@@ -127,6 +136,16 @@ app.use((req, res, next) => {
     },
     () => {
       log(`serving on port ${port}`);
+      logMemory("server.listen", { port });
     },
   );
+
+  // Periodic memory snapshot so Render's logs show RSS/heap drift even when
+  // no Shopify endpoints are being hit. Cheap (one process.memoryUsage call
+  // every 5 minutes) and disabled in NODE_ENV=test if anyone adds tests.
+  if (process.env.NODE_ENV !== "test") {
+    setInterval(() => {
+      logMemory("server.heartbeat");
+    }, 5 * 60 * 1000).unref();
+  }
 })();

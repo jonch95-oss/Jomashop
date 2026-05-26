@@ -46,8 +46,214 @@ import { registerCategoryMappingRoutes, lookupCategoryOverride } from "./categor
 import { registerBrandMappingRoutes, lookupBrandOverride, normalizeBrandKey } from "./brand_mapping";
 import { registerResolutionAuditRoutes } from "./resolution_audit";
 import { registerWebhookRoutes, registerShopifyWebhooks } from "./webhooks";
+import { logMemory } from "./memlog";
 
 // -------------------- helpers --------------------
+
+// Server-side caps for product list endpoints. These keep responses small
+// enough to render in the operator UI without ever shipping the full 3000+
+// item array over the wire (which is what was driving the Render OOM during
+// initial cache load). Heavy per-product detail (raw metafields, full image
+// list, debug echo) is moved behind /api/products/full/:id so a list view
+// only ever ships the compact projection.
+const DEFAULT_LIST_LIMIT = 200;
+const MAX_LIST_LIMIT = 500;
+
+function clampLimit(raw: unknown, fallback = DEFAULT_LIST_LIMIT, max = MAX_LIST_LIMIT): number {
+  if (raw === undefined || raw === null || raw === "") return fallback;
+  const s = String(raw).toLowerCase();
+  if (s === "all") return max;
+  const n = parseInt(s, 10);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.min(Math.max(n, 1), max);
+}
+
+function clampOffset(raw: unknown): number {
+  if (raw === undefined || raw === null || raw === "") return 0;
+  const n = parseInt(String(raw), 10);
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return n;
+}
+
+/**
+ * Compact projection of a fully-mapped product. Strips heavy fields
+ * (debug_raw, full metafields echo, full image array) and keeps only what
+ * the Products list view actually renders. Used both as the cache row and
+ * the default list response so we never ship megabytes of metafield JSON
+ * for a 3,000-product catalog.
+ */
+type CompactMappedProduct = {
+  category: string;
+  is_sample: boolean;
+  raw_category: string | null;
+  suggested_category: string;
+  ambiguous_category: boolean;
+  vendor_sku: string;
+  sku: string;
+  manufacturer_number: string | null;
+  name: string;
+  brand: string;
+  price: number | null;
+  msrp: number | null;
+  commercial_discount: number;
+  jomashop_price: number | null;
+  // Only the first image is retained — list views only ever render the primary.
+  image: string | null;
+  // Lightweight property echo: keep only string/number/boolean values that
+  // the UI uses to render the property summary chips. We do NOT keep null
+  // properties (they'd add up across 3000 products) and we cap the total
+  // count to a sane size.
+  properties: Record<string, string | number | boolean>;
+  variant_count: number;
+  // Compact variant projection. Drops the per-variant `options` object on
+  // products with many variants — list views show count, not full options.
+  variants: Array<{
+    vendor_sku: string;
+    price: number | null;
+    jomashop_price: number | null;
+    quantity: number;
+    status: "active" | "out_of_stock" | "inactive";
+  }>;
+  warnings: string[];
+  missing_required: string[];
+  missing_top_level: string[];
+  source: { shopify_product_id?: string | number; shopify_variant_ids: Array<string | number> };
+  // Push state (preserved as-is from the original payload).
+  push_state: string;
+  jomashop_sku: string | null;
+  last_push_error: string | null;
+  last_pushed_at: number | null;
+  last_invalid_params: string[] | null;
+  last_rejected_category: string | null;
+  last_rejected_brand: string | null;
+  // Resolution context (already small).
+  jomashop_resolution: {
+    outbound_brand: string;
+    outbound_category: string;
+    manufacturer: { id: number | string; name: string } | null;
+    manufacturer_suggestion: { id: number | string; name: string } | null;
+    category_record: { id: number | string; name: string } | null;
+    i1_available: boolean;
+  };
+  readiness: string;
+};
+
+function compactifyMapped(m: any): CompactMappedProduct {
+  const properties: Record<string, string | number | boolean> = {};
+  if (m.properties && typeof m.properties === "object") {
+    let count = 0;
+    for (const [k, v] of Object.entries(m.properties)) {
+      if (count >= 24) break; // hard cap on echoed property keys per row
+      if (v === null || v === undefined) continue;
+      if (typeof v === "string" || typeof v === "number" || typeof v === "boolean") {
+        properties[k] = v as string | number | boolean;
+        count += 1;
+      }
+    }
+  }
+  const variants = Array.isArray(m.variants)
+    ? m.variants.map((v: any) => ({
+        vendor_sku: String(v.vendor_sku ?? ""),
+        price: typeof v.price === "number" ? v.price : null,
+        jomashop_price: typeof v.jomashop_price === "number" ? v.jomashop_price : null,
+        quantity: typeof v.quantity === "number" ? v.quantity : 0,
+        status: (v.status ?? "inactive") as "active" | "out_of_stock" | "inactive",
+      }))
+    : [];
+  // Accept both the fresh-from-mapping shape (`images: string[]`) and the
+  // already-compact shape (`image: string | null`) so this helper is
+  // idempotent on cache-read paths.
+  const firstImage =
+    typeof m.image === "string" && m.image
+      ? m.image
+      : Array.isArray(m.images) && m.images.length > 0 && typeof m.images[0] === "string"
+        ? m.images[0]
+        : null;
+  return {
+    category: m.category,
+    is_sample: Boolean(m.is_sample),
+    raw_category: m.raw_category ?? null,
+    suggested_category: m.suggested_category ?? "",
+    ambiguous_category: Boolean(m.ambiguous_category),
+    vendor_sku: m.vendor_sku ?? "",
+    sku: m.sku ?? m.vendor_sku ?? "",
+    manufacturer_number: m.manufacturer_number ?? null,
+    name: m.name ?? "",
+    brand: m.brand ?? "",
+    price: typeof m.price === "number" ? m.price : null,
+    msrp: typeof m.msrp === "number" ? m.msrp : null,
+    commercial_discount: typeof m.commercial_discount === "number" ? m.commercial_discount : 0,
+    jomashop_price: typeof m.jomashop_price === "number" ? m.jomashop_price : null,
+    image: firstImage,
+    properties,
+    variant_count: variants.length,
+    variants,
+    warnings: Array.isArray(m.warnings) ? m.warnings.slice(0, 8) : [],
+    missing_required: Array.isArray(m.missing_required) ? m.missing_required : [],
+    missing_top_level: Array.isArray(m.missing_top_level) ? m.missing_top_level : [],
+    source: {
+      shopify_product_id: m.source?.shopify_product_id,
+      shopify_variant_ids: Array.isArray(m.source?.shopify_variant_ids)
+        ? m.source.shopify_variant_ids.slice(0, 100)
+        : [],
+    },
+    push_state: m.push_state ?? "not_pushed",
+    jomashop_sku: m.jomashop_sku ?? null,
+    last_push_error: m.last_push_error ?? null,
+    last_pushed_at: m.last_pushed_at ?? null,
+    last_invalid_params: m.last_invalid_params ?? null,
+    last_rejected_category: m.last_rejected_category ?? null,
+    last_rejected_brand: m.last_rejected_brand ?? null,
+    jomashop_resolution: m.jomashop_resolution ?? {
+      outbound_brand: "",
+      outbound_category: "",
+      manufacturer: null,
+      manufacturer_suggestion: null,
+      category_record: null,
+      i1_available: false,
+    },
+    readiness: m.readiness ?? "missing",
+  };
+}
+
+/**
+ * Slice + project a cache payload for transport. Always returns compact
+ * mapped rows (never debug_raw / full metafields), and applies pagination so
+ * we don't ship the full 3000-item list to a single client.
+ */
+function paginateCachePayload(
+  payload: any,
+  opts: { limit: number; offset: number; cachedAt: number | null; shopDomain: string | null },
+): Record<string, unknown> {
+  const allMapped: any[] = Array.isArray(payload?.mapped) ? payload.mapped : [];
+  const totalCount = allMapped.length;
+  const start = Math.min(opts.offset, totalCount);
+  const end = Math.min(start + opts.limit, totalCount);
+  const slice = allMapped.slice(start, end).map(compactifyMapped);
+  return {
+    mapperVersion: payload?.mapperVersion ?? null,
+    schemas: payload?.schemas ?? null,
+    mapped: slice,
+    count: slice.length,
+    totalCount,
+    page: { offset: start, limit: opts.limit, hasMore: end < totalCount },
+    usingSamples: Boolean(payload?.usingSamples),
+    shopifyConnected: Boolean(payload?.shopifyConnected),
+    dataSource: payload?.dataSource ?? "sample",
+    shopDomain: payload?.shopDomain ?? opts.shopDomain,
+    fetchedCount: payload?.fetchedCount ?? totalCount,
+    pageCount: payload?.pageCount ?? 0,
+    hasMore: payload?.hasMore ?? false,
+    fallbackReason: payload?.fallbackReason ?? null,
+    fetchError: payload?.fetchError ?? null,
+    liveCategoryNames: payload?.liveCategoryNames ?? null,
+    jomashopManufacturers: payload?.jomashopManufacturers ?? null,
+    jomashopI1Categories: payload?.jomashopI1Categories ?? null,
+    note: payload?.note ?? null,
+    fromCache: true,
+    lastRefreshedAt: opts.cachedAt,
+  };
+}
 
 function envBool(key: string): boolean {
   return Boolean(process.env[key] && process.env[key]!.trim().length > 0);
@@ -713,7 +919,18 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       });
     }
 
-    const mapped = await Promise.all(products.map(async (p) => {
+    // Process products sequentially. The previous Promise.all spawned one
+    // promise per product (3,000+ on a typical store), each holding a closure
+    // over the full mapping context. Sequential mapping keeps the working
+    // set bounded — each iteration releases its temporaries before the next.
+    const mapped: any[] = [];
+    let mappedIndex = 0;
+    for (const p of products) {
+      mappedIndex += 1;
+      if (mappedIndex % 500 === 0) {
+        logMemory("buildPreview.mapped", { done: mappedIndex, total: products.length });
+      }
+      const mappedRow = await (async (p: ShopifyProduct) => {
       const tmp = mapShopifyToJomashop(p, []);
       // Apply operator-supplied category override (XLSX-driven). When set, the
       // override pins the SupportedCategory used for schema resolution AND the
@@ -929,7 +1146,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         },
         readiness,
       };
-    }));
+      })(p);
+      mapped.push(mappedRow);
+    }
 
     const usingSamples = dataSource === "sample";
     return {
@@ -978,6 +1197,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       250,
     );
 
+    const limit = clampLimit(req.body?.limit ?? req.query.limit);
+    const offset = clampOffset(req.body?.offset ?? req.query.offset);
+
     // Cache fast-path: when not forcing a refresh and no products were
     // supplied, return the latest cached preview if one exists AND it was
     // produced by the current mapper version. A bumped MAPPER_VERSION
@@ -993,11 +1215,13 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           try {
             const payload = JSON.parse(cached.payloadJson);
             if (payload && payload.mapperVersion === MAPPER_VERSION) {
-              return res.json({
-                ...payload,
-                fromCache: true,
-                lastRefreshedAt: cached.fetchedAt,
+              const sliced = paginateCachePayload(payload, {
+                limit,
+                offset,
+                cachedAt: cached.fetchedAt,
+                shopDomain: cacheDomain,
               });
+              return res.json(sliced);
             }
             // Stale cache (older mapper version) — drop it so we re-fetch.
             storage.clearProductCache(cacheDomain);
@@ -1014,23 +1238,49 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
     }
 
+    logMemory("preview-products.start", { forceRefresh, maxProducts, pageSize });
     const preview = await buildPreview({
       suppliedProducts: supplied,
       forceRefresh,
       pageSize,
       maxProducts,
     });
+    logMemory("preview-products.built", {
+      mapped: preview.count,
+      dataSource: preview.dataSource,
+    });
 
     // Cache successful live previews so the next page load is instant.
     // Sample/empty previews are not cached so we don't pin demo data.
+    // We persist the COMPACT projection only — debug_raw / full metafields
+    // never round-trip through the cache, which keeps the SQLite row well
+    // under a megabyte even for catalogs in the thousands.
     if (preview.dataSource === "live" && preview.shopDomain) {
       try {
+        const cachePayload = {
+          mapperVersion: preview.mapperVersion,
+          schemas: preview.schemas,
+          mapped: preview.mapped.map((m) => compactifyMapped(m)),
+          usingSamples: preview.usingSamples,
+          shopifyConnected: preview.shopifyConnected,
+          dataSource: preview.dataSource,
+          shopDomain: preview.shopDomain,
+          fetchedCount: preview.fetchedCount,
+          pageCount: preview.pageCount,
+          hasMore: preview.hasMore,
+          fallbackReason: preview.fallbackReason,
+          fetchError: preview.fetchError,
+          liveCategoryNames: preview.liveCategoryNames,
+          jomashopManufacturers: preview.jomashopManufacturers,
+          jomashopI1Categories: preview.jomashopI1Categories,
+          note: preview.note,
+        };
         storage.upsertProductCache({
           shopDomain: preview.shopDomain,
           fetchedCount: preview.fetchedCount,
           pageCount: preview.pageCount,
           hasMore: preview.hasMore,
-          payloadJson: JSON.stringify(preview),
+          payloadJson: JSON.stringify(cachePayload),
           fetchedAt: Date.now(),
         });
       } catch (err) {
@@ -1043,13 +1293,43 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
     }
 
-    res.json({ ...preview, fromCache: false, lastRefreshedAt: Date.now() });
+    // Always slice the response so a freshly-built preview is just as
+    // memory-friendly as a cached one.
+    const totalCount = preview.mapped.length;
+    const start = Math.min(offset, totalCount);
+    const end = Math.min(start + limit, totalCount);
+    const sliced = preview.mapped.slice(start, end).map(compactifyMapped);
+    res.json({
+      mapperVersion: preview.mapperVersion,
+      schemas: preview.schemas,
+      mapped: sliced,
+      count: sliced.length,
+      totalCount,
+      page: { offset: start, limit, hasMore: end < totalCount },
+      usingSamples: preview.usingSamples,
+      shopifyConnected: preview.shopifyConnected,
+      dataSource: preview.dataSource,
+      shopDomain: preview.shopDomain,
+      fetchedCount: preview.fetchedCount,
+      pageCount: preview.pageCount,
+      hasMore: preview.hasMore,
+      fallbackReason: preview.fallbackReason,
+      fetchError: preview.fetchError,
+      liveCategoryNames: preview.liveCategoryNames,
+      jomashopManufacturers: preview.jomashopManufacturers,
+      jomashopI1Categories: preview.jomashopI1Categories,
+      note: preview.note,
+      fromCache: false,
+      lastRefreshedAt: Date.now(),
+    });
+    logMemory("preview-products.responded", { sent: sliced.length, totalCount });
   });
 
-  // Read-only fast path: return the cached preview without ever calling
-  // Shopify. The Products page calls this on mount so initial load is
-  // immediate. Returns null payload if no cache exists yet.
-  app.get("/api/products/cache", (_req, res) => {
+  // Read-only fast path: return a paginated slice of the cached preview
+  // without ever calling Shopify. The Products page calls this on mount so
+  // initial load is immediate. Returns `cached: false` if no cache exists
+  // yet. Defaults to DEFAULT_LIST_LIMIT rows; pass ?limit=&offset= to page.
+  app.get("/api/products/cache", (req, res) => {
     const conn = getActiveShopifyConnection();
     const shopDomain =
       conn?.shopDomain ??
@@ -1058,6 +1338,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     if (!shopDomain) return res.json({ cached: false, reason: "no-shopify-connection" });
     const cached = storage.getProductCache(shopDomain);
     if (!cached) return res.json({ cached: false, shopDomain });
+    const limit = clampLimit(req.query.limit);
+    const offset = clampOffset(req.query.offset);
     try {
       const payload = JSON.parse(cached.payloadJson);
       if (!payload || payload.mapperVersion !== MAPPER_VERSION) {
@@ -1070,6 +1352,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           mapperVersion: MAPPER_VERSION,
         });
       }
+      const sliced = paginateCachePayload(payload, {
+        limit,
+        offset,
+        cachedAt: cached.fetchedAt,
+        shopDomain,
+      });
       return res.json({
         cached: true,
         shopDomain,
@@ -1077,12 +1365,60 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         fetchedCount: cached.fetchedCount,
         pageCount: cached.pageCount,
         hasMore: cached.hasMore,
-        ...payload,
-        fromCache: true,
+        ...sliced,
       });
     } catch (err) {
       return res.json({ cached: false, shopDomain, error: (err as Error).message });
     }
+  });
+
+  // Single-product full detail. Returns the heavy fields (debug_raw, full
+  // metafields echo, full image list) for ONE product, looked up by Shopify
+  // product id. Backed by a live Shopify fetch — we do not persist heavy
+  // per-product data in the cache. This is the dedicated endpoint for the
+  // expandable debug panel in the UI; the list view never includes this
+  // payload.
+  app.get("/api/products/full/:id", async (req, res) => {
+    const productId = String(req.params.id);
+    if (!productId) return res.status(400).json({ ok: false, error: "Missing product id" });
+    const conn = getActiveShopifyConnection();
+    if (!conn) {
+      return res.status(503).json({ ok: false, error: "No connected Shopify store with an access token." });
+    }
+    // We can't filter Admin GraphQL by id without the GID, so we stream
+    // pages and stop as soon as we find the match. Worst case a few hundred
+    // KB of working memory for the page, never the whole catalog.
+    const { streamShopifyProducts } = await import("./shopify");
+    let found: ShopifyProduct | null = null;
+    const stream = await streamShopifyProducts((pageProducts) => {
+      for (const p of pageProducts) {
+        if (String(p.id) === productId) {
+          found = p;
+          return false; // stop pagination
+        }
+      }
+    }, { pageSize: 100 });
+    if (!stream.ok && !found) {
+      return res.status(502).json({ ok: false, error: stream.error });
+    }
+    if (!found) {
+      return res.status(404).json({ ok: false, error: "Product not found in connected Shopify store." });
+    }
+    // Resolve schema + map for the single product so the debug echo is in
+    // the same shape as the list view's compact rows but with full detail.
+    const tmp = mapShopifyToJomashop(found, []);
+    const { schema, source } = await resolveCategorySchema(tmp.category);
+    const props =
+      ((schema as { properties?: Array<any> } | undefined)?.properties) ??
+      FALLBACK_CATEGORY_SCHEMAS[tmp.category];
+    const mapped = mapShopifyToJomashop(found, props);
+    res.json({
+      ok: true,
+      shopDomain: conn.shopDomain,
+      schemaSource: source,
+      product: found,
+      mapped,
+    });
   });
 
   // Force a full Shopify pagination + cache overwrite. The Products page
@@ -1097,34 +1433,96 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       Math.max(parseInt(String(req.body?.pageSize ?? "100"), 10) || 100, 1),
       250,
     );
+    const responseLimit = clampLimit(req.body?.responseLimit ?? req.query.limit);
+    const responseOffset = clampOffset(req.body?.responseOffset ?? req.query.offset);
+
+    logMemory("products-refresh.start", { maxProducts, pageSize });
     const preview = await buildPreview({
       suppliedProducts: undefined,
       forceRefresh: true,
       pageSize,
       maxProducts,
     });
+    logMemory("products-refresh.built", {
+      mapped: preview.count,
+      dataSource: preview.dataSource,
+    });
     if (preview.dataSource === "live" && preview.shopDomain) {
-      storage.upsertProductCache({
-        shopDomain: preview.shopDomain,
-        fetchedCount: preview.fetchedCount,
-        pageCount: preview.pageCount,
-        hasMore: preview.hasMore,
-        payloadJson: JSON.stringify(preview),
-        fetchedAt: Date.now(),
-      });
+      try {
+        const cachePayload = {
+          mapperVersion: preview.mapperVersion,
+          schemas: preview.schemas,
+          mapped: preview.mapped.map((m) => compactifyMapped(m)),
+          usingSamples: preview.usingSamples,
+          shopifyConnected: preview.shopifyConnected,
+          dataSource: preview.dataSource,
+          shopDomain: preview.shopDomain,
+          fetchedCount: preview.fetchedCount,
+          pageCount: preview.pageCount,
+          hasMore: preview.hasMore,
+          fallbackReason: preview.fallbackReason,
+          fetchError: preview.fetchError,
+          liveCategoryNames: preview.liveCategoryNames,
+          jomashopManufacturers: preview.jomashopManufacturers,
+          jomashopI1Categories: preview.jomashopI1Categories,
+          note: preview.note,
+        };
+        storage.upsertProductCache({
+          shopDomain: preview.shopDomain,
+          fetchedCount: preview.fetchedCount,
+          pageCount: preview.pageCount,
+          hasMore: preview.hasMore,
+          payloadJson: JSON.stringify(cachePayload),
+          fetchedAt: Date.now(),
+        });
+      } catch (err) {
+        storage.appendLog({
+          level: "warn",
+          message: `Failed to persist product cache: ${(err as Error).message}`,
+          detailsJson: null,
+          createdAt: Date.now(),
+        });
+      }
     }
-    res.json({ ...preview, fromCache: false, lastRefreshedAt: Date.now() });
+    const totalCount = preview.mapped.length;
+    const start = Math.min(responseOffset, totalCount);
+    const end = Math.min(start + responseLimit, totalCount);
+    const sliced = preview.mapped.slice(start, end).map(compactifyMapped);
+    res.json({
+      mapperVersion: preview.mapperVersion,
+      schemas: preview.schemas,
+      mapped: sliced,
+      count: sliced.length,
+      totalCount,
+      page: { offset: start, limit: responseLimit, hasMore: end < totalCount },
+      usingSamples: preview.usingSamples,
+      shopifyConnected: preview.shopifyConnected,
+      dataSource: preview.dataSource,
+      shopDomain: preview.shopDomain,
+      fetchedCount: preview.fetchedCount,
+      pageCount: preview.pageCount,
+      hasMore: preview.hasMore,
+      fallbackReason: preview.fallbackReason,
+      fetchError: preview.fetchError,
+      liveCategoryNames: preview.liveCategoryNames,
+      jomashopManufacturers: preview.jomashopManufacturers,
+      jomashopI1Categories: preview.jomashopI1Categories,
+      note: preview.note,
+      fromCache: false,
+      lastRefreshedAt: Date.now(),
+    });
+    logMemory("products-refresh.responded", { sent: sliced.length, totalCount });
   });
 
   // Direct live Shopify product fetch (debug / admin use). Returns the
   // normalized ShopifyProduct[] without running through Jomashop mapping.
-  // Paginates through ALL products by default; pass ?limit=N to cap.
+  // To prevent OOMs on stores with thousands of products + heavy metafields,
+  // this endpoint defaults to a small capped response (DEFAULT_LIST_LIMIT).
+  // Pass ?limit=all (clamped to MAX_LIST_LIMIT) to receive a larger slice;
+  // there is no longer a way to ship the full uncapped catalog as one
+  // response — use /api/products/cache or /api/products/full/:id instead.
   app.get("/api/shopify/products", async (req, res) => {
-    const rawLimit = req.query.limit;
-    const maxProducts =
-      rawLimit === undefined || rawLimit === "" || rawLimit === "all"
-        ? undefined
-        : Math.max(parseInt(String(rawLimit), 10) || 0, 1);
+    const limit = clampLimit(req.query.limit);
     const pageSize = Math.min(
       Math.max(parseInt(String(req.query.pageSize ?? "100"), 10) || 100, 1),
       250,
@@ -1136,7 +1534,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         error: "No connected Shopify store with an access token. Complete OAuth install first.",
       });
     }
-    const result = await fetchShopifyProducts({ pageSize, maxProducts });
+    const result = await fetchShopifyProducts({ pageSize, maxProducts: limit });
     if (!result.ok) {
       return res.status(502).json({
         ok: false,
@@ -1153,6 +1551,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       hasMore: result.hasMore,
       partialError: result.partialError ?? null,
       products: result.products,
+      note: `Capped at ${limit} products. Use /api/products/cache for paginated mapped views or /api/products/full/:id for single-product detail.`,
     });
   });
 

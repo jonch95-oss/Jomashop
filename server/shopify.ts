@@ -9,6 +9,7 @@
 import crypto from "node:crypto";
 import { storage } from "./storage";
 import type { ShopifyProduct } from "./mapping";
+import { logMemory } from "./memlog";
 
 const ADMIN_API_VERSION = "2024-10";
 
@@ -114,7 +115,7 @@ function buildProductsQuery(first: number, after: string | null): { query: strin
             status
             tags
             options { id name values }
-            images(first: 10) { edges { node { url altText } } }
+            images(first: 1) { edges { node { url altText } } }
             metafields(first: ${METAFIELDS_PER_PRODUCT}) {
               edges {
                 node {
@@ -201,8 +202,16 @@ function numericIdFromGid(gid: string): string {
   return m ? m[1] : gid;
 }
 
+// Hard cap on description length retained in memory. The mapper strips HTML
+// then uses this as the product description, but Shopify shops sometimes hold
+// 50KB+ of marketing copy per product. With 3000+ products that alone is
+// hundreds of MB. Cap at 1500 chars (plain text fits comfortably).
+const MAX_DESCRIPTION_CHARS = 1500;
+
 function normalizeProduct(p: ShopifyGraphProduct): ShopifyProduct {
-  const images = p.images.edges.map((e) => ({ src: e.node.url, alt: e.node.altText }));
+  // Keep only the first image — list views only ever render the primary one,
+  // and pulling 10 per product across 3000+ products is multi-MB of URLs alone.
+  const images = p.images.edges.slice(0, 1).map((e) => ({ src: e.node.url, alt: e.node.altText }));
   const variants = p.variants.edges.map((e) => {
     const v = e.node;
     const selectedByName = new Map(v.selectedOptions.map((o) => [o.name.toLowerCase(), o.value]));
@@ -256,10 +265,14 @@ function normalizeProduct(p: ShopifyGraphProduct): ShopifyProduct {
       };
     });
 
+  const rawBody = p.descriptionHtml ?? "";
+  const truncatedBody =
+    rawBody.length > MAX_DESCRIPTION_CHARS ? rawBody.slice(0, MAX_DESCRIPTION_CHARS) : rawBody;
+
   return {
     id: numericIdFromGid(p.id),
     title: p.title,
-    body_html: p.descriptionHtml ?? "",
+    body_html: truncatedBody,
     vendor: p.vendor ?? "",
     product_type: p.productType ?? "",
     tags: p.tags,
@@ -296,18 +309,29 @@ const DEFAULT_PAGE_SIZE = 100;
 const SHOPIFY_MAX_PAGE_SIZE = 250;
 const DEFAULT_MAX_PAGES = 200;
 
+export type StreamPageResult =
+  | { ok: true; pageCount: number; partialError?: string; partialStatus?: number; hasMore: boolean; shopDomain: string; totalFetched: number }
+  | { ok: false; error: string; status?: number; shopDomain?: string };
+
 /**
- * Fetch live products from the connected Shopify store using the Admin
- * GraphQL API, paginating through ALL pages until hasNextPage is false (or
- * the optional caps are reached). Returns normalized products plus
- * fetchedCount, pageCount, and hasMore so callers can show progress.
+ * Stream live Shopify products page-by-page, invoking `onPage` with the
+ * normalized products from each GraphQL response and then discarding the raw
+ * response. This lets callers process tens of thousands of products without
+ * ever holding the full list in memory at once. The callback may also return
+ * `false` to stop pagination early (e.g. when the consumer has hit a cap).
  *
- * If a single page fails mid-walk we return the products we already have
- * along with `partialError`/`partialStatus` so the UI can show partial data.
+ * Memory characteristics:
+ * - Each iteration parses ONE page's JSON, normalizes it, hands it off, and
+ *   drops the parsed body. Steady-state working set is one page (≤250 products).
+ * - GraphQL response text is also released between pages.
+ *
+ * If a single page fails mid-walk we report the failure via `partialError` /
+ * `partialStatus` and return what was successfully streamed so far.
  */
-export async function fetchShopifyProducts(
+export async function streamShopifyProducts(
+  onPage: (products: ShopifyProduct[], pageIndex: number) => Promise<void | boolean> | void | boolean,
   options: FetchProductsOptions = {},
-): Promise<FetchProductsResult> {
+): Promise<StreamPageResult> {
   const conn = getActiveShopifyConnection();
   if (!conn) {
     return { ok: false, error: "No connected Shopify store with an access token." };
@@ -320,15 +344,16 @@ export async function fetchShopifyProducts(
   const maxProducts = options.maxProducts ?? Number.POSITIVE_INFINITY;
   const maxPages = Math.max(options.maxPages ?? DEFAULT_MAX_PAGES, 1);
 
-  const products: ShopifyProduct[] = [];
   let cursor: string | null = null;
   let hasMore = false;
   let pageCount = 0;
+  let totalFetched = 0;
   let partialError: string | undefined;
   let partialStatus: number | undefined;
+  let stoppedByConsumer = false;
 
-  while (pageCount < maxPages && products.length < maxProducts) {
-    const remaining = maxProducts - products.length;
+  while (pageCount < maxPages && totalFetched < maxProducts && !stoppedByConsumer) {
+    const remaining = maxProducts - totalFetched;
     const thisPageSize = Math.min(pageSize, Number.isFinite(remaining) ? remaining : pageSize);
     const { query, variables } = buildProductsQuery(thisPageSize, cursor);
 
@@ -344,7 +369,7 @@ export async function fetchShopifyProducts(
       });
     } catch (err) {
       const msg = (err as Error).message;
-      if (products.length === 0) {
+      if (totalFetched === 0) {
         return { ok: false, error: msg, shopDomain: conn.shopDomain };
       }
       partialError = msg;
@@ -355,7 +380,7 @@ export async function fetchShopifyProducts(
     if (!res.ok) {
       const text = await res.text().catch(() => "");
       const msg = `Shopify Admin API ${res.status}: ${text.slice(0, 500)}`;
-      if (products.length === 0) {
+      if (totalFetched === 0) {
         return { ok: false, status: res.status, error: msg, shopDomain: conn.shopDomain };
       }
       partialError = msg;
@@ -364,9 +389,14 @@ export async function fetchShopifyProducts(
       break;
     }
 
-    const body = (await res.json().catch(() => null)) as GraphQLResponse | null;
+    let body: GraphQLResponse | null = null;
+    try {
+      body = (await res.json()) as GraphQLResponse;
+    } catch {
+      body = null;
+    }
     if (!body) {
-      if (products.length === 0) {
+      if (totalFetched === 0) {
         return {
           ok: false,
           status: res.status,
@@ -381,7 +411,7 @@ export async function fetchShopifyProducts(
     }
     if (body.errors && body.errors.length > 0) {
       const msg = `Shopify GraphQL errors: ${body.errors.map((e) => e.message).join("; ")}`;
-      if (products.length === 0) {
+      if (totalFetched === 0) {
         return {
           ok: false,
           status: res.status,
@@ -397,16 +427,30 @@ export async function fetchShopifyProducts(
 
     pageCount += 1;
     const edges = body.data?.products?.edges ?? [];
+    const pageProducts: ShopifyProduct[] = [];
     for (const edge of edges) {
-      products.push(normalizeProduct(edge.node));
-      if (products.length >= maxProducts) break;
+      pageProducts.push(normalizeProduct(edge.node));
+      if (totalFetched + pageProducts.length >= maxProducts) break;
     }
     const pageInfo = body.data?.products?.pageInfo;
+    // Drop reference to the parsed body before invoking the callback so
+    // memory used for the GraphQL response can be GC'd while we map.
+    body = null;
+
+    totalFetched += pageProducts.length;
+    const continueResult = await onPage(pageProducts, pageCount - 1);
+    if (continueResult === false) {
+      stoppedByConsumer = true;
+      // We don't know if there are more — caller asked us to stop.
+      hasMore = Boolean(pageInfo && pageInfo.hasNextPage);
+      break;
+    }
+
     if (!pageInfo || !pageInfo.hasNextPage || !pageInfo.endCursor) {
       hasMore = false;
       break;
     }
-    if (products.length >= maxProducts) {
+    if (totalFetched >= maxProducts) {
       hasMore = true;
       break;
     }
@@ -426,12 +470,57 @@ export async function fetchShopifyProducts(
 
   return {
     ok: true,
-    products,
-    shopDomain: conn.shopDomain,
-    count: products.length,
     pageCount,
     hasMore,
+    shopDomain: conn.shopDomain,
+    totalFetched,
     ...(partialError ? { partialError } : {}),
     ...(partialStatus !== undefined ? { partialStatus } : {}),
+  };
+}
+
+/**
+ * Fetch live products from the connected Shopify store using the Admin
+ * GraphQL API, paginating through ALL pages until hasNextPage is false (or
+ * the optional caps are reached). Returns normalized products plus
+ * fetchedCount, pageCount, and hasMore so callers can show progress.
+ *
+ * NOTE: This buffers every product in memory. New code should prefer
+ * `streamShopifyProducts` and process pages incrementally so the working set
+ * stays bounded — the buffered version is retained only for callers that
+ * already cap themselves to small slices.
+ *
+ * If a single page fails mid-walk we return the products we already have
+ * along with `partialError`/`partialStatus` so the UI can show partial data.
+ */
+export async function fetchShopifyProducts(
+  options: FetchProductsOptions = {},
+): Promise<FetchProductsResult> {
+  const products: ShopifyProduct[] = [];
+  const startMem = { rss: 0 };
+  try {
+    startMem.rss = process.memoryUsage().rss;
+  } catch {
+    /* ignore */
+  }
+  const stream = await streamShopifyProducts((pageProducts) => {
+    for (const p of pageProducts) products.push(p);
+  }, options);
+  if (!stream.ok) return stream;
+  // Surface a memory data point so OOMs during refresh are easier to diagnose.
+  logMemory("fetchShopifyProducts.done", {
+    shopDomain: stream.shopDomain,
+    count: products.length,
+    pageCount: stream.pageCount,
+  });
+  return {
+    ok: true,
+    products,
+    shopDomain: stream.shopDomain,
+    count: products.length,
+    pageCount: stream.pageCount,
+    hasMore: stream.hasMore,
+    ...(stream.partialError ? { partialError: stream.partialError } : {}),
+    ...(stream.partialStatus !== undefined ? { partialStatus: stream.partialStatus } : {}),
   };
 }

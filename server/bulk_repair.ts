@@ -24,7 +24,8 @@ import {
   type SupportedCategory,
 } from "@shared/schema";
 import { resolveCategorySchema, jomashopConfigured, jomashopRequest } from "./jomashop";
-import { fetchShopifyProducts, getActiveShopifyConnection } from "./shopify";
+import { getActiveShopifyConnection, streamShopifyProducts } from "./shopify";
+import { logMemory } from "./memlog";
 
 // ---------- Editable column model ----------
 
@@ -185,13 +186,9 @@ async function buildMissingExportRows(): Promise<{
   if (!conn) {
     return { rows: [], shopDomain: null, fetchedCount: 0, pageCount: 0, hasMore: false };
   }
-  const result = await fetchShopifyProducts({ pageSize: 100 });
-  if (!result.ok) {
-    return { rows: [], shopDomain: conn.shopDomain, fetchedCount: 0, pageCount: 0, hasMore: false };
-  }
-  const products = result.products.filter((p) => !isSampleProduct(p));
 
-  // Resolve schemas for the three categories (live preferred).
+  // Resolve schemas for the three categories (live preferred). Done once
+  // up-front so each streamed page can map without re-fetching.
   const schemas: Record<SupportedCategory, Array<any>> = {
     Shoes: [],
     Handbags: [],
@@ -205,30 +202,48 @@ async function buildMissingExportRows(): Promise<{
     schemas[cat] = props;
   }
 
+  // Stream pages from Shopify and process in batches. We never retain the
+  // full ShopifyProduct[] — only the ExportRow projections (a few hundred
+  // bytes each), which keeps the working set bounded even for catalogs with
+  // thousands of products.
   const rows: ExportRow[] = [];
-  for (const product of products) {
-    const tmp = mapShopifyToJomashop(product, []);
-    const props = schemas[tmp.category];
-    const mapped = mapShopifyToJomashop(product, props);
-    const missing = [
-      ...(mapped.missing_top_level ?? []),
-      ...(mapped.missing_required ?? []),
-    ];
-    if (missing.length === 0) continue;
-    if (mapped.variants.length === 0) {
-      rows.push(exportRowFromMapped(conn.shopDomain, mapped, null));
-    } else {
-      for (const v of mapped.variants) {
-        rows.push(exportRowFromMapped(conn.shopDomain, mapped, v.vendor_sku));
+  let fetchedCount = 0;
+  logMemory("bulk-repair.export.start", { shopDomain: conn.shopDomain });
+  const stream = await streamShopifyProducts((pageProducts, pageIndex) => {
+    for (const product of pageProducts) {
+      fetchedCount += 1;
+      if (isSampleProduct(product)) continue;
+      const tmp = mapShopifyToJomashop(product, []);
+      const props = schemas[tmp.category];
+      const mapped = mapShopifyToJomashop(product, props);
+      const missing = [
+        ...(mapped.missing_top_level ?? []),
+        ...(mapped.missing_required ?? []),
+      ];
+      if (missing.length === 0) continue;
+      if (mapped.variants.length === 0) {
+        rows.push(exportRowFromMapped(conn.shopDomain, mapped, null));
+      } else {
+        for (const v of mapped.variants) {
+          rows.push(exportRowFromMapped(conn.shopDomain, mapped, v.vendor_sku));
+        }
       }
     }
+    if (pageIndex % 5 === 0) {
+      logMemory("bulk-repair.export.page", { pageIndex, fetchedCount, rowsSoFar: rows.length });
+    }
+  }, { pageSize: 100 });
+
+  if (!stream.ok) {
+    return { rows: [], shopDomain: conn.shopDomain, fetchedCount: 0, pageCount: 0, hasMore: false };
   }
+  logMemory("bulk-repair.export.done", { rows: rows.length, fetchedCount: stream.totalFetched });
   return {
     rows,
     shopDomain: conn.shopDomain,
-    fetchedCount: result.count,
-    pageCount: result.pageCount,
-    hasMore: result.hasMore,
+    fetchedCount: stream.totalFetched,
+    pageCount: stream.pageCount,
+    hasMore: stream.hasMore,
   };
 }
 
@@ -646,19 +661,26 @@ type JomashopPushResult = {
 async function refetchAndMap(
   productId: string,
 ): Promise<{ product: ShopifyProduct; mapped: MappedProduct; category: SupportedCategory } | null> {
-  // Refetch the full product list (cheap enough for the small datasets the
-  // operator typically corrects in one pass) and locate the matching one.
-  const result = await fetchShopifyProducts({ pageSize: 100 });
-  if (!result.ok) return null;
-  const product = result.products.find((p) => String(p.id) === String(productId));
-  if (!product) return null;
-  const tmp = mapShopifyToJomashop(product, []);
+  // Stream pages and stop as soon as we hit the matching product so we
+  // never retain the full catalog in memory just to look up one product.
+  let found: ShopifyProduct | null = null;
+  const stream = await streamShopifyProducts((pageProducts) => {
+    for (const p of pageProducts) {
+      if (String(p.id) === String(productId)) {
+        found = p;
+        return false;
+      }
+    }
+  }, { pageSize: 100 });
+  if (!stream.ok && !found) return null;
+  if (!found) return null;
+  const tmp = mapShopifyToJomashop(found, []);
   const { schema } = await resolveCategorySchema(tmp.category);
   const props =
     (schema as { properties?: Array<any> } | undefined)?.properties ??
     FALLBACK_CATEGORY_SCHEMAS[tmp.category];
-  const mapped = mapShopifyToJomashop(product, props);
-  return { product, mapped, category: mapped.category };
+  const mapped = mapShopifyToJomashop(found, props);
+  return { product: found, mapped, category: mapped.category };
 }
 
 async function pushRowToJomashop(row: ParsedRow): Promise<JomashopPushResult> {
