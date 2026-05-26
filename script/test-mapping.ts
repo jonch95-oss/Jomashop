@@ -29,7 +29,11 @@ import {
   normalizeCategoryCode,
   type ShopifyProduct,
 } from "../server/mapping";
-import { normalizeBrandKey } from "../server/brand_mapping";
+import {
+  BUILT_IN_BRAND_OVERRIDES,
+  lookupBrandOverride,
+  normalizeBrandKey,
+} from "../server/brand_mapping";
 import { FALLBACK_CATEGORY_SCHEMAS } from "../shared/schema";
 
 let failures = 0;
@@ -209,16 +213,23 @@ function runListTypeMetafield() {
 function runBuiltInCategoryDefaults() {
   console.log("Case 5: built-in Shopify→Jomashop category seed mappings");
   const cases: Array<{ code: string; expected: string }> = [
-    { code: "DRSH", expected: "Clothing" },
-    { code: "SNEK", expected: "Footwear" },
-    { code: "BAGS", expected: "Handbags" },
+    { code: "DRSH", expected: "Apparel" },
     { code: "WALL", expected: "Accessories" },
+    { code: "SNEK", expected: "Footwear" },
+    { code: "SUNG", expected: "Eyewear" },
+    { code: "NECK", expected: "Necklaces" },
+    { code: "RING", expected: "Rings" },
+    { code: "POUC", expected: "Handbags" },
     { code: "BOOT", expected: "Footwear" },
     { code: "CARD", expected: "Accessories" },
     { code: "TOTE", expected: "Handbags" },
+    { code: "PINS", expected: "Pins & Brooches" },
+    { code: "BRAC", expected: "Bracelets" },
+    { code: "EARI", expected: "Earrings" },
+    { code: "HOME", expected: "Home Decor" },
     // Casing / punctuation tolerance — normalized lookup must collapse these.
-    { code: "drsh", expected: "Clothing" },
-    { code: "Dress-Shirts".replace("Dress-Shirts", "DRSH"), expected: "Clothing" },
+    { code: "drsh", expected: "Apparel" },
+    { code: "Dress-Shirts".replace("Dress-Shirts", "DRSH"), expected: "Apparel" },
   ];
   for (const { code, expected } of cases) {
     const got = lookupBuiltInCategoryDefault(code);
@@ -251,10 +262,16 @@ function runBuiltInCategoryDefaults() {
     `CARD is no longer ambiguous after built-in mapping → Accessories`,
   );
   // A code that is in SMALL_LEATHER_GOODS_CODES but NOT in the built-in
-  // map (e.g. "belt") must still be flagged ambiguous so the operator picks.
+  // map (e.g. "keychain" — the short code KCHN is seeded but the full word
+  // is not) must still be flagged ambiguous so the operator picks.
   assert(
-    isAmbiguousCategoryCode("BELT"),
-    `BELT remains ambiguous (no built-in seed mapping)`,
+    isAmbiguousCategoryCode("keychain"),
+    `"keychain" remains ambiguous (no built-in seed mapping)`,
+  );
+  // BELT is now seeded → Accessories, so it should no longer be ambiguous.
+  assert(
+    !isAmbiguousCategoryCode("BELT"),
+    `BELT is no longer ambiguous after built-in mapping → Accessories`,
   );
   // normalizeCategoryCode parity check used by the lookup table.
   assert(
@@ -461,6 +478,61 @@ function runResolvedRecordsRequiredForReadiness() {
   );
 }
 
+function runBuiltInBrandSeeds() {
+  console.log("Case 9: built-in Shopify→Jomashop brand seed mappings");
+  const cases: Array<{ shopify: string; expected: string }> = [
+    { shopify: "ACNESTUDI", expected: "Acne Studios" },
+    { shopify: "Cavalli Class", expected: "Roberto Cavalli" },
+    { shopify: "CAVALLICL", expected: "Roberto Cavalli" },
+    { shopify: "CHRISTIAN", expected: "Christian Louboutin" },
+    { shopify: "DOLCE&GAB", expected: "Dolce and Gabbana" },
+    { shopify: "Tods", expected: "Tods" },
+    { shopify: "TODS", expected: "Tods" },
+    { shopify: "Tod's", expected: "Tods" },
+    { shopify: "Off White", expected: "Off-White" },
+    { shopify: "OFFWHITE", expected: "Off-White" },
+    { shopify: "MONCLERGR", expected: "Moncler" },
+    { shopify: "PALMANGEL", expected: "Palm Angels" },
+    { shopify: "Salvatore Ferragamo", expected: "Salvatore Ferragamo" },
+    { shopify: "SALVATORE", expected: "Salvatore Ferragamo (#40)" },
+  ];
+  for (const { shopify, expected } of cases) {
+    const hit = lookupBrandOverride(shopify);
+    assert(
+      hit !== null && hit.jomashopBrand === expected && hit.source === "built-in",
+      `lookupBrandOverride("${shopify}") → "${expected}" (built-in) (got ${JSON.stringify(hit)})`,
+    );
+  }
+  // Blank brands in the audit must NOT be seeded — they should fall through
+  // to null so the readiness check surfaces them as unresolved.
+  for (const blank of [
+    "BELSTAFF",
+    "EIDOS",
+    "ERL",
+    "ERMANNOSC",
+    "FLEURDUM",
+    "GOSHA",
+    "MARA HOFFMAN",
+    "MARAHOFFM",
+    "ORLBROWN",
+    "PESERICO",
+    "SOTF",
+  ]) {
+    const hit = lookupBrandOverride(blank);
+    assert(
+      hit === null,
+      `lookupBrandOverride("${blank}") returns null (no seed) (got ${JSON.stringify(hit)})`,
+    );
+  }
+  // Every built-in brand key must already be in normalized form.
+  for (const k of Object.keys(BUILT_IN_BRAND_OVERRIDES)) {
+    assert(
+      normalizeBrandKey(k) === k,
+      `built-in brand key "${k}" is already in normalized form`,
+    );
+  }
+}
+
 async function runResolutionAuditHelpers() {
   const { brandLookupKey, editDistance, buildResolutionAuditWorkbook } = await import(
     "../server/resolution_audit"
@@ -566,6 +638,7 @@ runBuiltInCategoryDefaults();
 runBrandKeyNormalization();
 runManufacturerIdCarriedThrough();
 runResolvedRecordsRequiredForReadiness();
+runBuiltInBrandSeeds();
 await runResolutionAuditHelpers();
 
 if (failures > 0) {
