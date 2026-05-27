@@ -454,6 +454,64 @@ function readMetafieldAny(p: ShopifyProduct, keys: string[]): string | undefined
   return undefined;
 }
 
+/**
+ * Locate the (namespace, key) of the first metafield on `p` whose
+ * key/namespace/name/label matches any of the candidate identifiers, and
+ * whose value is non-empty. Used by the per-product XLSX writeback to
+ * preserve the original metafield location instead of always writing to a
+ * new `jomashop.*` namespace.
+ *
+ * Returns null if no candidate has a populated metafield, in which case
+ * callers should fall back to a stable default (`jomashop.parent_sku`).
+ */
+export function findMetafieldSource(
+  p: ShopifyProduct,
+  keys: ReadonlyArray<string>,
+): { namespace: string; key: string } | null {
+  const targets = keys.map((k) => normKey(k)).filter((t) => t !== "");
+  if (targets.length === 0) return null;
+  for (const m of p.metafields || []) {
+    if (!m) continue;
+    const val = m.value === null || m.value === undefined ? "" : String(m.value).trim();
+    if (val === "") continue;
+    const candidateTokens = [
+      normKey(m.key),
+      normKey(`${m.namespace ?? ""}.${m.key ?? ""}`),
+      normKey(m.name),
+      normKey(m.label),
+      normKey(m.description),
+    ].filter((t) => t !== "");
+    if (candidateTokens.some((tok) => targets.includes(tok))) {
+      const ns = (m.namespace && String(m.namespace).trim()) || "custom";
+      const k = (m.key && String(m.key).trim()) || "parent_sku";
+      return { namespace: ns, key: k };
+    }
+  }
+  return null;
+}
+
+/**
+ * Read the Parent SKU value from `p` using the canonical candidate list.
+ * Centralized so the canonical-field extractor, the per-product XLSX
+ * exporter, and the upload writeback all agree on the same source set.
+ */
+export function readParentSku(p: ShopifyProduct): string | undefined {
+  return readMetafieldAny(p, [...PARENT_SKU_METAFIELD_CANDIDATES]);
+}
+
+/**
+ * Detect the existing (namespace, key) of the source metafield where a
+ * product's Parent SKU lives, when present. The XLSX upload writeback
+ * prefers this over the default `jomashop.parent_sku` so edits land on the
+ * same metafield the value was read from. Returns null when no candidate
+ * metafield exists.
+ */
+export function findParentSkuSource(
+  p: ShopifyProduct,
+): { namespace: string; key: string } | null {
+  return findMetafieldSource(p, PARENT_SKU_METAFIELD_CANDIDATES);
+}
+
 const DISCOUNT_KEY_CANDIDATES = [
   "custom.commercial_discount",
   "commercial_discount",
@@ -594,7 +652,41 @@ export type CanonicalProductFields = {
    *  single non-empty size), "No" when it does not. Never the literal size
    *  value (e.g. "4") — Jomashop's Variation Size enum is a Yes/No flag. */
   variation_size_yes_no?: string;
+  /** Parent SKU — the upstream "group" SKU shared across all size/colour
+   *  variants of a product. Sourced strictly from explicit Shopify
+   *  metafields (parent_sku / Parent SKU / ff_parent_sku / parentSku across
+   *  the common namespaces). Never derived from variant size, variant SKU,
+   *  brand, or handle — those are not parent SKUs and silently substituting
+   *  them would corrupt Jomashop's product grouping. */
+  parent_sku?: string;
 };
+
+/**
+ * Candidate metafield keys/labels for the Parent SKU value, in priority
+ * order. Used both for reading the value into the canonical bag and for
+ * detecting which namespace/key the value originally came from when the
+ * per-product XLSX writeback wants to land back on the same metafield
+ * (rather than always writing to `jomashop.parent_sku`).
+ *
+ * IMPORTANT: variant size, variant SKU, the product handle, manufacturer
+ * number, and brand are intentionally NOT in this list. A "Parent SKU"
+ * substituted from any of those is wrong by definition.
+ */
+export const PARENT_SKU_METAFIELD_CANDIDATES: ReadonlyArray<string> = [
+  "Parent SKU",
+  "parent_sku",
+  "parentSku",
+  "parent-sku",
+  "ff_parent_sku",
+  "FF Parent SKU",
+  "custom.parent_sku",
+  "custom.ff_parent_sku",
+  "luxe.parent_sku",
+  "luxe.ff_parent_sku",
+  "jomashop.parent_sku",
+  "global.parent_sku",
+  "ff.parent_sku",
+];
 
 /**
  * A normalized view of a single live Jomashop schema property. Different
@@ -832,6 +924,14 @@ export function buildCanonicalProductFields(p: ShopifyProduct): CanonicalProduct
     variation_size_yes_no = "No";
   }
 
+  // Parent SKU: pulled strictly from explicit parent-sku metafields. Never
+  // derived from the variant SKU, variant size, manufacturer number, brand,
+  // or product handle — those are not parent SKUs by definition and silently
+  // substituting them would corrupt Jomashop's product grouping. When no
+  // parent-sku metafield is present the field stays undefined; downstream
+  // schema-mapping / payload code surfaces the gap rather than guessing.
+  const parent_sku = readParentSku(p);
+
   return {
     brand: brand || undefined,
     model: p.title || undefined,
@@ -859,6 +959,7 @@ export function buildCanonicalProductFields(p: ShopifyProduct): CanonicalProduct
     product_id,
     asin,
     variation_size_yes_no,
+    parent_sku: parent_sku || undefined,
   };
 }
 
@@ -932,7 +1033,10 @@ function pickCanonicalField(prop: SchemaPropertyDescriptor): keyof CanonicalProd
   if (tokens.length === 0) return null;
   const has = (sub: string) => tokens.some((t) => t.includes(sub));
   // Most-specific first so "Variation Size (Yes/No)" and "Apparel Size Type"
-  // don't fall through to "size".
+  // don't fall through to "size", and so "Parent SKU" maps to the parent_sku
+  // canonical field instead of being treated as a generic "SKU".
+  if (has("parentsku") || has("parentitemsku") || has("groupsku") || has("parentnumber"))
+    return "parent_sku";
   if (has("variationsize") || has("variantsize") || has("sizevariation") || has("sizeyesno"))
     return "variation_size_yes_no";
   if (has("productidtype") || has("productidkind") || has("idtype")) return "product_id_type";
@@ -1796,6 +1900,12 @@ export function mapShopifyToJomashop(
             "material",
             "Material",
           ]);
+          break;
+        case "parent_sku":
+          // Parent SKU is sourced strictly from explicit parent-sku
+          // metafields. Never substituted from variant size, variant SKU,
+          // brand, or handle — those are not parent SKUs by definition.
+          value = readParentSku(product);
           break;
       }
     }

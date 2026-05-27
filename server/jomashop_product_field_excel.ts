@@ -34,7 +34,11 @@ import {
   jomashopConfigured,
 } from "./jomashop";
 import {
+  PARENT_SKU_METAFIELD_CANDIDATES,
+  findMetafieldSource,
   normalizeI1CategorySchema,
+  readParentSku,
+  type ShopifyProduct,
   type SchemaPropertyDescriptor,
 } from "./mapping";
 import { getActiveShopifyConnection } from "./shopify";
@@ -60,6 +64,12 @@ export type ProductFieldExportRow = {
   fieldValues: Record<string, string>;
   /** Variant-specific marker used to decide product vs variant metafield. */
   isVariant: boolean;
+  /** Optional override of the writeback target metafield (namespace/key) per
+   *  Jomashop schema field. When the canonical value originally came from a
+   *  non-`jomashop` metafield (e.g. Parent SKU lives at `custom.parent_sku`),
+   *  the writeback prefers updating the existing metafield in place rather
+   *  than minting a fresh `jomashop.*` one. Keyed by field name. */
+  fieldWritebackTargets?: Record<string, { namespace: string; key: string }>;
 };
 
 export type ProductFieldExportResult = {
@@ -119,6 +129,43 @@ export function fieldIsVariantTargeted(propertyName: string): boolean {
     .toLowerCase()
     .replace(/[^a-z0-9]/g, "");
   return VARIANT_FIELD_TOKENS.has(tok);
+}
+
+/**
+ * Detect whether a Jomashop schema field label refers to the Parent SKU
+ * concept. "Parent SKU", "ParentSKU", "Parent_Sku", and similar variants
+ * are all matched; the bare "SKU" / "Vendor SKU" is intentionally NOT a
+ * Parent SKU (those identify the child variant, not its parent group).
+ */
+export function fieldIsParentSku(propertyName: string): boolean {
+  const tok = String(propertyName)
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
+  return tok === "parentsku" || tok === "parentitemsku" || tok === "groupsku" || tok === "parentnumber";
+}
+
+/**
+ * Build a synthetic ShopifyProduct shape from the compact `debug_raw`
+ * metafields echo cached on each mapped product. Used by the per-product
+ * XLSX exporter to (re-)derive Parent SKU values and locate the original
+ * source metafield without re-fetching the live product from the Admin API.
+ */
+function productFromDebugRaw(m: any): ShopifyProduct {
+  const mfs: ShopifyProduct["metafields"] = [];
+  const raw = (m && m.debug_raw && Array.isArray(m.debug_raw.metafields))
+    ? m.debug_raw.metafields
+    : [];
+  for (const mf of raw) {
+    if (!mf || typeof mf !== "object") continue;
+    mfs.push({
+      namespace: typeof mf.namespace === "string" ? mf.namespace : undefined,
+      key: typeof mf.key === "string" ? mf.key : undefined,
+      name: typeof mf.name === "string" ? mf.name : undefined,
+      label: typeof mf.label === "string" ? mf.label : undefined,
+      value: mf.value === undefined || mf.value === null ? null : String(mf.value),
+    });
+  }
+  return { metafields: mfs };
 }
 
 /**
@@ -269,6 +316,21 @@ export async function aggregateProductFieldRows(opts: {
         ? m.properties
         : {};
 
+      // Synthetic product (metafields only) used to (re-)derive values that
+      // come straight from Shopify metafields independent of whichever
+      // schema happened to be in effect when the cache was built. Currently
+      // only Parent SKU uses this path — `m.properties` lacks it whenever
+      // the live category schema didn't carry a "Parent SKU" property at
+      // mapping time.
+      const syntheticProduct = productFromDebugRaw(m);
+      const parentSkuFromMetafields = readParentSku(syntheticProduct);
+      const parentSkuSource = findMetafieldSource(
+        syntheticProduct,
+        PARENT_SKU_METAFIELD_CANDIDATES,
+      );
+
+      const fieldWritebackTargets: Record<string, { namespace: string; key: string }> = {};
+
       const mkRow = (variantId: string, variantOptions: Record<string, string>, isVariant: boolean) => {
         const fieldValues: Record<string, string> = {};
         for (const f of cleanFields) {
@@ -292,6 +354,17 @@ export async function aggregateProductFieldRows(opts: {
                 v = val;
                 break;
               }
+            }
+          }
+          // Parent SKU fields: prefer the metafield-derived value even when
+          // the cached mapped properties don't carry one. Never substitute
+          // variant size / variant SKU here.
+          if (fieldIsParentSku(f.field)) {
+            const candidate =
+              typeof v === "string" && v.trim() !== "" ? String(v) : parentSkuFromMetafields;
+            v = candidate || "";
+            if (candidate && parentSkuSource) {
+              fieldWritebackTargets[f.field] = parentSkuSource;
             }
           }
           fieldValues[f.field] =
@@ -325,6 +398,10 @@ export async function aggregateProductFieldRows(opts: {
             : "",
           fieldValues,
           isVariant,
+          fieldWritebackTargets:
+            Object.keys(fieldWritebackTargets).length > 0
+              ? { ...fieldWritebackTargets }
+              : undefined,
         });
       };
 
@@ -1296,12 +1373,30 @@ export function registerJomashopProductFieldExcelRoutes(app: Express): void {
     let succeeded = 0;
     let failed = 0;
 
+    // Index aggSnapshot rows by rowId so the apply step can look up the
+    // per-field writeback targets stamped at export time (e.g. preserving
+    // an existing `custom.parent_sku` source instead of always writing to
+    // `jomashop.parent_sku`). Falls back to the slug-derived default when
+    // no override is present.
+    const targetsByRowId = new Map<string, Record<string, { namespace: string; key: string }>>();
+    for (const cat of session.aggSnapshot.categories) {
+      for (const r of cat.rows) {
+        if (r.fieldWritebackTargets && Object.keys(r.fieldWritebackTargets).length > 0) {
+          targetsByRowId.set(r.rowId, r.fieldWritebackTargets);
+        }
+      }
+    }
+
     if (conn) {
       for (const row of validRows) {
         if (!row.writeBack) continue;
+        const overrides = targetsByRowId.get(row.rowId);
         for (const [fieldName, value] of Object.entries(row.fieldValues)) {
           if (!value) continue;
-          const target = deriveMetafieldTargetForProductField(fieldName);
+          const override = overrides ? overrides[fieldName] : undefined;
+          const target = override
+            ? { namespace: override.namespace, key: override.key }
+            : deriveMetafieldTargetForProductField(fieldName);
           const isVariant = fieldIsVariantTargeted(fieldName);
           const ownerId =
             isVariant && row.shopifyVariantId
