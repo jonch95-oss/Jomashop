@@ -904,6 +904,105 @@ function matchSchemaOption(value: string, options: string[] | undefined): string
  * Returns an empty array when no recognizable property list is present
  * (which signals the caller to fall back to the bundled schema).
  */
+/**
+ * Normalize the v1 `/v1/categories/:name` response into the same uniform
+ * descriptor shape as `normalizeI1CategorySchema`. The v1 shape (per the
+ * published Jomashop docs) wraps each schema property as:
+ *
+ *   {
+ *     key: "article",
+ *     designation: "required" | "recommended" | "optional",
+ *     name: "Article",
+ *     kind: "enumerable" | "string" | "numeric" | "boolean",
+ *     data: { values: ["Outerwear", "Jackets", …], multiple?: boolean,
+ *             min_length?: number, max_length?: number }
+ *   }
+ *
+ * The accepted enum list lives under `data.values` — when present we treat
+ * the property as a verified Jomashop-confirmed enum and emit its options
+ * exactly. Required-ness comes from `designation === "required"`.
+ *
+ * Returns [] when the payload doesn't carry a recognizable v1 property
+ * list, so callers can fall back to /i1 or the bundled schema.
+ */
+export function normalizeV1CategorySchema(raw: unknown): SchemaPropertyDescriptor[] {
+  if (!raw || typeof raw !== "object") return [];
+  const root = raw as Record<string, unknown>;
+  const candidates: unknown[] = [
+    root.properties,
+    (root.category as { properties?: unknown } | undefined)?.properties,
+    (root.data as { properties?: unknown } | undefined)?.properties,
+  ];
+  let list: unknown[] = [];
+  for (const c of candidates) {
+    if (Array.isArray(c) && c.length > 0) {
+      list = c;
+      break;
+    }
+  }
+  if (list.length === 0) return [];
+  // Heuristic: a v1 property has at least one of {designation, kind, data}.
+  // Otherwise this isn't a v1 payload — let the caller try the /i1
+  // normalizer (which handles older shapes).
+  const looksLikeV1 = list.some((p) => {
+    if (!p || typeof p !== "object") return false;
+    const it = p as Record<string, unknown>;
+    return "designation" in it || "kind" in it || "data" in it;
+  });
+  if (!looksLikeV1) return [];
+
+  const out: SchemaPropertyDescriptor[] = [];
+  for (const item of list) {
+    if (!item || typeof item !== "object") continue;
+    const it = item as Record<string, unknown>;
+    // Prefer human-readable `name` for the outbound payload key (matches the
+    // Title Case labels Jomashop's /i1 endpoint accepts). Fall back to `key`
+    // only when `name` is absent. Skip the property entirely if both are
+    // missing or empty.
+    const nameRaw = typeof it.name === "string" ? it.name.trim() : "";
+    const keyRaw = typeof it.key === "string" ? it.key.trim() : "";
+    const field = nameRaw || keyRaw;
+    if (!field) continue;
+    const label = nameRaw || keyRaw;
+    const designation =
+      typeof it.designation === "string" ? it.designation.toLowerCase().trim() : "";
+    const required = designation === "required" || designation === "mandatory";
+    const kindRaw = typeof it.kind === "string" ? it.kind.toLowerCase().trim() : "";
+    let type: string | undefined;
+    if (kindRaw === "enumerable" || kindRaw === "enum") type = "enum";
+    else if (kindRaw === "numeric" || kindRaw === "number" || kindRaw === "integer") type = "number";
+    else if (kindRaw === "boolean" || kindRaw === "bool") type = "boolean";
+    else if (kindRaw === "string" || kindRaw === "text") type = "string";
+    // data.values → options
+    const dataObj = (it.data && typeof it.data === "object" ? (it.data as Record<string, unknown>) : null);
+    const options: string[] = [];
+    const valsRaw = dataObj?.values;
+    if (Array.isArray(valsRaw)) {
+      for (const o of valsRaw) {
+        if (typeof o === "string" && o.trim()) options.push(o);
+        else if (o && typeof o === "object") {
+          const vo = o as Record<string, unknown>;
+          const v = vo.value ?? vo.label ?? vo.name;
+          if (typeof v === "string" && v.trim()) options.push(v);
+        }
+      }
+    }
+    const hasOptions = options.length > 0;
+    if (hasOptions && !type) type = "enum";
+    out.push({
+      field,
+      label,
+      required,
+      type,
+      options: hasOptions ? options : undefined,
+      // v1 options are LIVE and verified — never mark as unverified.
+      allow_omit: !required,
+      omit_when_unknown_enum: !required && hasOptions,
+    });
+  }
+  return out;
+}
+
 export function normalizeI1CategorySchema(raw: unknown): SchemaPropertyDescriptor[] {
   if (!raw || typeof raw !== "object") return [];
   const root = raw as Record<string, unknown>;

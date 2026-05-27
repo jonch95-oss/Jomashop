@@ -17,6 +17,7 @@ import {
   resolveCategoryRecord,
   createManufacturer,
   clearI1Cache,
+  getV1CategoryDescriptors,
 } from "./jomashop";
 import {
   FALLBACK_CATEGORY_SCHEMAS,
@@ -812,13 +813,44 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       });
     }
 
-    // 2. Live category record + schema — if reachable. Resolve the category
-    //    id from /i1/categories, then fetch /i1/categories/:id and pull the
-    //    real per-field option list. Options here override the bundled
-    //    guess and flip `verified` to true.
+    // 2. Live category record + schema — if reachable.
+    //    Preferred: GET /v1/categories/:name, which returns properties with
+    //    key/designation/kind and data.values (the exact accepted enum
+    //    options Jomashop validates against). v1 options are the canonical
+    //    verified source.
+    //    Secondary: fall back to /i1/categories/:id when v1 is unreachable
+    //    or doesn't carry the property list (legacy tenants).
     let liveCategoryId: number | string | null = null;
     let liveError: string | null = null;
+    let v1Error: string | null = null;
+    let v1Source = false;
     if (jomashopConfigured()) {
+      const v1 = await getV1CategoryDescriptors(name).catch((e: unknown) => ({
+        ok: false as const,
+        status: 0,
+        error: (e as Error).message,
+        fromCache: false,
+      }));
+      if (v1.ok && v1.descriptors.length > 0) {
+        for (const p of v1.descriptors) {
+          if (!p.options || p.options.length === 0) continue;
+          byField.set(p.field, {
+            field: p.field,
+            required: p.required,
+            type: p.type || "enum",
+            options: [...p.options],
+            source: "live",
+            verified: true,
+            preflightBlocking: false,
+            note: "Verified against /v1/categories/" + name + " data.values",
+          });
+        }
+        v1Source = v1.descriptors.length > 0;
+      } else if (!v1.ok) {
+        v1Error = v1.error;
+      }
+
+      // /i1 secondary — only populate fields v1 didn't already verify.
       const catResolve = await resolveCategoryRecord(name).catch(() => null);
       if (catResolve && "ok" in catResolve && catResolve.ok && "configured" in catResolve && catResolve.configured && catResolve.exact) {
         liveCategoryId = catResolve.exact.id;
@@ -833,6 +865,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           const liveSchema = normalizeI1CategorySchema(propsResp.data);
           for (const p of liveSchema) {
             if (!p.options || p.options.length === 0) continue;
+            // Don't overwrite a v1-verified entry — v1 is canonical.
+            const existing = byField.get(p.field);
+            if (existing && existing.source === "live") continue;
             byField.set(p.field, {
               field: p.field,
               required: p.required,
@@ -853,6 +888,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       ok: true,
       category: name,
       liveCategoryId,
+      v1Source,
+      v1Error,
       liveError,
       fields: Array.from(byField.values()),
     });
@@ -1969,18 +2006,36 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
     }
 
-    // Schema-driven property mapping: once we know the resolved Jomashop
-    // category id, fetch its live property list and re-map the Shopify
-    // product against EXACT live labels. Falls back silently to the bundled
-    // schema when /i1/categories/:id is unavailable OR returns a
-    // lowercase-only legacy shape (Jomashop's /i1 validator rejects those).
+    // Schema-driven property mapping: prefer the published v1 schema
+    // (`GET /v1/categories/:name`) because its `data.values` carry the
+    // canonical verified enum option list (e.g. the real Apparel "Article"
+    // accepted values). Falls back to /i1/categories/:id by category id when
+    // v1 is unavailable, and finally to the bundled exact-label schema.
     let liveSchemaSource: "live-i1" | "live-v1" | "fallback" = source === "live" ? "live-v1" : "fallback";
     const bundledFallback = FALLBACK_CATEGORY_SCHEMAS[tmpMap.category];
     const bundledIsExact =
       Array.isArray(bundledFallback) &&
       bundledFallback.length > 0 &&
       bundledFallback.every((p) => /[A-Z]/.test(p.field) || /\s/.test(p.field));
-    if (overrides.category_id !== undefined && overrides.category_id !== null) {
+    let v1SchemaUsed = false;
+    try {
+      const v1Resp = await getV1CategoryDescriptors(tmpMap.category);
+      if (v1Resp.ok && v1Resp.descriptors.length > 0) {
+        const v1Exact = v1Resp.descriptors.some(
+          (p) => p && typeof p.field === "string" && (/[A-Z]/.test(p.field) || /\s/.test(p.field)),
+        );
+        if (v1Exact || !bundledIsExact) {
+          mapped = mapShopifyToJomashop(body.product, v1Resp.descriptors, body.forcedCategory, {
+            resolveEnumOverride: enumResolver,
+          });
+          liveSchemaSource = "live-v1";
+          v1SchemaUsed = true;
+        }
+      }
+    } catch {
+      // network issue — fall through to /i1
+    }
+    if (!v1SchemaUsed && overrides.category_id !== undefined && overrides.category_id !== null) {
       try {
         const i1SchemaResp = await getCategoryPropertiesI1(overrides.category_id);
         if (i1SchemaResp.ok && i1SchemaResp.data) {
@@ -2658,6 +2713,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     type FieldAccepted = {
       options: string[];
       source: "live" | "fallback" | "unknown";
+      v1Error?: string;
     };
     const acceptedByCatField = new Map<string, FieldAccepted>();
     async function loadAccepted(category: string): Promise<Map<string, FieldAccepted>> {
@@ -2673,6 +2729,25 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         }
       }
       if (jomashopConfigured()) {
+        // Primary verified source: GET /v1/categories/:name (data.values).
+        const v1 = await getV1CategoryDescriptors(category).catch(() => null);
+        if (v1 && v1.ok && v1.descriptors.length > 0) {
+          for (const p of v1.descriptors) {
+            if (Array.isArray(p.options) && p.options.length > 0) {
+              out.set(normalizeEnumFieldKey(p.field), {
+                options: [...p.options],
+                source: "live",
+              });
+            }
+          }
+        } else if (v1 && !v1.ok) {
+          // Surface the v1 error on every enum field for this category so the
+          // operator can see why the verified list isn't available.
+          for (const [k, existing] of Array.from(out.entries())) {
+            out.set(k, { ...existing, v1Error: v1.error });
+          }
+        }
+        // Secondary: /i1 by category id — only fills fields v1 didn't cover.
         const catResolve = await resolveCategoryRecord(category).catch(() => null);
         const liveId =
           catResolve && (catResolve as any).ok && (catResolve as any).configured && (catResolve as any).exact
@@ -2684,7 +2759,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             const liveSchema = normalizeI1CategorySchema((propsResp as any).data);
             for (const p of liveSchema) {
               if (Array.isArray(p.options) && p.options.length > 0) {
-                out.set(normalizeEnumFieldKey(p.field), {
+                const key = normalizeEnumFieldKey(p.field);
+                const existing = out.get(key);
+                if (existing && existing.source === "live") continue;
+                out.set(key, {
                   options: [...p.options],
                   source: "live",
                 });

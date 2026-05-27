@@ -2,6 +2,7 @@
 // Tokens live in-memory only; nothing is persisted to disk.
 
 import { FALLBACK_CATEGORY_SCHEMAS, type SupportedCategory } from "@shared/schema";
+import { normalizeV1CategorySchema, type SchemaPropertyDescriptor } from "./mapping";
 
 type JomashopConfig = {
   baseUrl: string;
@@ -184,34 +185,101 @@ export async function getCategorySchema(name: string) {
   return jomashopRequest({ path: `/v1/categories/${encodeURIComponent(name)}` });
 }
 
-// Helper that the mapping preview uses: it tries to fetch a live schema
-// but falls back to the bundled one if the API is unavailable OR if the
-// live schema would emit lowercase legacy labels (Jomashop's /i1 schema
-// validator now rejects those). When we have a bundled exact-label
-// fallback for the category we prefer it over a lowercase live shape.
+// Module-level cache for /v1/categories/:name responses. Same TTL as the /i1
+// caches so a single push cycle reuses the schema instead of re-fetching.
+const V1_SCHEMA_TTL_MS = 5 * 60 * 1000;
+type V1SchemaCacheEntry = {
+  fetchedAt: number;
+  /** Normalized descriptors. Empty array signals "v1 returned data but it
+   *  didn't carry recognizable properties" — distinct from null which means
+   *  "v1 fetch failed entirely". */
+  descriptors: SchemaPropertyDescriptor[];
+  raw: unknown;
+};
+const v1SchemaCache = new Map<string, V1SchemaCacheEntry>();
+const v1SchemaErrorCache = new Map<string, { fetchedAt: number; error: string; status: number }>();
+
+export function clearV1SchemaCache(): void {
+  v1SchemaCache.clear();
+  v1SchemaErrorCache.clear();
+}
+
+/**
+ * Fetch and normalize the live /v1/categories/:name schema. Returns the
+ * normalized descriptor list (with verified enum options from `data.values`)
+ * plus the raw payload for debug surfaces. Returns null when the fetch
+ * failed or the response shape isn't recognizable as v1 properties — the
+ * caller is expected to fall back to /i1 or the bundled schema.
+ *
+ * Cached for 5 minutes per category name. Failures cached too so a degraded
+ * Jomashop API doesn't burn one round-trip per product in a 3,000-product
+ * preview build.
+ */
+export async function getV1CategoryDescriptors(
+  category: string,
+  opts: { refresh?: boolean } = {},
+): Promise<
+  | { ok: true; descriptors: SchemaPropertyDescriptor[]; raw: unknown; fromCache: boolean }
+  | { ok: false; status: number; error: string; fromCache: boolean }
+> {
+  const key = String(category).trim();
+  if (!key) return { ok: false, status: 0, error: "Missing category name", fromCache: false };
+  if (!opts.refresh) {
+    const cached = v1SchemaCache.get(key);
+    if (cached && Date.now() - cached.fetchedAt < V1_SCHEMA_TTL_MS) {
+      return { ok: true, descriptors: cached.descriptors, raw: cached.raw, fromCache: true };
+    }
+    const cachedErr = v1SchemaErrorCache.get(key);
+    if (cachedErr && Date.now() - cachedErr.fetchedAt < V1_SCHEMA_TTL_MS) {
+      return { ok: false, status: cachedErr.status, error: cachedErr.error, fromCache: true };
+    }
+  }
+  const live = await getCategorySchema(key);
+  if (!live.ok || !live.data) {
+    const error = live.error || `HTTP ${live.status}`;
+    v1SchemaErrorCache.set(key, { fetchedAt: Date.now(), error, status: live.status });
+    return { ok: false, status: live.status, error, fromCache: false };
+  }
+  const descriptors = normalizeV1CategorySchema(live.data);
+  v1SchemaCache.set(key, { fetchedAt: Date.now(), descriptors, raw: live.data });
+  return { ok: true, descriptors, raw: live.data, fromCache: false };
+}
+
+// Helper that the mapping preview uses: prefer the live /v1/categories/:name
+// schema (verified by Jomashop — `data.values` carries the exact accepted
+// enum options) over the bundled fallback for every supported category.
+// Only falls back when v1 is unreachable OR its payload doesn't carry
+// usable Title Case property labels.
 export async function resolveCategorySchema(category: SupportedCategory) {
   const bundled = FALLBACK_CATEGORY_SCHEMAS[category];
   const bundledIsExact =
     Array.isArray(bundled) &&
     bundled.length > 0 &&
     bundled.every((p) => /[A-Z]/.test(p.field) || /\s/.test(p.field));
-  const live = await getCategorySchema(category);
-  if (live.ok && live.data) {
-    const props = (live.data as { properties?: Array<{ field: string }> } | undefined)?.properties;
+  const v1 = await getV1CategoryDescriptors(category);
+  if (v1.ok && v1.descriptors.length > 0) {
+    const liveHasExactLabels = v1.descriptors.some(
+      (p) => typeof p.field === "string" && (/[A-Z]/.test(p.field) || /\s/.test(p.field)),
+    );
+    if (liveHasExactLabels || !bundledIsExact) {
+      return {
+        source: "live" as const,
+        schema: { name: category, properties: v1.descriptors },
+      };
+    }
+  }
+  // Legacy v1 shape (rare): the API responded with a `properties` array but
+  // the new v1 normalizer didn't recognize it. Try the older /i1-style
+  // normalization for backwards compatibility — same `live.data` from before.
+  if (v1.ok && v1.descriptors.length === 0) {
+    const props = (v1.raw as { properties?: Array<{ field: string }> } | undefined)?.properties;
     const liveHasExactLabels =
       Array.isArray(props) &&
       props.length > 0 &&
       props.some((p) => p && typeof p.field === "string" && (/[A-Z]/.test(p.field) || /\s/.test(p.field)));
     if (liveHasExactLabels || !bundledIsExact) {
-      return { source: "live" as const, schema: live.data };
+      return { source: "live" as const, schema: v1.raw };
     }
-    // Live schema is lowercase-only (legacy) but we have an exact-label
-    // bundled fallback — prefer the bundled one so the outgoing payload
-    // uses Title Case labels Jomashop accepts.
-    return {
-      source: "fallback" as const,
-      schema: { name: category, properties: bundled },
-    };
   }
   return {
     source: "fallback" as const,

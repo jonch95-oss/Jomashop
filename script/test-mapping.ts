@@ -30,6 +30,7 @@ import {
   mapShopifyToJomashop,
   normalizeCategoryCode,
   normalizeI1CategorySchema,
+  normalizeV1CategorySchema,
   type ShopifyProduct,
   type SchemaPropertyDescriptor,
 } from "../server/mapping";
@@ -2569,6 +2570,241 @@ function runFootwearHandbagsRequiredEnumRegression() {
   );
 }
 
+// ---------- Case 36: v1 schema normalization ----------
+//
+// The published Jomashop /v1/categories/:name docs return properties with
+// `key`, `designation` (required/recommended), `name`, `kind` (enumerable/
+// string/numeric), and `data.values` carrying the verified enum option list.
+// normalizeV1CategorySchema must parse that shape, mark designation=required
+// fields as required, expose data.values as the canonical accepted-options
+// list, and refuse to claim a payload is v1 when none of the v1 markers
+// (designation/kind/data) appear.
+function runV1SchemaNormalization() {
+  console.log("Case 36: normalizeV1CategorySchema parses /v1/categories/:name docs shape");
+  const apparelV1Payload = {
+    name: "Apparel",
+    properties: [
+      {
+        key: "gender",
+        designation: "required",
+        name: "Gender",
+        kind: "enumerable",
+        data: { values: ["Men", "Women", "Unisex"] },
+      },
+      {
+        key: "article",
+        designation: "required",
+        name: "Article",
+        kind: "enumerable",
+        data: { values: ["Outerwear", "Jackets", "Pants"] },
+      },
+      {
+        key: "color",
+        designation: "required",
+        name: "Color",
+        kind: "string",
+        data: {},
+      },
+      {
+        key: "country_of_origin",
+        designation: "recommended",
+        name: "Country of Origin",
+        kind: "enumerable",
+        data: { values: ["Italy", "USA"] },
+      },
+    ],
+  };
+  const norm = normalizeV1CategorySchema(apparelV1Payload);
+  assert(norm.length === 4, `v1 normalizer returns 4 props (got ${norm.length})`);
+  const article = norm.find((p) => p.field === "Article");
+  assert(article !== undefined, `Article descriptor present`);
+  assert(article!.required === true, `Article required from designation=required`);
+  assert(
+    Array.isArray(article!.options) && article!.options!.includes("Outerwear"),
+    `Article options unpack from data.values`,
+  );
+  const coo = norm.find((p) => p.field === "Country of Origin");
+  assert(coo !== undefined && coo.required === false, `Country of Origin not required (designation=recommended)`);
+  // A payload missing designation/kind/data shouldn't be misidentified as v1.
+  const legacy = normalizeV1CategorySchema({
+    properties: [{ field: "Color", required: true }],
+  });
+  assert(legacy.length === 0, `legacy /i1 shape rejected by v1 normalizer`);
+  assert(normalizeV1CategorySchema(null).length === 0, `null → []`);
+  assert(normalizeV1CategorySchema({}).length === 0, `empty obj → []`);
+}
+
+// ---------- Case 37: mocked v1 Apparel response — Article preflight ----------
+//
+// Simulates GET /v1/categories/Apparel returning the docs-shape payload with
+// Article=["Outerwear", "Jackets", "Pants"]. Two assertions:
+//
+//   (a) When the operator stores a verified mapping OUTW → "Outerwear" and
+//       Article is in data.values, the mapper emits properties.Article =
+//       "Outerwear" — proving v1-confirmed options flow through preflight.
+//   (b) When the operator stores a mapping OUTW → "Tuxedos" (NOT in
+//       data.values), the mapper drops the value and missing_required
+//       surfaces Article — proving the accepted_options gate still blocks
+//       a mismatched mapping even when v1 is reachable.
+function runV1ApparelArticleAcceptedOptions() {
+  console.log("Case 37: v1 Apparel Article accepted options gate operator overrides");
+  // v1 schema as it would arrive from GET /v1/categories/Apparel
+  const v1Raw = {
+    name: "Apparel",
+    properties: [
+      {
+        key: "gender",
+        designation: "required",
+        name: "Gender",
+        kind: "enumerable",
+        data: { values: ["Men", "Women", "Unisex"] },
+      },
+      {
+        key: "age",
+        designation: "required",
+        name: "Age",
+        kind: "enumerable",
+        data: { values: ["Adult", "Kids"] },
+      },
+      {
+        key: "apparel_type",
+        designation: "required",
+        name: "Apparel Type",
+        kind: "enumerable",
+        data: { values: ["Outerwear", "Pants", "Shirts"] },
+      },
+      {
+        key: "detailed_description",
+        designation: "required",
+        name: "Detailed Description",
+        kind: "string",
+        data: {},
+      },
+      {
+        key: "total_number_of_pieces",
+        designation: "required",
+        name: "Total Number of Pieces",
+        kind: "string",
+        data: {},
+      },
+      {
+        key: "color",
+        designation: "required",
+        name: "Color",
+        kind: "string",
+        data: {},
+      },
+      {
+        key: "article",
+        designation: "required",
+        name: "Article",
+        kind: "enumerable",
+        data: { values: ["Outerwear", "Jackets", "Pants"] },
+      },
+    ],
+  };
+  const v1Descriptors = normalizeV1CategorySchema(v1Raw);
+  assert(v1Descriptors.length === 7, `v1 normalizer returns 7 descriptors (got ${v1Descriptors.length})`);
+  const articleDesc = v1Descriptors.find((p) => p.field === "Article");
+  assert(
+    articleDesc !== undefined && (articleDesc.options || []).length === 3,
+    `Article options sourced from data.values`,
+  );
+  // None of the v1-sourced descriptors carry options_unverified — they are
+  // verified by Jomashop.
+  for (const p of v1Descriptors) {
+    assert(
+      p.options_unverified !== true,
+      `v1 descriptor "${p.field}" is not options_unverified`,
+    );
+  }
+
+  // Build a Canada Goose OUTW Kids Apparel product analogous to the live
+  // catalog. Article carries no explicit metafield, so the mapper falls
+  // through to the raw_category_code (OUTW) for override resolution.
+  const outwProduct: ShopifyProduct = {
+    id: "shopify-outw-37",
+    title: "Canada Goose Kids Lodge Jacket",
+    body_html: "<p>Canada Goose Lodge Jacket for kids.</p>",
+    vendor: "Canada Goose",
+    product_type: "OUTW",
+    tags: ["Kids"],
+    images: [],
+    options: [{ name: "Size", values: ["M"] }],
+    variants: [
+      {
+        id: 9901,
+        sku: "CG-OUTW-KIDS-M",
+        price: "550.00",
+        inventory_quantity: 1,
+        option1: "M",
+      },
+    ],
+    metafields: [
+      { namespace: "custom", key: "color", value: "Navy", name: "Color" },
+      { namespace: "custom", key: "ff_country_of_origin", value: "Italy" },
+    ],
+  };
+
+  // (a) verified mapping OUTW → "Outerwear" (in v1 data.values) flows through.
+  const accepting = mapShopifyToJomashop(outwProduct, v1Descriptors, "Apparel", {
+    resolveEnumOverride: makeTestEnumResolver({
+      "apparel|article|outw": "Outerwear",
+    }),
+  });
+  assert(
+    accepting.properties.Article === "Outerwear",
+    `Case 37a: properties.Article === "Outerwear" (v1 confirmed) (got ${JSON.stringify(accepting.properties.Article)})`,
+  );
+  assert(
+    !(accepting.missing_required || []).includes("Article"),
+    `Case 37a: Article not blocked when v1 confirms the target (got ${JSON.stringify(accepting.missing_required)})`,
+  );
+
+  // (b) Build a product whose Article candidate is NOT in v1 data.values
+  //     and whose operator mapping targets a value also NOT in v1 data.values
+  //     ("Tuxedos" — Article only lists Outerwear/Jackets/Pants here). The
+  //     accepted-options gate must reject the bogus mapping; preflight then
+  //     surfaces Article as missing with the v1 accepted-options list ready
+  //     to be shown to the operator.
+  const sockProduct: ShopifyProduct = {
+    ...outwProduct,
+    id: "shopify-sock-37b",
+    product_type: "SOCK",
+    title: "Canada Goose Wool Socks",
+    metafields: [
+      // Explicit Article metafield value that's not in v1 data.values; the
+      // mapper would otherwise try to coerce it.
+      { namespace: "custom", key: "Article", value: "Socks" },
+      { namespace: "custom", key: "color", value: "Black", name: "Color" },
+    ],
+  };
+  const blocked = mapShopifyToJomashop(sockProduct, v1Descriptors, "Apparel", {
+    resolveEnumOverride: makeTestEnumResolver({
+      // Operator mapping targets "Tuxedos" — also not in v1 data.values, so
+      // it's rejected by the live accepted-options gate.
+      "apparel|article|sock": "Tuxedos",
+      "apparel|article|socks": "Tuxedos",
+    }),
+  });
+  assert(
+    blocked.properties.Article === undefined || blocked.properties.Article === null,
+    `Case 37b: Article dropped when override target is not in v1 data.values (got ${JSON.stringify(blocked.properties.Article)})`,
+  );
+  assert(
+    (blocked.missing_required || []).includes("Article"),
+    `Case 37b: missing_required surfaces Article (got ${JSON.stringify(blocked.missing_required)})`,
+  );
+  // The v1 descriptor still carries the canonical accepted list so the
+  // preflight 422 response (and /api/jomashop/category-enum-options/Apparel)
+  // can show the operator the exact accepted set.
+  const acceptedFromDescriptor = articleDesc!.options || [];
+  assert(
+    acceptedFromDescriptor.includes("Outerwear") && acceptedFromDescriptor.includes("Jackets"),
+    `Case 37b: accepted options derivable from v1 descriptor (got ${acceptedFromDescriptor.join(", ")})`,
+  );
+}
+
 runColorNavyCase();
 runDefinitionNameOnlyCase();
 runVariantSelectedOptionFallback();
@@ -2605,6 +2841,8 @@ runCanadaGooseOutwBlocksWithoutVerifiedMapping();
 runUnverifiedBuiltInSeedIsRejected();
 runVerifiedMappingRespectsAcceptedOrOperatorVerified();
 runFootwearHandbagsRequiredEnumRegression();
+runV1SchemaNormalization();
+runV1ApparelArticleAcceptedOptions();
 
 if (failures > 0) {
   console.error(`\n${failures} assertion(s) failed.`);
