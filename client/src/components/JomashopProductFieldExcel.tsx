@@ -48,6 +48,7 @@ type PreviewRow = {
 type PreviewResponse = {
   ok: boolean;
   sessionId: string;
+  forceWriteback?: boolean;
   headerErrors: string[];
   perCategoryWarnings: string[];
   totals: {
@@ -55,6 +56,7 @@ type PreviewResponse = {
     valid: number;
     errors: number;
     writeback: number;
+    pushReady?: number;
     metafieldsFillable: number;
   };
   rows: PreviewRow[];
@@ -67,6 +69,9 @@ type ApplyResponse = {
   skippedInvalidRows: number;
   cacheInvalidatedFor: string | null;
   shopifyConnected: boolean;
+  forceWriteback?: boolean;
+  pushReadyRowIds?: string[];
+  pushReadyCount?: number;
   metafieldWriteSummary: { attempted: number; succeeded: number; failed: number };
   metafieldWrites: Array<{
     rowId: string;
@@ -89,6 +94,7 @@ export function JomashopProductFieldExcelCard() {
   const [exportError, setExportError] = useState<string | null>(null);
   const [exportInfo, setExportInfo] = useState<string | null>(null);
   const [includeAll, setIncludeAll] = useState(false);
+  const [forceWriteback, setForceWriteback] = useState(false);
 
   const exportMut = useMutation({
     mutationFn: async () => {
@@ -131,6 +137,7 @@ export function JomashopProductFieldExcelCard() {
     mutationFn: async (file: File): Promise<PreviewResponse> => {
       const form = new FormData();
       form.append("file", file);
+      if (forceWriteback) form.append("forceWriteback", "true");
       const res = await fetch("/api/jomashop-product-fields/import-preview", {
         method: "POST",
         headers: authHeaders(),
@@ -154,6 +161,7 @@ export function JomashopProductFieldExcelCard() {
       const res = await apiRequest("POST", "/api/jomashop-product-fields/apply", {
         sessionId: preview.sessionId,
         confirm: true,
+        forceWriteback,
       });
       return (await res.json()) as ApplyResponse;
     },
@@ -197,6 +205,15 @@ export function JomashopProductFieldExcelCard() {
               data-testid="checkbox-product-field-include-all"
             />
             Include push-ready products too
+          </label>
+          <label className="flex items-center gap-2 text-xs">
+            <input
+              type="checkbox"
+              checked={forceWriteback}
+              onChange={(e) => setForceWriteback(e.target.checked)}
+              data-testid="checkbox-product-field-force-writeback"
+            />
+            Writeback every filled value (ignore blank Write Back? cells)
           </label>
           <Button
             onClick={() => exportMut.mutate()}
@@ -260,6 +277,7 @@ export function JomashopProductFieldExcelCard() {
               </Badge>
               <Badge variant="outline" className="gap-1">
                 {preview.totals.writeback} writeback row(s)
+                {forceWriteback ? " (forced)" : ""}
               </Badge>
               <Badge variant="outline" className="gap-1">
                 {preview.totals.metafieldsFillable} cell(s) to write

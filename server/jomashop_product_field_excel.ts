@@ -26,7 +26,7 @@ import type { Express } from "express";
 import multer from "multer";
 
 import { storage } from "./storage";
-import { FALLBACK_CATEGORY_SCHEMAS } from "@shared/schema";
+import { FALLBACK_CATEGORY_SCHEMAS, SUPPORTED_CATEGORIES } from "@shared/schema";
 import {
   getV1CategoryDescriptors,
   resolveCategoryRecord,
@@ -563,6 +563,26 @@ export async function buildProductFieldWorkbook(
     optionColByKey.set(`${oc.category}::${oc.field}`, oc);
   }
 
+  // Hidden _Meta sheet: explicit (sanitized sheet name -> canonical Jomashop
+  // category) mapping. Lets upload parsing resolve a sheet to its category
+  // even when the server-side live product cache is empty, stale, or the
+  // category list temporarily can't be fetched. Header row is bold but the
+  // sheet is hidden so the operator never sees it. Column 1 = sheet name,
+  // column 2 = canonical category name.
+  const metaSheet = wb.addWorksheet("_Meta");
+  metaSheet.state = "hidden";
+  metaSheet.columns = [
+    { header: "Sheet Name", key: "sheet_name", width: 32 },
+    { header: "Jomashop Category", key: "category", width: 32 },
+  ];
+  metaSheet.getRow(1).font = { bold: true };
+  for (const cat of agg.categories) {
+    metaSheet.addRow({
+      sheet_name: sanitizeSheetName(cat.category),
+      category: cat.category,
+    });
+  }
+
   // Accepted Options helper sheet — human-readable reference. Kept even
   // though dropdowns now cover all enum lengths, because operators
   // sometimes need to copy-paste large lists or cross-check the published
@@ -868,6 +888,59 @@ export type ParseProductFieldUploadResult = {
   perCategoryWarnings: string[];
 };
 
+export type ParseProductFieldUploadOptions = {
+  /**
+   * When true, every row that has at least one filled editable field value
+   * is treated as if its `Write Back?` cell were "Yes". The per-row cell
+   * value still wins when it is explicitly "No" — operators can opt out of
+   * the global writeback by setting Write Back? = No on individual rows.
+   */
+  forceWriteback?: boolean;
+};
+
+/**
+ * Resolve a workbook sheet name to its canonical Jomashop category.
+ *
+ * Precedence:
+ *   1. Hidden `_Meta` sheet shipped by the exporter — authoritative when
+ *      present. Allows imports to work even if the live product cache is
+ *      empty / stale / unreachable.
+ *   2. Exact match against the live agg snapshot (sanitized sheet name and
+ *      raw category name).
+ *   3. Exact match against the static SUPPORTED_CATEGORIES list (case- and
+ *      whitespace-insensitive), so the importer accepts every category we
+ *      ship, regardless of agg / live state.
+ *
+ * Returns null when no canonical category is found.
+ */
+export function resolveSheetCategory(
+  sheetName: string,
+  opts: {
+    metaMap?: Map<string, string>;
+    aggCategories?: Iterable<string>;
+  } = {},
+): string | null {
+  const norm = (s: string) => s.toLowerCase().trim().replace(/\s+/g, " ");
+  const sheetKey = norm(sheetName);
+  if (opts.metaMap) {
+    // _Meta lookup — both sanitized and raw forms.
+    const direct = opts.metaMap.get(sheetKey);
+    if (direct) return direct;
+  }
+  if (opts.aggCategories) {
+    const arr = Array.from(opts.aggCategories);
+    for (const cat of arr) {
+      if (norm(sanitizeSheetName(cat)) === sheetKey) return cat;
+      if (norm(cat) === sheetKey) return cat;
+    }
+  }
+  for (const cat of SUPPORTED_CATEGORIES) {
+    if (norm(sanitizeSheetName(cat)) === sheetKey) return cat;
+    if (norm(cat) === sheetKey) return cat;
+  }
+  return null;
+}
+
 function readCell(cell: ExcelJS.Cell): string {
   const v = cell.value;
   if (v === null || v === undefined) return "";
@@ -887,35 +960,83 @@ function readCell(cell: ExcelJS.Cell): string {
 export async function parseProductFieldUpload(
   buffer: Buffer,
   agg: ProductFieldExportResult,
+  options: ParseProductFieldUploadOptions = {},
 ): Promise<ParseProductFieldUploadResult> {
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.load(buffer);
   const headerErrors: string[] = [];
   const perCategoryWarnings: string[] = [];
   const rows: ParsedProductFieldRow[] = [];
+  const forceWriteback = options.forceWriteback === true;
 
-  // Build a map of category name -> live schema fields, for validation.
-  const aggByCategory = new Map<string, ProductFieldExportResult["categories"][number]>();
-  for (const c of agg.categories) {
-    aggByCategory.set(sanitizeSheetName(c.category).toLowerCase(), c);
+  // Index agg categories by canonical category name for live-schema lookup.
+  const aggByCategoryName = new Map<string, ProductFieldExportResult["categories"][number]>();
+  for (const c of agg.categories) aggByCategoryName.set(c.category, c);
+
+  // Pull explicit (sheet -> category) mappings from the hidden _Meta sheet
+  // when present. This makes the parser robust against an empty / stale
+  // live product cache (the prior implementation would fail to resolve any
+  // sheet at all in that case, producing zero-row imports).
+  const metaSheetWs = wb.getWorksheet("_Meta");
+  const metaMap = new Map<string, string>();
+  if (metaSheetWs) {
+    const normKey = (s: string) => s.toLowerCase().trim().replace(/\s+/g, " ");
+    for (let r = 2; r <= metaSheetWs.rowCount; r++) {
+      const sn = readCell(metaSheetWs.getRow(r).getCell(1));
+      const cat = readCell(metaSheetWs.getRow(r).getCell(2));
+      if (sn && cat) metaMap.set(normKey(sn), cat);
+    }
   }
-  // Also key by raw category name for the case where the operator renamed
-  // the sheet to match the live category exactly.
-  for (const c of agg.categories) {
-    aggByCategory.set(c.category.toLowerCase(), c);
-  }
+
+  // Cache schemas loaded lazily for sheets whose category isn't in agg
+  // (e.g. operator uploaded a fully-filled workbook for an empty cache).
+  const lazySchemas = new Map<
+    string,
+    { fields: SchemaPropertyDescriptor[]; source: "live-v1" | "live-i1" | "fallback" | "unknown" }
+  >();
 
   for (const ws of wb.worksheets) {
-    if (ws.name === "Instructions" || ws.name === "Accepted Options" || ws.name === "No Products") {
+    if (
+      ws.name === "Instructions" ||
+      ws.name === "Accepted Options" ||
+      ws.name === "No Products" ||
+      ws.name === "_Options" ||
+      ws.name === "_Meta"
+    ) {
       continue;
     }
-    const sheetKey = ws.name.toLowerCase();
-    const cat = aggByCategory.get(sheetKey);
-    if (!cat) {
+    const categoryName = resolveSheetCategory(ws.name, {
+      metaMap,
+      aggCategories: agg.categories.map((c) => c.category),
+    });
+    if (!categoryName) {
       perCategoryWarnings.push(
         `Sheet "${ws.name}" doesn't match any known Jomashop category; skipping.`,
       );
       continue;
+    }
+    let cat = aggByCategoryName.get(categoryName);
+    if (!cat) {
+      // Live cache had nothing for this category. Load the schema on demand
+      // so we can still validate rows (and at least surface them for
+      // writeback). Fields list is sourced live when possible, otherwise
+      // from the bundled fallback. Reuses the same loader the exporter
+      // uses.
+      let schemaEntry = lazySchemas.get(categoryName);
+      if (!schemaEntry) {
+        schemaEntry = await loadLiveSchemaForCategory(categoryName);
+        lazySchemas.set(categoryName, schemaEntry);
+      }
+      const cleanFields = schemaEntry.fields.filter(
+        (f) => f && typeof f.field === "string" && f.field.trim() !== "" && f.field !== "undefined",
+      );
+      cat = {
+        category: categoryName,
+        fields: cleanFields,
+        fieldsSource: schemaEntry.source,
+        rows: [],
+      };
+      aggByCategoryName.set(categoryName, cat);
     }
 
     // Build column-by-header lookup.
@@ -1060,8 +1181,21 @@ export async function parseProductFieldUpload(
           }
         }
       }
-      const writeBackRaw = get(r, "Write Back?").toLowerCase();
-      const writeBack = writeBackRaw === "yes" || writeBackRaw === "y" || writeBackRaw === "true";
+      const writeBackRaw = get(r, "Write Back?").toLowerCase().trim();
+      const rowSaysNo =
+        writeBackRaw === "no" || writeBackRaw === "n" || writeBackRaw === "false";
+      const rowSaysYes =
+        writeBackRaw === "yes" || writeBackRaw === "y" || writeBackRaw === "true";
+      // Per-row Write Back? wins when explicitly set. When blank AND the
+      // global forceWriteback flag is on, treat rows with at least one
+      // filled value as writeback candidates. This is the "global writeback
+      // for a completed workbook" path requested by operators who don't
+      // want to mark every row by hand.
+      const writeBack = rowSaysYes
+        ? true
+        : rowSaysNo
+        ? false
+        : forceWriteback && anyValue;
       rows.push({
         rowNumber: r,
         sheetName: ws.name,
@@ -1165,6 +1299,8 @@ type Session = {
   createdAt: number;
   rows: ParsedProductFieldRow[];
   aggSnapshot: ProductFieldExportResult;
+  /** Whether the preview was parsed with forceWriteback on. */
+  forceWriteback: boolean;
 };
 const SESSION_TTL_MS = 60 * 60 * 1000;
 const SESSIONS = new Map<string, Session>();
@@ -1285,21 +1421,39 @@ export function registerJomashopProductFieldExcelRoutes(app: Express): void {
         return res.status(400).json({ ok: false, error: "Missing uploaded file." });
       }
       try {
+        // forceWriteback accepted via multipart field (string "true"/"1"),
+        // body field, or `?forceWriteback=1` query string. Multipart field
+        // is the natural form to send alongside the file from a browser.
+        const fwRaw =
+          (req.body && (req.body.forceWriteback ?? req.body.writebackAllFilled)) ??
+          (req.query?.forceWriteback ?? req.query?.writebackAllFilled);
+        const forceWriteback =
+          fwRaw === true ||
+          fwRaw === "1" ||
+          (typeof fwRaw === "string" && fwRaw.toLowerCase() === "true") ||
+          (typeof fwRaw === "string" && fwRaw.toLowerCase() === "yes");
         const agg = await aggregateProductFieldRows({ includeAll: true });
-        const parsed = await parseProductFieldUpload(file.buffer, agg);
+        const parsed = await parseProductFieldUpload(file.buffer, agg, {
+          forceWriteback,
+        });
         const sessionId = newSessionId();
         SESSIONS.set(sessionId, {
           id: sessionId,
           createdAt: Date.now(),
           rows: parsed.rows,
           aggSnapshot: agg,
+          forceWriteback,
         });
         const validRows = parsed.rows.filter((r) => r.isValid);
         const errorRows = parsed.rows.filter((r) => !r.isValid);
         const writebackRows = validRows.filter((r) => r.writeBack);
+        const pushReadyRows = validRows.filter(
+          (r) => Object.keys(r.fieldValues).length > 0,
+        );
         res.json({
           ok: parsed.headerErrors.length === 0,
           sessionId,
+          forceWriteback,
           headerErrors: parsed.headerErrors,
           perCategoryWarnings: parsed.perCategoryWarnings,
           totals: {
@@ -1307,6 +1461,7 @@ export function registerJomashopProductFieldExcelRoutes(app: Express): void {
             valid: validRows.length,
             errors: errorRows.length,
             writeback: writebackRows.length,
+            pushReady: pushReadyRows.length,
             metafieldsFillable: validRows.reduce(
               (acc, r) => acc + Object.keys(r.fieldValues).length,
               0,
@@ -1342,6 +1497,9 @@ export function registerJomashopProductFieldExcelRoutes(app: Express): void {
       sessionId?: string;
       confirm?: boolean;
       ignoreErrors?: boolean;
+      forceWriteback?: boolean;
+      writebackAllFilled?: boolean;
+      pushReady?: boolean;
     };
     if (!body.confirm) {
       return res.status(400).json({
@@ -1359,6 +1517,14 @@ export function registerJomashopProductFieldExcelRoutes(app: Express): void {
         .json({ ok: false, error: "Session not found or expired. Re-upload the XLSX." });
     }
     const ignoreErrors = body.ignoreErrors === true;
+    // Apply-time forceWriteback: when true, every valid row that carries at
+    // least one filled field value is treated as if Write Back? = Yes,
+    // regardless of what was on the row. Honors the existing session-level
+    // flag from import-preview when not overridden here.
+    const forceWriteback =
+      body.forceWriteback === true ||
+      body.writebackAllFilled === true ||
+      session.forceWriteback === true;
     const validRows = session.rows.filter((r) => r.isValid || ignoreErrors);
     const skippedInvalid = session.rows.length - validRows.length;
 
@@ -1387,9 +1553,12 @@ export function registerJomashopProductFieldExcelRoutes(app: Express): void {
       }
     }
 
+    const pushReadyRowIds: string[] = [];
     if (conn) {
       for (const row of validRows) {
-        if (!row.writeBack) continue;
+        const effectiveWriteBack =
+          row.writeBack || (forceWriteback && Object.keys(row.fieldValues).length > 0);
+        if (!effectiveWriteBack) continue;
         const overrides = targetsByRowId.get(row.rowId);
         for (const [fieldName, value] of Object.entries(row.fieldValues)) {
           if (!value) continue;
@@ -1441,8 +1610,10 @@ export function registerJomashopProductFieldExcelRoutes(app: Express): void {
             ok: result.ok,
             error: result.ok ? null : result.error,
           });
-          if (result.ok) succeeded++;
-          else failed++;
+          if (result.ok) {
+            succeeded++;
+            if (!pushReadyRowIds.includes(row.rowId)) pushReadyRowIds.push(row.rowId);
+          } else failed++;
         }
       }
     }
@@ -1480,8 +1651,15 @@ export function registerJomashopProductFieldExcelRoutes(app: Express): void {
       skippedInvalidRows: skippedInvalid,
       cacheInvalidatedFor: shopDomain,
       shopifyConnected: Boolean(conn),
+      forceWriteback,
       metafieldWriteSummary: { attempted, succeeded, failed },
       metafieldWrites: writes,
+      // Rows that successfully wrote at least one metafield are now
+      // candidates for a Jomashop push. The UI / orchestrator decides
+      // whether to actually push; we do NOT push from this route unless
+      // the caller explicitly opted in (see /api/jomashop/push-...).
+      pushReadyRowIds,
+      pushReadyCount: pushReadyRowIds.length,
       warnings: !conn
         ? ["No connected Shopify store — metafield writes were skipped."]
         : [],

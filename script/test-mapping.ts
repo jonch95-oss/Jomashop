@@ -64,6 +64,7 @@ import {
   fieldIsParentSku,
   fieldIsVariantTargeted,
   buildOptionsRangeName,
+  resolveSheetCategory,
   type ProductFieldExportResult,
 } from "../server/jomashop_product_field_excel";
 
@@ -4598,6 +4599,238 @@ async function runParentSkuUploadWritebackTarget() {
   );
 }
 
+// ---------- Case 50: import-preview sheet recognition + forceWriteback ----
+//
+// Reproduces the user-reported bug where a completed per-product workbook
+// uploaded to /api/jomashop-product-fields/import-preview produced
+// "Sheet 'Accessories' doesn't match any known Jomashop category; skipping"
+// for every category sheet, despite the sheet names matching the exporter's
+// output exactly. Root cause: the parser keyed its sheet -> category map
+// solely off of the in-memory `agg` snapshot, which is empty when the
+// product cache has been invalidated. The fix routes resolution through
+// SUPPORTED_CATEGORIES + a hidden _Meta sheet stamped at export time, so
+// the parser always recognizes the workbook's own sheets.
+//
+// Also exercises the new forceWriteback flag: with Write Back? cells blank,
+// `parseProductFieldUpload(..., { forceWriteback: true })` flips
+// writeBack=true on rows that have at least one filled field value.
+async function runProductFieldSheetRecognitionAndForceWriteback() {
+  console.log(
+    "Case 50: sheet recognition for actual category names + forceWriteback for blank Write Back? cells",
+  );
+
+  // 50a: resolveSheetCategory matches each canonical category from the
+  // SUPPORTED_CATEGORIES list, including spaced + ampersand variants.
+  const canonicalSheetNames = [
+    "Accessories",
+    "Apparel",
+    "Footwear",
+    "Handbags",
+    "Home Decor",
+    "Pins & Brooches",
+  ];
+  for (const name of canonicalSheetNames) {
+    const resolved = resolveSheetCategory(name);
+    assert(
+      resolved === name,
+      `Case 50a: resolveSheetCategory("${name}") === "${name}" (got ${JSON.stringify(resolved)})`,
+    );
+  }
+
+  // 50b: case + whitespace insensitive — operator-typed "home decor" still
+  // resolves to canonical "Home Decor".
+  assert(
+    resolveSheetCategory("home decor") === "Home Decor",
+    `Case 50b: case-insensitive resolution for "home decor"`,
+  );
+  assert(
+    resolveSheetCategory("pins & brooches") === "Pins & Brooches",
+    `Case 50b2: case-insensitive resolution for ampersand sheet name`,
+  );
+
+  // 50c: empty agg snapshot — the exact failure mode reported by the user.
+  // Build a workbook with the actual sheet names, then parse with an empty
+  // agg. Should still resolve every sheet to a known category and surface
+  // at least one parsed row per sheet.
+  const ExcelJS = (await import("exceljs")).default;
+  const aggForExport: ProductFieldExportResult = {
+    shopDomain: "test.myshopify.com",
+    fromCache: true,
+    cachedAt: Date.now(),
+    totalProducts: canonicalSheetNames.length,
+    includedAll: true,
+    categories: canonicalSheetNames.map((category, idx) => ({
+      category,
+      fieldsSource: "fallback" as const,
+      fields: [
+        { field: "Color", label: "Color", required: false, type: "string" as const },
+      ],
+      rows: [
+        {
+          rowId: `row-${idx}-001`,
+          jomashopCategory: category,
+          shopifyProductId: `${1000 + idx}`,
+          shopifyVariantId: `${2000 + idx}`,
+          productTitle: `Test ${category} Product`,
+          vendorSku: `VS-${idx}`,
+          manufacturerNumber: `MFR-${idx}`,
+          brand: "Test Brand",
+          shopifyCategoryCode: `CAT-${idx}`,
+          shopifyProductType: `CAT-${idx}`,
+          jomashopCategoryId: `${100 + idx}`,
+          jomashopBrandId: `${200 + idx}`,
+          pushStatus: "needs-fill",
+          warnings: "",
+          fieldValues: { Color: "" },
+          isVariant: false,
+        },
+      ],
+    })),
+  };
+
+  const buf = await buildProductFieldWorkbook(aggForExport);
+
+  // Confirm the exported workbook carries every requested sheet by name —
+  // proves we're testing the exact same sheet names the user uploaded.
+  const wbCheck = new ExcelJS.Workbook();
+  await wbCheck.xlsx.load(buf);
+  const sheetNames = wbCheck.worksheets.map((w) => w.name);
+  for (const expected of canonicalSheetNames) {
+    assert(
+      sheetNames.includes(expected),
+      `Case 50c: workbook export carries sheet "${expected}" (got ${sheetNames.join(", ")})`,
+    );
+  }
+  // Hidden _Meta sheet present + populated.
+  const metaSheet = wbCheck.getWorksheet("_Meta");
+  assert(metaSheet !== undefined, "Case 50c2: hidden _Meta sheet is present in the export");
+  assert(
+    (metaSheet as any).state === "hidden" || (metaSheet as any).state === "veryHidden",
+    `Case 50c3: _Meta sheet is hidden (state=${(metaSheet as any).state})`,
+  );
+
+  // 50d: fill one cell per sheet (NO Write Back? cell set) and parse with
+  // an EMPTY agg — exactly the failure mode reported in production.
+  const wbFill = new ExcelJS.Workbook();
+  await wbFill.xlsx.load(buf);
+  for (const name of canonicalSheetNames) {
+    const ws = wbFill.getWorksheet(name)!;
+    const headerCols: Record<string, number> = {};
+    ws.getRow(1).eachCell((cell, c) => {
+      headerCols[String(cell.value)] = c;
+    });
+    // Drop a value into Color so the row is non-empty (writeback candidate).
+    ws.getRow(2).getCell(headerCols["Color"]).value = "Black";
+    // Explicitly do NOT touch Write Back? — that's the bug condition.
+  }
+  const filledBuf = Buffer.from(await wbFill.xlsx.writeBuffer());
+
+  const emptyAgg: ProductFieldExportResult = {
+    shopDomain: null,
+    fromCache: false,
+    cachedAt: null,
+    totalProducts: 0,
+    includedAll: true,
+    categories: [],
+  };
+
+  const parsedEmpty = await parseProductFieldUpload(filledBuf, emptyAgg);
+  // Every sheet must produce at least one parsed row — no "doesn't match"
+  // warnings.
+  for (const expected of canonicalSheetNames) {
+    const rowForSheet = parsedEmpty.rows.find((r) => r.jomashopCategory === expected);
+    assert(
+      rowForSheet !== undefined,
+      `Case 50d: sheet "${expected}" parsed at least one row with empty agg (warnings=${JSON.stringify(parsedEmpty.perCategoryWarnings)})`,
+    );
+  }
+  assert(
+    parsedEmpty.perCategoryWarnings.length === 0,
+    `Case 50d2: no "doesn't match any known Jomashop category" warnings (got ${JSON.stringify(parsedEmpty.perCategoryWarnings)})`,
+  );
+  assert(
+    parsedEmpty.rows.length >= canonicalSheetNames.length,
+    `Case 50d3: total parsed rows >= number of category sheets (got ${parsedEmpty.rows.length})`,
+  );
+
+  // 50e: with Write Back? blank everywhere, default parse leaves writeBack
+  // = false. forceWriteback flips it for rows that have at least one
+  // filled cell.
+  for (const row of parsedEmpty.rows) {
+    assert(
+      row.writeBack === false,
+      `Case 50e: default writeBack=false when Write Back? cell is blank (sheet=${row.sheetName})`,
+    );
+  }
+
+  const parsedForced = await parseProductFieldUpload(filledBuf, emptyAgg, {
+    forceWriteback: true,
+  });
+  const forcedRows = parsedForced.rows.filter(
+    (r) => Object.keys(r.fieldValues).length > 0,
+  );
+  assert(
+    forcedRows.length >= canonicalSheetNames.length,
+    `Case 50f: forceWriteback parse surfaces every filled row (got ${forcedRows.length})`,
+  );
+  for (const row of forcedRows) {
+    assert(
+      row.writeBack === true,
+      `Case 50f2: forceWriteback flips writeBack=true on filled rows (sheet=${row.sheetName}, fieldValues=${JSON.stringify(row.fieldValues)})`,
+    );
+  }
+
+  // 50g: forceWriteback does NOT override an explicit Write Back? = No.
+  const wbWithNo = new ExcelJS.Workbook();
+  await wbWithNo.xlsx.load(buf);
+  const apparelWs = wbWithNo.getWorksheet("Apparel")!;
+  const apparelHdrs: Record<string, number> = {};
+  apparelWs.getRow(1).eachCell((c, idx) => {
+    apparelHdrs[String(c.value)] = idx;
+  });
+  apparelWs.getRow(2).getCell(apparelHdrs["Color"]).value = "Red";
+  apparelWs.getRow(2).getCell(apparelHdrs["Write Back?"]).value = "No";
+  const noBuf = Buffer.from(await wbWithNo.xlsx.writeBuffer());
+  const parsedNo = await parseProductFieldUpload(noBuf, emptyAgg, {
+    forceWriteback: true,
+  });
+  const noRow = parsedNo.rows.find((r) => r.jomashopCategory === "Apparel")!;
+  assert(
+    noRow.writeBack === false,
+    `Case 50g: explicit Write Back? = No wins over forceWriteback (got ${noRow.writeBack})`,
+  );
+
+  // 50h: workbook with NO _Meta sheet (e.g. an older export the user
+  // already has on disk) still resolves all sheets via the static
+  // SUPPORTED_CATEGORIES fallback.
+  const wbNoMeta = new ExcelJS.Workbook();
+  await wbNoMeta.xlsx.load(buf);
+  // Older exports never had a _Meta sheet. Simulate that by removing it
+  // before re-parsing.
+  const metaWs = wbNoMeta.getWorksheet("_Meta");
+  if (metaWs) wbNoMeta.removeWorksheet(metaWs.id);
+  // Fill a value too.
+  const handbagsWs = wbNoMeta.getWorksheet("Handbags")!;
+  const handbagsHdrs: Record<string, number> = {};
+  handbagsWs.getRow(1).eachCell((c, idx) => {
+    handbagsHdrs[String(c.value)] = idx;
+  });
+  handbagsWs.getRow(2).getCell(handbagsHdrs["Color"]).value = "Beige";
+  const noMetaBuf = Buffer.from(await wbNoMeta.xlsx.writeBuffer());
+  const parsedNoMeta = await parseProductFieldUpload(noMetaBuf, emptyAgg);
+  const handbagsRowNoMeta = parsedNoMeta.rows.find(
+    (r) => r.jomashopCategory === "Handbags",
+  );
+  assert(
+    handbagsRowNoMeta !== undefined,
+    `Case 50h: workbook without _Meta still resolves Handbags via SUPPORTED_CATEGORIES fallback (warnings=${JSON.stringify(parsedNoMeta.perCategoryWarnings)})`,
+  );
+  assert(
+    parsedNoMeta.perCategoryWarnings.length === 0,
+    `Case 50h2: still no "doesn't match" warnings (got ${JSON.stringify(parsedNoMeta.perCategoryWarnings)})`,
+  );
+}
+
 runColorNavyCase();
 runDefinitionNameOnlyCase();
 runVariantSelectedOptionFallback();
@@ -4648,6 +4881,7 @@ await runParentSkuUploadWritebackTarget();
 await runJomashopMappingExcelHelpers();
 await runJomashopProductFieldExcelHelpers();
 await runProductFieldDropdownCoverage();
+await runProductFieldSheetRecognitionAndForceWriteback();
 
 if (failures > 0) {
   console.error(`\n${failures} assertion(s) failed.`);
