@@ -55,6 +55,7 @@ import {
   listBuiltInSeeds,
 } from "./enum_mapping";
 import { registerResolutionAuditRoutes } from "./resolution_audit";
+import { registerJomashopMappingExcelRoutes } from "./jomashop_mapping_excel";
 import { registerWebhookRoutes, registerShopifyWebhooks } from "./webhooks";
 import { logMemory } from "./memlog";
 
@@ -2831,6 +2832,16 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   // ---------- Brand & category resolution audit (XLSX export / import / apply) ----------
   registerResolutionAuditRoutes(app);
+
+  // ---------- Bulk Jomashop mapping XLSX workflow ----------
+  // Aggregates every unresolved Jomashop required/recommended enum mapping
+  // across the cached product preview into a single XLSX. Operator fills the
+  // accepted Jomashop value (validated against the live v1 accepted-options
+  // list on upload), then the apply step creates verified enum_overrides,
+  // invalidates the product cache so the next preview rebuild picks up the
+  // new mappings for ALL existing cached products in bulk, and optionally
+  // writes the accepted value back to the Shopify product metafield.
+  registerJomashopMappingExcelRoutes(app);
 
   // ---------- Shopify webhooks (public, HMAC-verified) ----------
   registerWebhookRoutes(app);

@@ -46,6 +46,13 @@ import {
   normalizeEnumSourceValue,
 } from "../server/enum_mapping";
 import { FALLBACK_CATEGORY_SCHEMAS, SUPPORTED_CATEGORIES } from "../shared/schema";
+import {
+  buildMappingWorkbook,
+  parseMappingUpload,
+  deriveDefaultMetafieldTarget,
+  type AggregateMappingsResult,
+  type MappingRowExportRecord,
+} from "../server/jomashop_mapping_excel";
 
 // Pure (storage-free) enum override resolver that mimics the production
 // lookupEnumOverride for tests. Mirrors the strict trust gate used in
@@ -3237,6 +3244,174 @@ function runOperatorOverrideBeatsSynonym() {
   );
 }
 
+// ---------- Jomashop mapping XLSX workflow helpers ----------
+// Exercises pure logic in server/jomashop_mapping_excel.ts:
+//   - buildMappingWorkbook produces an XLSX with the expected rows / headers
+//   - parseMappingUpload validates user_value against accepted options
+//     (rejects values not in the live list, accepts values in the list,
+//     accepts free-text when no live list is available)
+//   - deriveDefaultMetafieldTarget slugifies property names safely
+//   - Roundtrip: build → parse identifies invalid + valid rows correctly
+async function runJomashopMappingExcelHelpers() {
+  console.log("Case 44: Jomashop mapping XLSX export / upload helpers");
+
+  const sampleRows: MappingRowExportRecord[] = [
+    {
+      rowId: "row-article-outw",
+      jomashopCategory: "Apparel",
+      shopifyCategoryCode: "OUTW",
+      shopifyProductType: "OUTW",
+      jomashopPropertyName: "Article",
+      required: true,
+      currentSourceField: "Shopify category code",
+      currentSourceValue: "OUTW",
+      currentAutoMappedValue: "(none)",
+      statusReason: "Unverified accepted-options list",
+      acceptedJomashopOptions: ["Coats & Jackets", "Jackets", "Pants"],
+      acceptedOptionsSource: "live-v1",
+      exampleProductTitles: ["Canada Goose Parka"],
+      exampleSkus: ["CG-OUTW-1"],
+      productCount: 12,
+      shopifyProductIds: ["111", "222"],
+      currentVerifiedOverride: null,
+    },
+    {
+      rowId: "row-color-handbag",
+      jomashopCategory: "Handbags",
+      shopifyCategoryCode: "BAG",
+      shopifyProductType: "BAG",
+      jomashopPropertyName: "Color",
+      required: true,
+      currentSourceField: "metafield",
+      currentSourceValue: "(empty)",
+      currentAutoMappedValue: "(missing)",
+      statusReason: "Required field is missing",
+      acceptedJomashopOptions: null,
+      acceptedOptionsSource: "unknown",
+      exampleProductTitles: ["Designer Tote"],
+      exampleSkus: ["TT-1"],
+      productCount: 3,
+      shopifyProductIds: ["333"],
+      currentVerifiedOverride: null,
+    },
+  ];
+  const agg: AggregateMappingsResult = {
+    shopDomain: "luxe-test.myshopify.com",
+    fromCache: true,
+    cachedAt: 1700000000000,
+    totalProducts: 15,
+    rows: sampleRows,
+  };
+
+  const buf = await buildMappingWorkbook(agg);
+  assert(buf.length > 0, "Case 44a: workbook export produces a non-empty buffer");
+
+  // Re-parse the same buffer to confirm the round-trip preserves row identity.
+  // Since the operator hasn't filled User Jomashop Value yet, every row should
+  // be flagged invalid with a "Missing User Jomashop Value" error.
+  const reparseEmpty = await parseMappingUpload(buf, agg);
+  assert(
+    reparseEmpty.headerErrors.length === 0,
+    `Case 44b: empty workbook has no header errors (got ${JSON.stringify(reparseEmpty.headerErrors)})`,
+  );
+  assert(
+    reparseEmpty.rows.length === 2,
+    `Case 44c: empty workbook parses 2 rows (got ${reparseEmpty.rows.length})`,
+  );
+  for (const r of reparseEmpty.rows) {
+    assert(
+      !r.isValid && r.errors.some((e) => e.toLowerCase().includes("user jomashop value")),
+      `Case 44d: empty user_value yields a "Missing User Jomashop Value" error for ${r.rowId}`,
+    );
+  }
+
+  // Now build a workbook the operator has filled in: an accepted Apparel
+  // Article value, and a free-text Handbags Color value (no live list).
+  // We re-use ExcelJS directly so we don't have to plumb a write API.
+  const ExcelJS = (await import("exceljs")).default;
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(buf);
+  const ws = wb.getWorksheet("Jomashop Mapping")!;
+  // Find column indexes by header name.
+  const headerCols: Record<string, number> = {};
+  ws.getRow(1).eachCell((cell, col) => {
+    headerCols[String(cell.value)] = col;
+  });
+  const setCell = (rowNum: number, header: string, value: string) => {
+    const col = headerCols[header];
+    if (!col) throw new Error(`Missing header column: ${header}`);
+    ws.getRow(rowNum).getCell(col).value = value;
+  };
+
+  // Row 2 = Article OUTW. Accept a valid option.
+  setCell(2, "User Jomashop Value", "Coats & Jackets");
+  setCell(2, "Write Back To Shopify? (Yes/No)", "Yes");
+  // Row 3 = Color (no live list). Free-text Black is accepted as
+  // operator-verified.
+  setCell(3, "User Jomashop Value", "Black");
+  setCell(3, "Write Back To Shopify? (Yes/No)", "No");
+
+  const filledBuf = Buffer.from(await wb.xlsx.writeBuffer());
+  const parsedFilled = await parseMappingUpload(filledBuf, agg);
+  const articleRow = parsedFilled.rows.find((r) => r.rowId === "row-article-outw")!;
+  const colorRow = parsedFilled.rows.find((r) => r.rowId === "row-color-handbag")!;
+  assert(
+    articleRow.isValid,
+    `Case 44e: accepted Article=Coats & Jackets is valid (errors=${JSON.stringify(articleRow.errors)})`,
+  );
+  assert(
+    articleRow.userValue === "Coats & Jackets",
+    `Case 44f: user_value preserved through roundtrip (got "${articleRow.userValue}")`,
+  );
+  assert(
+    articleRow.writeBack === true,
+    `Case 44g: write_back=Yes parsed to true (got ${articleRow.writeBack})`,
+  );
+  assert(
+    colorRow.isValid,
+    `Case 44h: free-text Color value is valid when no live options exist (errors=${JSON.stringify(colorRow.errors)})`,
+  );
+
+  // Now build a workbook with an INVALID user value (not in accepted list) —
+  // the parser should reject it.
+  const wbInvalid = new ExcelJS.Workbook();
+  await wbInvalid.xlsx.load(buf);
+  const wsInvalid = wbInvalid.getWorksheet("Jomashop Mapping")!;
+  const headerColsInvalid: Record<string, number> = {};
+  wsInvalid.getRow(1).eachCell((cell, col) => {
+    headerColsInvalid[String(cell.value)] = col;
+  });
+  wsInvalid.getRow(2).getCell(headerColsInvalid["User Jomashop Value"]).value = "Sweaters";
+  const invalidBuf = Buffer.from(await wbInvalid.xlsx.writeBuffer());
+  const parsedInvalid = await parseMappingUpload(invalidBuf, agg);
+  const invalidArticle = parsedInvalid.rows.find((r) => r.rowId === "row-article-outw")!;
+  assert(
+    !invalidArticle.isValid,
+    `Case 44i: "Sweaters" rejected (not in accepted list); got errors=${JSON.stringify(invalidArticle.errors)}`,
+  );
+  assert(
+    invalidArticle.errors.some((e) => e.includes("not an accepted Jomashop option")),
+    `Case 44j: rejection mentions accepted-options gate`,
+  );
+
+  // deriveDefaultMetafieldTarget slugifies safely.
+  const t1 = deriveDefaultMetafieldTarget("Article");
+  assert(
+    t1.namespace === "jomashop" && t1.key === "article",
+    `Case 44k: derive("Article") = jomashop.article (got ${JSON.stringify(t1)})`,
+  );
+  const t2 = deriveDefaultMetafieldTarget("Country of Origin");
+  assert(
+    t2.namespace === "jomashop" && t2.key === "country_of_origin",
+    `Case 44l: derive("Country of Origin") = jomashop.country_of_origin (got ${JSON.stringify(t2)})`,
+  );
+  const t3 = deriveDefaultMetafieldTarget("!!!");
+  assert(
+    t3.namespace === "jomashop" && t3.key === "value",
+    `Case 44m: derive falls back to "value" for empty-slug input (got ${JSON.stringify(t3)})`,
+  );
+}
+
 // ---------- Case 43: optional unresolved enum is omitted, not blocked ------
 function runOptionalUnresolvedOmitted() {
   console.log("Case 43: optional unresolved enum is omitted, never blocks preflight");
@@ -3320,6 +3495,7 @@ runFootwearSynonymResolver();
 runHandbagsSynonymResolver();
 runOperatorOverrideBeatsSynonym();
 runOptionalUnresolvedOmitted();
+await runJomashopMappingExcelHelpers();
 
 if (failures > 0) {
   console.error(`\n${failures} assertion(s) failed.`);
