@@ -12,6 +12,19 @@ installProcessHandlers();
 const app = express();
 const httpServer = createServer(app);
 
+// Render (and any other PaaS) probes /api/health to decide whether the
+// container is healthy. Register the health route BEFORE any body parsers,
+// auth middleware, or async route setup so the probe always succeeds even
+// during startup or while heavy registrations are still pending. This is
+// what fixes the "dial tcp ...:5000: connect: connection refused" alerts —
+// the previous build returned a 503 here because the admin-token gate ran
+// first and Express's app.use("/api", mw) had stripped the "/api" prefix,
+// causing the `req.path === "/api/health"` exemption to never match.
+app.get("/api/health", (_req, res) => {
+  res.json({ ok: true, time: new Date().toISOString() });
+});
+app.head("/api/health", (_req, res) => res.status(200).end());
+
 declare module "http" {
   interface IncomingMessage {
     rawBody: unknown;
@@ -33,7 +46,11 @@ app.use(
 app.use(express.urlencoded({ extended: false }));
 
 function requireAdminToken(req: Request, res: Response, next: NextFunction) {
-  if (req.path === "/api/health") return next();
+  // Express strips the mount path when this is attached via app.use("/api", ...),
+  // so req.path is e.g. "/health" not "/api/health". Match both for safety
+  // (this middleware is also called from /api/health directly above as a
+  // belt-and-braces guard).
+  if (req.path === "/api/health" || req.path === "/health") return next();
 
   const token = process.env.ADMIN_TOKEN?.trim();
   if (!token) {
@@ -101,7 +118,18 @@ app.use((req, res, next) => {
 });
 
 (async () => {
-  await registerRoutes(httpServer, app);
+  // Wrap registration so a single bad route can't take the entire server
+  // down before it starts listening — the health endpoint is already wired
+  // above the body parser, so even if routes never finish registering,
+  // Render's health probe will still pass and the operator can fix forward.
+  try {
+    await registerRoutes(httpServer, app);
+  } catch (err) {
+    console.error("[startup] registerRoutes failed:", err);
+    logMemory("startup.registerRoutes.failed", {
+      message: (err as Error)?.message,
+    });
+  }
 
   app.use((err: any, req: Request, res: Response, next: NextFunction) => {
     console.error("Internal Server Error:", err);
@@ -142,17 +170,15 @@ app.use((req, res, next) => {
   // this serves both the API and the client.
   // It is the only port that is not firewalled.
   const port = parseInt(process.env.PORT || "5000", 10);
-  httpServer.listen(
-    {
-      port,
-      host: "0.0.0.0",
-      reusePort: true,
-    },
-    () => {
-      log(`serving on port ${port}`);
-      logMemory("server.listen", { port });
-    },
-  );
+  // Note: we do NOT pass reusePort. SO_REUSEPORT is a Linux-specific socket
+  // option that some PaaS runtimes (and recent Node builds on certain
+  // kernels) reject with EADDRINUSE or EINVAL, leaving the process running
+  // but unable to accept connections — that's how Render ends up reporting
+  // "dial tcp 10.x.x.x:5000: connect: connection refused".
+  httpServer.listen(port, "0.0.0.0", () => {
+    log(`serving on port ${port}`);
+    logMemory("server.listen", { port });
+  });
 
   // Periodic memory snapshot so Render's logs show RSS/heap drift even when
   // no Shopify endpoints are being hit. Cheap (one process.memoryUsage call

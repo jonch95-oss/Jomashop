@@ -16,6 +16,7 @@ import {
 } from "@/components/ui/dialog";
 import { PageHeader, EmptyState, LoadingRows } from "@/components/AppShell";
 import { apiRequest } from "@/lib/queryClient";
+import { authHeaders } from "@/lib/adminToken";
 import { BulkRepairCard } from "@/components/BulkRepair";
 import { CategoryMappingCard } from "@/components/CategoryMapping";
 import { BrandMappingCard } from "@/components/BrandMapping";
@@ -203,8 +204,12 @@ export default function Products() {
   const cacheQ = useQuery<PreviewData & { cached?: boolean }>({
     queryKey: ["/api/products/cache", "all"],
     queryFn: async () => {
+      // Must include the admin token header — in production the
+      // requireAdminToken middleware returns 503/401 for unauthenticated
+      // /api/* hits, which previously blanked out the Products page.
       const res = await fetch("/api/products/cache?limit=all", {
         credentials: "include",
+        headers: authHeaders(),
       });
       return res.json();
     },

@@ -1881,92 +1881,98 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const responseOffset = clampOffset(req.body?.responseOffset ?? req.query.offset);
 
     // Serialize full refreshes; two concurrent Shopify catalog pulls can
-    // double RSS and trigger the Render OOM (exit 134).
+    // double RSS and trigger the Render OOM (exit 134). Lock is always
+    // released in finally so a crash mid-build can't permanently wedge the
+    // endpoint at 409.
     if (!withLockOr409(res, "products.refresh")) return;
-    let preview;
     try {
-      logMemory("products-refresh.start", { maxProducts, pageSize });
-      preview = await buildPreview({
-        suppliedProducts: undefined,
-        forceRefresh: true,
-        pageSize,
-        maxProducts,
-      });
-      logMemory("products-refresh.built", {
-        mapped: preview.count,
-        dataSource: preview.dataSource,
-      });
-    } catch (err) {
-      releaseLock("products.refresh");
-      logMemory("products-refresh.failed", { message: (err as Error)?.message });
-      return res.status(500).json({ ok: false, error: (err as Error).message });
-    }
-    if (preview.dataSource === "live" && preview.shopDomain) {
+      let preview;
       try {
-        const cachePayload = {
-          mapperVersion: preview.mapperVersion,
-          schemas: preview.schemas,
-          mapped: preview.mapped.map((m) => compactifyMapped(m)),
-          usingSamples: preview.usingSamples,
-          shopifyConnected: preview.shopifyConnected,
+        logMemory("products-refresh.start", { maxProducts, pageSize });
+        preview = await buildPreview({
+          suppliedProducts: undefined,
+          forceRefresh: true,
+          pageSize,
+          maxProducts,
+        });
+        logMemory("products-refresh.built", {
+          mapped: preview.count,
           dataSource: preview.dataSource,
-          shopDomain: preview.shopDomain,
-          fetchedCount: preview.fetchedCount,
-          pageCount: preview.pageCount,
-          hasMore: preview.hasMore,
-          fallbackReason: preview.fallbackReason,
-          fetchError: preview.fetchError,
-          liveCategoryNames: preview.liveCategoryNames,
-          jomashopManufacturers: preview.jomashopManufacturers,
-          jomashopI1Categories: preview.jomashopI1Categories,
-          note: preview.note,
-        };
-        storage.upsertProductCache({
-          shopDomain: preview.shopDomain,
-          fetchedCount: preview.fetchedCount,
-          pageCount: preview.pageCount,
-          hasMore: preview.hasMore,
-          payloadJson: JSON.stringify(cachePayload),
-          fetchedAt: Date.now(),
         });
       } catch (err) {
-        storage.appendLog({
-          level: "warn",
-          message: `Failed to persist product cache: ${(err as Error).message}`,
-          detailsJson: null,
-          createdAt: Date.now(),
-        });
+        logMemory("products-refresh.failed", { message: (err as Error)?.message });
+        return res
+          .status(500)
+          .json({ ok: false, error: (err as Error).message || "Refresh failed" });
       }
+      if (preview.dataSource === "live" && preview.shopDomain) {
+        try {
+          const cachePayload = {
+            mapperVersion: preview.mapperVersion,
+            schemas: preview.schemas,
+            mapped: preview.mapped.map((m) => compactifyMapped(m)),
+            usingSamples: preview.usingSamples,
+            shopifyConnected: preview.shopifyConnected,
+            dataSource: preview.dataSource,
+            shopDomain: preview.shopDomain,
+            fetchedCount: preview.fetchedCount,
+            pageCount: preview.pageCount,
+            hasMore: preview.hasMore,
+            fallbackReason: preview.fallbackReason,
+            fetchError: preview.fetchError,
+            liveCategoryNames: preview.liveCategoryNames,
+            jomashopManufacturers: preview.jomashopManufacturers,
+            jomashopI1Categories: preview.jomashopI1Categories,
+            note: preview.note,
+          };
+          storage.upsertProductCache({
+            shopDomain: preview.shopDomain,
+            fetchedCount: preview.fetchedCount,
+            pageCount: preview.pageCount,
+            hasMore: preview.hasMore,
+            payloadJson: JSON.stringify(cachePayload),
+            fetchedAt: Date.now(),
+          });
+        } catch (err) {
+          storage.appendLog({
+            level: "warn",
+            message: `Failed to persist product cache: ${(err as Error).message}`,
+            detailsJson: null,
+            createdAt: Date.now(),
+          });
+        }
+      }
+      const totalCount = preview.mapped.length;
+      const start = Math.min(responseOffset, totalCount);
+      const end = Math.min(start + responseLimit, totalCount);
+      const sliced = preview.mapped.slice(start, end).map(compactifyMapped);
+      res.json({
+        mapperVersion: preview.mapperVersion,
+        schemas: preview.schemas,
+        mapped: sliced,
+        count: sliced.length,
+        totalCount,
+        page: { offset: start, limit: responseLimit, hasMore: end < totalCount },
+        usingSamples: preview.usingSamples,
+        shopifyConnected: preview.shopifyConnected,
+        dataSource: preview.dataSource,
+        shopDomain: preview.shopDomain,
+        fetchedCount: preview.fetchedCount,
+        pageCount: preview.pageCount,
+        hasMore: preview.hasMore,
+        fallbackReason: preview.fallbackReason,
+        fetchError: preview.fetchError,
+        liveCategoryNames: preview.liveCategoryNames,
+        jomashopManufacturers: preview.jomashopManufacturers,
+        jomashopI1Categories: preview.jomashopI1Categories,
+        note: preview.note,
+        fromCache: false,
+        lastRefreshedAt: Date.now(),
+      });
+      logMemory("products-refresh.responded", { sent: sliced.length, totalCount });
+    } finally {
+      releaseLock("products.refresh");
     }
-    const totalCount = preview.mapped.length;
-    const start = Math.min(responseOffset, totalCount);
-    const end = Math.min(start + responseLimit, totalCount);
-    const sliced = preview.mapped.slice(start, end).map(compactifyMapped);
-    res.json({
-      mapperVersion: preview.mapperVersion,
-      schemas: preview.schemas,
-      mapped: sliced,
-      count: sliced.length,
-      totalCount,
-      page: { offset: start, limit: responseLimit, hasMore: end < totalCount },
-      usingSamples: preview.usingSamples,
-      shopifyConnected: preview.shopifyConnected,
-      dataSource: preview.dataSource,
-      shopDomain: preview.shopDomain,
-      fetchedCount: preview.fetchedCount,
-      pageCount: preview.pageCount,
-      hasMore: preview.hasMore,
-      fallbackReason: preview.fallbackReason,
-      fetchError: preview.fetchError,
-      liveCategoryNames: preview.liveCategoryNames,
-      jomashopManufacturers: preview.jomashopManufacturers,
-      jomashopI1Categories: preview.jomashopI1Categories,
-      note: preview.note,
-      fromCache: false,
-      lastRefreshedAt: Date.now(),
-    });
-    logMemory("products-refresh.responded", { sent: sliced.length, totalCount });
-    releaseLock("products.refresh");
   });
 
   // Direct live Shopify product fetch (debug / admin use). Returns the

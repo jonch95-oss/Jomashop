@@ -44,9 +44,51 @@ import type {
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import Database from "better-sqlite3";
 import { eq, desc, and } from "drizzle-orm";
+import path from "node:path";
+import fs from "node:fs";
 
-const sqlite = new Database("data.db");
-sqlite.pragma("journal_mode = WAL");
+// Allow Render (or any other host with a persistent disk mount) to point
+// the sqlite file at a writable volume via DATA_DB_PATH. Falls back to a
+// relative "data.db" in the working directory, which is fine for local dev
+// but is wiped on every Render redeploy unless DATA_DB_PATH points at a
+// disk mount. Critically, if the file is unreadable/corrupt, do NOT crash
+// the process — log loudly and back off to an in-memory database so the
+// HTTP server still listens and the operator can fix the disk via the
+// dashboard.
+const DATA_DB_PATH = (process.env.DATA_DB_PATH || "data.db").trim() || "data.db";
+try {
+  const dir = path.dirname(DATA_DB_PATH);
+  if (dir && dir !== "." && !fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+} catch (err) {
+  // eslint-disable-next-line no-console
+  console.error("[storage] failed to ensure data.db directory:", (err as Error)?.message);
+}
+
+function openDatabase(): Database.Database {
+  try {
+    const db = new Database(DATA_DB_PATH);
+    db.pragma("journal_mode = WAL");
+    return db;
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error(
+      `[storage] failed to open ${DATA_DB_PATH} (${(err as Error)?.message}). ` +
+        `Falling back to in-memory sqlite so the server can still listen on PORT. ` +
+        `Set DATA_DB_PATH to a writable location to persist state.`,
+    );
+    const mem = new Database(":memory:");
+    try {
+      mem.pragma("journal_mode = MEMORY");
+    } catch {
+      // ignore
+    }
+    return mem;
+  }
+}
+
+const sqlite = openDatabase();
 
 export const db = drizzle(sqlite);
 
