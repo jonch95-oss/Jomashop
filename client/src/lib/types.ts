@@ -72,6 +72,12 @@ export type MappedProduct = {
   brand: string;
   price: number | null;
   msrp: number | null;
+  /** Where MSRP came from: variant_compare_at_price | metafield |
+   *  shopify_price_fallback | none. Used by the debug payload UI to show
+   *  the operator which Shopify field MSRP was sourced from before pushing. */
+  msrp_source?: string;
+  /** When msrp_source === "metafield", the matched metafield key/label. */
+  msrp_metafield_key?: string | null;
   commercial_discount: number;
   jomashop_price: number | null;
   images: string[];

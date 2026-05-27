@@ -20,6 +20,7 @@
 
 import {
   BUILT_IN_CATEGORY_OVERRIDES,
+  MSRP_METAFIELD_CANDIDATES,
   PARENT_SKU_METAFIELD_CANDIDATES,
   buildCanonicalProductFields,
   buildI1ProductEnvelope,
@@ -27,6 +28,7 @@ import {
   buildSchemaProperties,
   coerceJomashopToSupported,
   findMetafieldSource,
+  findMsrpSource,
   findParentSkuSource,
   isAmbiguousCategoryCode,
   lookupBuiltInCategoryDefault,
@@ -35,6 +37,7 @@ import {
   normalizeI1CategorySchema,
   normalizeV1CategorySchema,
   readParentSku,
+  resolveMsrp,
   type ShopifyProduct,
   type SchemaPropertyDescriptor,
 } from "../server/mapping";
@@ -5005,6 +5008,351 @@ function runClothingApparelAliasNormalization() {
     `Case 51d2: schema alias resolution targets the Apparel fallback (not Clothing)`,
   );
 }
+
+// ---------- MSRP resolution / push payload tests ----------
+
+function apparelSchema() {
+  return FALLBACK_CATEGORY_SCHEMAS.Apparel.map((f) => ({
+    field: f.field,
+    required: f.required,
+    type: f.type,
+    options: f.options,
+  }));
+}
+
+function runMsrpCanadaGooseCompareAtPrice() {
+  console.log(
+    "Case MSRP-1: Canada Goose Apparel — price 400 + compare_at_price 400 + discount 40% → payload price 240, msrp 400",
+  );
+  const product: ShopifyProduct = {
+    id: "shopify-cg-1",
+    title: "Canada Goose Wyndham Parka",
+    body_html: "<p>Down parka.</p>",
+    vendor: "Canada Goose",
+    product_type: "Apparel",
+    tags: ["Men", "Outerwear"],
+    images: [{ src: "https://example.com/cg.jpg" }],
+    options: [{ name: "Size", values: ["M"] }],
+    variants: [
+      {
+        id: 9101,
+        sku: "CG-WYND-M",
+        price: "400.00",
+        compare_at_price: "400.00",
+        inventory_quantity: 3,
+        option1: "M",
+      },
+    ],
+    metafields: [
+      { namespace: "custom", key: "commercial_discount", value: "40" },
+    ],
+  };
+  const mapped = mapShopifyToJomashop(product, apparelSchema());
+  assert(
+    mapped.price === 400,
+    `Case MSRP-1a: mapped.price === 400 (got ${JSON.stringify(mapped.price)})`,
+  );
+  assert(
+    mapped.commercial_discount === 0.4,
+    `Case MSRP-1b: mapped.commercial_discount === 0.4 (got ${JSON.stringify(mapped.commercial_discount)})`,
+  );
+  assert(
+    mapped.jomashop_price === 240,
+    `Case MSRP-1c: mapped.jomashop_price === 240 (got ${JSON.stringify(mapped.jomashop_price)})`,
+  );
+  assert(
+    mapped.msrp === 400,
+    `Case MSRP-1d: mapped.msrp === 400 (got ${JSON.stringify(mapped.msrp)})`,
+  );
+  assert(
+    mapped.msrp_source === "variant_compare_at_price",
+    `Case MSRP-1e: msrp_source === "variant_compare_at_price" (got ${JSON.stringify(mapped.msrp_source)})`,
+  );
+
+  const { payload } = buildJomashopProductPayload(mapped, undefined, {
+    manufacturer_id: 2774,
+    category_id: 35,
+  });
+  assert(
+    payload.price === 240,
+    `Case MSRP-1f: payload.price === 240 (got ${JSON.stringify(payload.price)})`,
+  );
+  assert(
+    payload.msrp === 400,
+    `Case MSRP-1g: payload.msrp === 400 (got ${JSON.stringify(payload.msrp)})`,
+  );
+
+  const envelope = buildI1ProductEnvelope(payload, mapped.variants[0] ?? null) as {
+    product: Record<string, unknown>;
+    stock: Record<string, unknown>;
+  };
+  assert(
+    envelope.stock?.price === 240,
+    `Case MSRP-1h: envelope.stock.price === 240 (got ${JSON.stringify(envelope.stock?.price)})`,
+  );
+  assert(
+    envelope.stock?.msrp === 400,
+    `Case MSRP-1i: envelope.stock.msrp === 400 — Jomashop portal needs MSRP under stock (got ${JSON.stringify(envelope.stock?.msrp)})`,
+  );
+}
+
+function runMsrpFallbackToShopifyPrice() {
+  console.log(
+    "Case MSRP-2: blank compare_at_price + no metafield → MSRP falls back to Shopify price (the retail/list price for this vendor)",
+  );
+  const product: ShopifyProduct = {
+    id: "shopify-cg-2",
+    title: "Canada Goose Chilliwack Bomber",
+    body_html: "",
+    vendor: "Canada Goose",
+    product_type: "Apparel",
+    tags: ["Men"],
+    images: [],
+    options: [{ name: "Size", values: ["L"] }],
+    variants: [
+      {
+        id: 9102,
+        sku: "CG-CHIL-L",
+        price: "400.00",
+        compare_at_price: null,
+        inventory_quantity: 1,
+        option1: "L",
+      },
+    ],
+    metafields: [
+      { namespace: "custom", key: "commercial_discount", value: "40" },
+    ],
+  };
+  const mapped = mapShopifyToJomashop(product, apparelSchema());
+  assert(
+    mapped.msrp === 400,
+    `Case MSRP-2a: mapped.msrp === 400 from Shopify price fallback (got ${JSON.stringify(mapped.msrp)})`,
+  );
+  assert(
+    mapped.msrp_source === "shopify_price_fallback",
+    `Case MSRP-2b: msrp_source === "shopify_price_fallback" (got ${JSON.stringify(mapped.msrp_source)})`,
+  );
+  assert(
+    mapped.jomashop_price === 240,
+    `Case MSRP-2c: discounted jomashop_price stays 240 even with fallback MSRP (got ${JSON.stringify(mapped.jomashop_price)})`,
+  );
+
+  const { payload } = buildJomashopProductPayload(mapped, undefined, {
+    manufacturer_id: 2774,
+    category_id: 35,
+  });
+  const envelope = buildI1ProductEnvelope(payload, mapped.variants[0] ?? null) as {
+    stock: Record<string, unknown>;
+  };
+  assert(
+    envelope.stock?.msrp === 400,
+    `Case MSRP-2d: envelope.stock.msrp === 400 — fixes the reported "MSRP blank" bug (got ${JSON.stringify(envelope.stock?.msrp)})`,
+  );
+}
+
+function runMsrpMetafieldSourceWorks() {
+  console.log("Case MSRP-3: explicit MSRP metafield is sourced when present");
+  const product: ShopifyProduct = {
+    id: "shopify-cg-3",
+    title: "Test Product",
+    body_html: "",
+    vendor: "Test",
+    product_type: "Apparel",
+    tags: [],
+    images: [],
+    options: [{ name: "Size", values: ["M"] }],
+    variants: [
+      {
+        id: 9103,
+        sku: "TST-M",
+        price: "100.00",
+        compare_at_price: null,
+        inventory_quantity: 1,
+        option1: "M",
+      },
+    ],
+    metafields: [
+      { namespace: "custom", key: "msrp", value: "175.00", name: "MSRP", label: "MSRP" },
+    ],
+  };
+  const mapped = mapShopifyToJomashop(product, apparelSchema());
+  assert(
+    mapped.msrp === 175,
+    `Case MSRP-3a: metafield msrp wins over Shopify price fallback (got ${JSON.stringify(mapped.msrp)})`,
+  );
+  assert(
+    mapped.msrp_source === "metafield",
+    `Case MSRP-3b: msrp_source === "metafield" (got ${JSON.stringify(mapped.msrp_source)})`,
+  );
+  assert(
+    typeof mapped.msrp_metafield_key === "string" && mapped.msrp_metafield_key !== "",
+    `Case MSRP-3c: msrp_metafield_key populated (got ${JSON.stringify(mapped.msrp_metafield_key)})`,
+  );
+
+  // Also verify alternative metafield labels work (retail_price, list_price,
+  // original_price, compareAtPrice — each spelling is its own field that may
+  // appear independently across catalogs).
+  const altLabels = ["retail_price", "list_price", "original_price", "compareAtPrice"];
+  for (const k of altLabels) {
+    const alt: ShopifyProduct = {
+      id: `shopify-alt-${k}`,
+      title: "Alt Source",
+      vendor: "Test",
+      product_type: "Apparel",
+      tags: [],
+      images: [],
+      options: [{ name: "Size", values: ["M"] }],
+      variants: [
+        {
+          id: 9200,
+          sku: "ALT-M",
+          price: "50.00",
+          compare_at_price: null,
+          inventory_quantity: 1,
+          option1: "M",
+        },
+      ],
+      metafields: [{ namespace: "custom", key: k, value: "200.00" }],
+    };
+    const m = mapShopifyToJomashop(alt, apparelSchema());
+    assert(
+      m.msrp === 200,
+      `Case MSRP-3d (${k}): metafield resolves MSRP (got ${JSON.stringify(m.msrp)})`,
+    );
+    assert(
+      m.msrp_source === "metafield",
+      `Case MSRP-3e (${k}): msrp_source === "metafield" (got ${JSON.stringify(m.msrp_source)})`,
+    );
+  }
+}
+
+function runMsrpVariantCompareAtPriceTakesPrecedence() {
+  console.log("Case MSRP-4: variant compare_at_price takes precedence over metafields");
+  const product: ShopifyProduct = {
+    id: "shopify-cg-4",
+    title: "Test Product",
+    body_html: "",
+    vendor: "Test",
+    product_type: "Apparel",
+    tags: [],
+    images: [],
+    options: [{ name: "Size", values: ["M"] }],
+    variants: [
+      {
+        id: 9104,
+        sku: "TST2-M",
+        price: "100.00",
+        compare_at_price: "300.00",
+        inventory_quantity: 1,
+        option1: "M",
+      },
+    ],
+    metafields: [
+      // Metafield says 999, but variant compare_at_price wins because Shopify's
+      // native field is the canonical MSRP signal when populated.
+      { namespace: "custom", key: "msrp", value: "999.00" },
+    ],
+  };
+  const mapped = mapShopifyToJomashop(product, apparelSchema());
+  assert(
+    mapped.msrp === 300,
+    `Case MSRP-4a: variant compare_at_price (300) beats metafield (999), got ${JSON.stringify(mapped.msrp)}`,
+  );
+  assert(
+    mapped.msrp_source === "variant_compare_at_price",
+    `Case MSRP-4b: msrp_source === "variant_compare_at_price" (got ${JSON.stringify(mapped.msrp_source)})`,
+  );
+}
+
+function runMsrpBlankPriceYieldsNone() {
+  console.log("Case MSRP-5: blank Shopify price + no metafield + no compare_at_price → no MSRP");
+  const product: ShopifyProduct = {
+    id: "shopify-noprice",
+    title: "Test Product",
+    body_html: "",
+    vendor: "Test",
+    product_type: "Apparel",
+    tags: [],
+    images: [],
+    options: [{ name: "Size", values: ["M"] }],
+    variants: [
+      {
+        id: 9105,
+        sku: "TST3-M",
+        // No price at all on the variant.
+        inventory_quantity: 1,
+        option1: "M",
+      },
+    ],
+    metafields: [],
+  };
+  const mapped = mapShopifyToJomashop(product, apparelSchema());
+  assert(
+    mapped.price === null,
+    `Case MSRP-5a: mapped.price === null (got ${JSON.stringify(mapped.price)})`,
+  );
+  assert(
+    mapped.msrp === null,
+    `Case MSRP-5b: mapped.msrp === null when nothing usable exists (got ${JSON.stringify(mapped.msrp)})`,
+  );
+  assert(
+    mapped.msrp_source === "none",
+    `Case MSRP-5c: msrp_source === "none" (got ${JSON.stringify(mapped.msrp_source)})`,
+  );
+
+  const { payload } = buildJomashopProductPayload(mapped, undefined, {
+    manufacturer_id: 2774,
+    category_id: 35,
+  });
+  const envelope = buildI1ProductEnvelope(payload, mapped.variants[0] ?? null) as {
+    stock: Record<string, unknown>;
+  };
+  assert(
+    !("msrp" in envelope.stock),
+    `Case MSRP-5d: envelope.stock omits msrp when no MSRP source is available (got ${JSON.stringify(envelope.stock)})`,
+  );
+}
+
+function runMsrpResolveDirectFn() {
+  console.log("Case MSRP-6: resolveMsrp() works as a standalone helper");
+  // Direct resolveMsrp usage — exercises the function exposed for callers
+  // that work outside the full mapper (e.g. the per-product XLSX exporter).
+  const product: ShopifyProduct = {
+    metafields: [
+      { namespace: "custom", key: "list_price", value: "1200.00" },
+    ],
+    variants: [{ id: 1, sku: "A", price: "800.00", inventory_quantity: 1 }],
+  };
+  const res = resolveMsrp(product, 800);
+  assert(
+    res.value === 1200,
+    `Case MSRP-6a: resolveMsrp picks metafield list_price (got ${JSON.stringify(res.value)})`,
+  );
+  assert(
+    res.source === "metafield",
+    `Case MSRP-6b: resolveMsrp source is metafield (got ${JSON.stringify(res.source)})`,
+  );
+
+  // findMsrpSource locates the metafield identifier for writeback targeting.
+  const located = findMsrpSource(product);
+  assert(
+    located !== null && located.key === "list_price",
+    `Case MSRP-6c: findMsrpSource returns matched metafield (got ${JSON.stringify(located)})`,
+  );
+
+  // Constant is exposed for downstream Excel writeback / mapping audit use.
+  assert(
+    MSRP_METAFIELD_CANDIDATES.includes("MSRP") && MSRP_METAFIELD_CANDIDATES.includes("compareAtPrice"),
+    `Case MSRP-6d: MSRP_METAFIELD_CANDIDATES carries documented spellings`,
+  );
+}
+
+runMsrpCanadaGooseCompareAtPrice();
+runMsrpFallbackToShopifyPrice();
+runMsrpMetafieldSourceWorks();
+runMsrpVariantCompareAtPriceTakesPrecedence();
+runMsrpBlankPriceYieldsNone();
+runMsrpResolveDirectFn();
 
 runClothingApparelAliasNormalization();
 

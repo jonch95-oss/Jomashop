@@ -115,6 +115,14 @@ async function pushInventoryUpdate(opts: {
   if (price !== null && price !== undefined && Number.isFinite(Number(price))) {
     body.price = price;
   }
+  // Persist MSRP across inventory updates so the Jomashop portal keeps a
+  // populated MSRP column when only stock/price changes are pushed. Without
+  // this, /v1/inventory PUTs would silently strip the MSRP that the original
+  // /i1/products push set.
+  const msrp = stored?.msrp;
+  if (msrp !== null && msrp !== undefined && Number.isFinite(Number(msrp))) {
+    body.msrp = msrp;
+  }
   const targetSku = lookup.jomashopSku || lookup.shopifySku;
   const resp = await jomashopRequest({
     method: "PUT",

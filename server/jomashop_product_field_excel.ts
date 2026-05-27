@@ -34,8 +34,10 @@ import {
   jomashopConfigured,
 } from "./jomashop";
 import {
+  MSRP_METAFIELD_CANDIDATES,
   PARENT_SKU_METAFIELD_CANDIDATES,
   findMetafieldSource,
+  findMsrpSource,
   normalizeI1CategorySchema,
   readParentSku,
   type ShopifyProduct,
@@ -69,6 +71,16 @@ export type ProductFieldExportRow = {
   jomashopBrandId: string;
   pushStatus: string;
   warnings: string;
+  /** Shopify retail price (line through in the UI). Read-only column. */
+  shopifyPrice: string;
+  /** MSRP / list price the operator can edit. Writeback lands on the
+   *  originating metafield when one existed (e.g. `custom.msrp`), otherwise
+   *  on `jomashop.msrp`. Stored as a string for the workbook cell. */
+  msrp: string;
+  /** Source label for MSRP (variant_compare_at_price | metafield |
+   *  shopify_price_fallback | none) — surfaced as a read-only column so the
+   *  operator can see where the current value came from. */
+  msrpSource: string;
   /** Current app-derived value per Jomashop schema field name. */
   fieldValues: Record<string, string>;
   /** Variant-specific marker used to decide product vs variant metafield. */
@@ -79,6 +91,11 @@ export type ProductFieldExportRow = {
    *  the writeback prefers updating the existing metafield in place rather
    *  than minting a fresh `jomashop.*` one. Keyed by field name. */
   fieldWritebackTargets?: Record<string, { namespace: string; key: string }>;
+  /** Writeback target for the MSRP system column. Defaults to
+   *  `{namespace:"jomashop", key:"msrp"}` when no existing metafield source
+   *  was present on the Shopify product; falls back to the matched
+   *  MSRP_METAFIELD_CANDIDATES location otherwise. */
+  msrpWritebackTarget?: { namespace: string; key: string };
 };
 
 export type ProductFieldExportResult = {
@@ -98,7 +115,14 @@ export type ProductFieldExportResult = {
 };
 
 // Identity columns are present on every category sheet.
-const IDENTITY_COLUMNS: Array<{ header: string; key: string; width: number }> = [
+// `editable: true` columns are user-writable (e.g. MSRP). Anything else is
+// reference-only — the upload parser ignores edits made to those cells.
+const IDENTITY_COLUMNS: Array<{
+  header: string;
+  key: string;
+  width: number;
+  editable?: boolean;
+}> = [
   { header: "Row ID", key: "row_id", width: 14 },
   { header: "Shopify Product ID", key: "shopify_product_id", width: 18 },
   { header: "Shopify Variant ID", key: "shopify_variant_id", width: 18 },
@@ -113,6 +137,9 @@ const IDENTITY_COLUMNS: Array<{ header: string; key: string; width: number }> = 
   { header: "Jomashop Brand ID", key: "jomashop_brand_id", width: 14 },
   { header: "Current Push Status", key: "push_status", width: 16 },
   { header: "Warnings", key: "warnings", width: 32 },
+  { header: "Shopify Price", key: "shopify_price", width: 12 },
+  { header: "MSRP", key: "msrp", width: 12, editable: true },
+  { header: "MSRP Source", key: "msrp_source", width: 22 },
 ];
 
 const TRAILING_COLUMNS: Array<{ header: string; key: string; width: number }> = [
@@ -338,6 +365,20 @@ export async function aggregateProductFieldRows(opts: {
         PARENT_SKU_METAFIELD_CANDIDATES,
       );
 
+      // Locate the existing MSRP metafield source (if any) so writeback lands
+      // on the same metafield the value was originally read from instead of
+      // always minting a fresh `jomashop.msrp`. Falls back to the
+      // jomashop.msrp default when no candidate metafield is present.
+      const msrpWritebackTarget =
+        findMsrpSource(syntheticProduct) ?? { namespace: "jomashop", key: "msrp" };
+
+      const msrpValue =
+        typeof m?.msrp === "number" && Number.isFinite(m.msrp) ? String(m.msrp) : "";
+      const msrpSourceLabel =
+        typeof m?.msrp_source === "string" && m.msrp_source ? String(m.msrp_source) : "none";
+      const shopifyPriceValue =
+        typeof m?.price === "number" && Number.isFinite(m.price) ? String(m.price) : "";
+
       const fieldWritebackTargets: Record<string, { namespace: string; key: string }> = {};
 
       const mkRow = (variantId: string, variantOptions: Record<string, string>, isVariant: boolean) => {
@@ -405,12 +446,16 @@ export async function aggregateProductFieldRows(opts: {
           warnings: Array.isArray(m?.warnings)
             ? (m.warnings as string[]).slice(0, 3).join(" | ")
             : "",
+          shopifyPrice: shopifyPriceValue,
+          msrp: msrpValue,
+          msrpSource: msrpSourceLabel,
           fieldValues,
           isVariant,
           fieldWritebackTargets:
             Object.keys(fieldWritebackTargets).length > 0
               ? { ...fieldWritebackTargets }
               : undefined,
+          msrpWritebackTarget,
         });
       };
 
@@ -724,6 +769,9 @@ export async function buildProductFieldWorkbook(
         jomashop_brand_id: r.jomashopBrandId,
         push_status: r.pushStatus,
         warnings: r.warnings,
+        shopify_price: r.shopifyPrice,
+        msrp: r.msrp,
+        msrp_source: r.msrpSource,
         write_back: "",
         notes: "",
       };
@@ -885,6 +933,9 @@ export type ParsedProductFieldRow = {
   vendorSku: string;
   /** field name -> user-supplied value (already trimmed). Blank cells omitted. */
   fieldValues: Record<string, string>;
+  /** Operator-edited MSRP cell (system column, not a schema field). Empty
+   *  string when blank. Written back as a product-level metafield on apply. */
+  msrp: string;
   writeBack: boolean;
   notes: string;
   isValid: boolean;
@@ -1171,9 +1222,24 @@ export async function parseProductFieldUpload(
         }
         fieldValues[fieldName] = val;
       }
+      // MSRP system column: editable identity cell. Parse, validate that the
+      // operator typed a non-negative number, and track empty separately
+      // (empty = "no edit"; the apply step will not overwrite). Bad input
+      // raises an error so the operator catches it before push.
+      const msrpRaw = get(r, "MSRP");
+      let msrpVal = "";
+      if (msrpRaw !== "") {
+        const n = Number(msrpRaw);
+        if (!Number.isFinite(n) || n < 0) {
+          errors.push(`"MSRP" expects a non-negative number; got "${msrpRaw}".`);
+        } else {
+          msrpVal = String(n);
+        }
+      }
       // Check required fields are present whenever the operator has filled
-      // at least one cell on this row (skip silent blank rows).
-      const anyValue = Object.keys(fieldValues).length > 0;
+      // at least one cell on this row (skip silent blank rows). MSRP counts
+      // toward "any value" — an MSRP-only edit is still a valid writeback.
+      const anyValue = Object.keys(fieldValues).length > 0 || msrpVal !== "";
       if (!rowId && !anyValue) continue;
       if (anyValue) {
         for (const f of cat.fields) {
@@ -1214,6 +1280,7 @@ export async function parseProductFieldUpload(
         shopifyVariantId: get(r, "Shopify Variant ID"),
         vendorSku: get(r, "Vendor SKU"),
         fieldValues,
+        msrp: msrpVal,
         writeBack,
         notes: get(r, "Notes"),
         isValid: errors.length === 0,
@@ -1572,10 +1639,17 @@ export function registerJomashopProductFieldExcelRoutes(app: Express): void {
     // `jomashop.parent_sku`). Falls back to the slug-derived default when
     // no override is present.
     const targetsByRowId = new Map<string, Record<string, { namespace: string; key: string }>>();
+    // MSRP writeback target per rowId. Defaults to `jomashop.msrp` at the
+    // exporter; preserved here so the apply step can write back to the
+    // originating metafield (e.g. `custom.msrp`) when one existed.
+    const msrpTargetByRowId = new Map<string, { namespace: string; key: string }>();
     for (const cat of session.aggSnapshot.categories) {
       for (const r of cat.rows) {
         if (r.fieldWritebackTargets && Object.keys(r.fieldWritebackTargets).length > 0) {
           targetsByRowId.set(r.rowId, r.fieldWritebackTargets);
+        }
+        if (r.msrpWritebackTarget) {
+          msrpTargetByRowId.set(r.rowId, r.msrpWritebackTarget);
         }
       }
     }
@@ -1583,10 +1657,46 @@ export function registerJomashopProductFieldExcelRoutes(app: Express): void {
     const pushReadyRowIds: string[] = [];
     if (conn) {
       for (const row of validRows) {
+        const rowHasFilledValues =
+          Object.keys(row.fieldValues).length > 0 || row.msrp !== "";
         const effectiveWriteBack =
-          row.writeBack || (forceWriteback && Object.keys(row.fieldValues).length > 0);
+          row.writeBack || (forceWriteback && rowHasFilledValues);
         if (!effectiveWriteBack) continue;
         const overrides = targetsByRowId.get(row.rowId);
+        // MSRP system column write — always product-level (never variant).
+        // Lands on the originating Shopify metafield when one was detected at
+        // export time; otherwise on `jomashop.msrp`.
+        if (row.msrp !== "" && row.shopifyProductId) {
+          const target = msrpTargetByRowId.get(row.rowId) ?? {
+            namespace: "jomashop",
+            key: "msrp",
+          };
+          const ownerId = row.shopifyProductId.startsWith("gid://")
+            ? row.shopifyProductId
+            : `gid://shopify/Product/${row.shopifyProductId}`;
+          attempted++;
+          const result = await writeMetafield(
+            conn,
+            ownerId,
+            target.namespace,
+            target.key,
+            row.msrp,
+          );
+          writes.push({
+            rowId: row.rowId,
+            ownerId,
+            ownerType: "product",
+            field: "MSRP",
+            namespace: target.namespace,
+            key: target.key,
+            ok: result.ok,
+            error: result.ok ? null : result.error,
+          });
+          if (result.ok) {
+            succeeded++;
+            if (!pushReadyRowIds.includes(row.rowId)) pushReadyRowIds.push(row.rowId);
+          } else failed++;
+        }
         for (const [fieldName, value] of Object.entries(row.fieldValues)) {
           if (!value) continue;
           const override = overrides ? overrides[fieldName] : undefined;

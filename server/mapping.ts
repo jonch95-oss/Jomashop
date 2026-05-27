@@ -91,6 +91,15 @@ export type MappedProduct = {
   brand: string;
   price: number | null;
   msrp: number | null;
+  /** Where MSRP was sourced from: variant compare_at_price, a Shopify
+   *  metafield (MSRP / list_price / retail_price / …), the Shopify price
+   *  itself when no explicit MSRP source existed, or "none" when no usable
+   *  value was found. Surfaced so the UI can show the operator which Shopify
+   *  field MSRP came from before pushing. */
+  msrp_source: MsrpSource;
+  /** When `msrp_source === "metafield"`, the matched metafield identifier
+   *  (key / label / definition name) that resolveMsrp found. */
+  msrp_metafield_key: string | null;
   commercial_discount: number;
   jomashop_price: number | null;
   images: string[];
@@ -519,6 +528,97 @@ const DISCOUNT_KEY_CANDIDATES = [
   "commercial-discount",
 ];
 const DISCOUNT_LABEL_PATTERN = /^\s*commercial[\s_-]*discount\s*$/i;
+
+/**
+ * Metafield identifiers checked (in priority order) when sourcing MSRP from
+ * Shopify metafields. Each is matched case- and punctuation-insensitively
+ * against the metafield key, `<namespace>.<key>`, definition name, label,
+ * and description (see `readMetafield`). The first non-empty hit wins.
+ *
+ * Order: Jomashop-style explicit MSRP first, then common retail / list price
+ * spellings, then the camelCase variant Shopify's Storefront API uses.
+ */
+export const MSRP_METAFIELD_CANDIDATES: ReadonlyArray<string> = [
+  "MSRP",
+  "msrp",
+  "custom.msrp",
+  "jomashop.msrp",
+  "retail_price",
+  "retailPrice",
+  "list_price",
+  "listPrice",
+  "regular_price",
+  "regularPrice",
+  "original_price",
+  "originalPrice",
+  "compare_at_price",
+  "compareAtPrice",
+  "compare-at-price",
+];
+
+export type MsrpSource =
+  | "variant_compare_at_price"
+  | "metafield"
+  | "shopify_price_fallback"
+  | "none";
+
+export type MsrpResolution = {
+  value: number | null;
+  source: MsrpSource;
+  /** When source==="metafield", the matched metafield key/label so the UI
+   *  can show which Shopify field the value came from. */
+  metafieldKey: string | null;
+};
+
+/**
+ * Resolve MSRP for a Shopify product following the documented precedence:
+ *
+ *   1. First variant's `compare_at_price` (Shopify's native list price field)
+ *   2. MSRP / list-price metafields (MSRP_METAFIELD_CANDIDATES)
+ *   3. Fallback to Shopify `price` itself — for this vendor the Shopify
+ *      `price` IS the retail list price; the Jomashop wholesale price is
+ *      derived by applying Commercial Discount. So when no explicit MSRP
+ *      source exists, Shopify price is the correct list price to ship.
+ *
+ * Returns the resolved value, the source label, and (when source is
+ * "metafield") the matched metafield identifier — exposed via MappedProduct
+ * so the UI / debug surface can show "MSRP source: metafield (custom.msrp)".
+ */
+export function resolveMsrp(
+  product: ShopifyProduct,
+  shopifyPrice: number | null,
+): MsrpResolution {
+  const firstVariant = product?.variants?.[0];
+  const variantCompare = parsePrice(firstVariant?.compare_at_price);
+  if (variantCompare !== null && variantCompare > 0) {
+    return { value: variantCompare, source: "variant_compare_at_price", metafieldKey: null };
+  }
+  for (const key of MSRP_METAFIELD_CANDIDATES) {
+    const raw = readMetafield(product, key);
+    if (raw === undefined || raw === "") continue;
+    const parsed = parsePrice(raw);
+    if (parsed !== null && parsed > 0) {
+      return { value: parsed, source: "metafield", metafieldKey: key };
+    }
+  }
+  if (shopifyPrice !== null && shopifyPrice > 0) {
+    return { value: shopifyPrice, source: "shopify_price_fallback", metafieldKey: null };
+  }
+  return { value: null, source: "none", metafieldKey: null };
+}
+
+/**
+ * Find the (namespace, key) of an existing MSRP-like metafield on the
+ * product, when one is present. Used by the per-product XLSX writeback so
+ * edits land back on the same metafield the value was originally read from.
+ * Returns null when no candidate metafield exists, in which case the
+ * writeback falls back to a stable default (`jomashop.msrp`).
+ */
+export function findMsrpSource(
+  p: ShopifyProduct,
+): { namespace: string; key: string } | null {
+  return findMetafieldSource(p, MSRP_METAFIELD_CANDIDATES);
+}
 
 /**
  * Locate the Commercial Discount metafield on a Shopify product across the
@@ -1954,6 +2054,7 @@ export function mapShopifyToJomashop(
   });
 
   const shopifyPrice = parsePrice(firstVariant?.price);
+  const msrpResolution = resolveMsrp(product, shopifyPrice);
 
   const rawCategory =
     readMetafieldAny(product, ["category", "Category", "ff_category"]) ||
@@ -2045,7 +2146,9 @@ export function mapShopifyToJomashop(
     description: (product.body_html || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim(),
     brand,
     price: shopifyPrice,
-    msrp: parsePrice(firstVariant?.compare_at_price),
+    msrp: msrpResolution.value,
+    msrp_source: msrpResolution.source,
+    msrp_metafield_key: msrpResolution.metafieldKey,
     commercial_discount: commercialDiscount,
     jomashop_price: computeJomashopPrice(shopifyPrice, commercialDiscount),
     images: (product.images || []).map((i) => i.src).filter(Boolean),

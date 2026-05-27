@@ -768,6 +768,28 @@ export default function Products() {
                             <span className="ml-2 text-xs text-muted-foreground line-through">${p.msrp.toFixed(2)}</span>
                           )}
                         </div>
+                        <div className="mt-3 text-[10px] uppercase tracking-wider text-muted-foreground">MSRP (list price)</div>
+                        <div
+                          className="mt-1 text-sm tabular-nums"
+                          data-testid={`text-msrp-${p.vendor_sku}`}
+                        >
+                          {p.msrp !== null && p.msrp !== undefined ? `$${p.msrp.toFixed(2)}` : "—"}
+                          {p.msrp_source && p.msrp_source !== "none" && (
+                            <span
+                              className="ml-2 text-[10px] uppercase tracking-wider text-muted-foreground"
+                              data-testid={`text-msrp-source-${p.vendor_sku}`}
+                            >
+                              source:{" "}
+                              {p.msrp_source === "variant_compare_at_price"
+                                ? "compare_at_price"
+                                : p.msrp_source === "metafield"
+                                  ? `metafield (${p.msrp_metafield_key ?? "?"})`
+                                  : p.msrp_source === "shopify_price_fallback"
+                                    ? "shopify price (no MSRP set)"
+                                    : p.msrp_source}
+                            </span>
+                          )}
+                        </div>
                         <div className="mt-3 text-[10px] uppercase tracking-wider text-muted-foreground">Jomashop price</div>
                         <div className="mt-1 text-sm font-medium tabular-nums">
                           {p.jomashop_price !== null ? `$${p.jomashop_price.toFixed(2)}` : "—"}

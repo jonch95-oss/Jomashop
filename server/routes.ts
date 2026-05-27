@@ -110,6 +110,12 @@ type CompactMappedProduct = {
   brand: string;
   price: number | null;
   msrp: number | null;
+  /** Where MSRP was sourced from (variant compare_at_price, metafield, …).
+   *  Surfaced to the UI debug panel so operators can verify the value /
+   *  source before pushing. */
+  msrp_source: string;
+  /** Matched metafield identifier when msrp_source === "metafield". */
+  msrp_metafield_key: string | null;
   commercial_discount: number;
   jomashop_price: number | null;
   // Only the first image is retained — list views only ever render the primary.
@@ -236,6 +242,9 @@ function compactifyMapped(m: any): CompactMappedProduct {
     description,
     price: typeof m.price === "number" ? m.price : null,
     msrp: typeof m.msrp === "number" ? m.msrp : null,
+    msrp_source: typeof m.msrp_source === "string" && m.msrp_source ? m.msrp_source : "none",
+    msrp_metafield_key:
+      typeof m.msrp_metafield_key === "string" && m.msrp_metafield_key ? m.msrp_metafield_key : null,
     commercial_discount: typeof m.commercial_discount === "number" ? m.commercial_discount : 0,
     jomashop_price: typeof m.jomashop_price === "number" ? m.jomashop_price : null,
     image: firstImage,
