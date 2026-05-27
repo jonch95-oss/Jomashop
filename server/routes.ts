@@ -56,6 +56,7 @@ import {
 } from "./enum_mapping";
 import { registerResolutionAuditRoutes } from "./resolution_audit";
 import { registerJomashopMappingExcelRoutes } from "./jomashop_mapping_excel";
+import { registerJomashopProductFieldExcelRoutes } from "./jomashop_product_field_excel";
 import { registerWebhookRoutes, registerShopifyWebhooks } from "./webhooks";
 import { logMemory } from "./memlog";
 
@@ -2842,6 +2843,14 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // new mappings for ALL existing cached products in bulk, and optionally
   // writes the accepted value back to the Shopify product metafield.
   registerJomashopMappingExcelRoutes(app);
+
+  // ---------- Per-product Jomashop field XLSX workflow ----------
+  // Complementary to the grouped enum-override workflow above. Exports a
+  // workbook with one row per product (or variant) and one sheet per
+  // Jomashop category; operator fills the live-schema fields and uploads.
+  // Valid values are written to Shopify metafields (jomashop.<key>) and the
+  // cached preview is invalidated.
+  registerJomashopProductFieldExcelRoutes(app);
 
   // ---------- Shopify webhooks (public, HMAC-verified) ----------
   registerWebhookRoutes(app);

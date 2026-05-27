@@ -1,0 +1,1134 @@
+// Per-product Jomashop field XLSX workflow.
+//
+// Sister module to `jomashop_mapping_excel.ts`. Where that file aggregates
+// every unresolved enum mapping into ONE row per (category, property, source),
+// this one walks the cached product preview and produces ONE row per
+// product/variant, with each Jomashop category's live schema fields as
+// columns. The operator fills the missing/incorrect cells in Excel and
+// uploads the file; valid cells are written back to Shopify metafields and
+// the cached preview is invalidated so the next refresh picks the new values
+// up.
+//
+// Sheet layout:
+//   - One sheet per Jomashop category (preferred per spec). Each sheet
+//     carries identity columns + that category's live schema fields as
+//     editable columns. Required fields are marked with "*" in the header.
+//   - "Accepted Options" helper sheet listing the live accepted values for
+//     every enum field we couldn't fit into a dropdown.
+//   - "Instructions" sheet up front summarizing the workflow.
+//
+// Both workflows coexist — the existing grouped enum-override workflow is
+// untouched. This one is complementary and writes Shopify metafields.
+
+import crypto from "node:crypto";
+import ExcelJS from "exceljs";
+import type { Express } from "express";
+import multer from "multer";
+
+import { storage } from "./storage";
+import { FALLBACK_CATEGORY_SCHEMAS } from "@shared/schema";
+import {
+  getV1CategoryDescriptors,
+  resolveCategoryRecord,
+  getCategoryPropertiesI1,
+  jomashopConfigured,
+} from "./jomashop";
+import {
+  normalizeI1CategorySchema,
+  type SchemaPropertyDescriptor,
+} from "./mapping";
+import { getActiveShopifyConnection } from "./shopify";
+
+// ---------- Types ----------
+
+export type ProductFieldExportRow = {
+  rowId: string;
+  jomashopCategory: string;
+  shopifyProductId: string;
+  shopifyVariantId: string;
+  productTitle: string;
+  vendorSku: string;
+  manufacturerNumber: string;
+  brand: string;
+  shopifyCategoryCode: string;
+  shopifyProductType: string;
+  jomashopCategoryId: string;
+  jomashopBrandId: string;
+  pushStatus: string;
+  warnings: string;
+  /** Current app-derived value per Jomashop schema field name. */
+  fieldValues: Record<string, string>;
+  /** Variant-specific marker used to decide product vs variant metafield. */
+  isVariant: boolean;
+};
+
+export type ProductFieldExportResult = {
+  shopDomain: string | null;
+  fromCache: boolean;
+  cachedAt: number | null;
+  totalProducts: number;
+  /** Only rows for products not push-ready by default; full=true returns all. */
+  includedAll: boolean;
+  /** Per-category aggregation: schema fields + the rows that go on that sheet. */
+  categories: Array<{
+    category: string;
+    fields: SchemaPropertyDescriptor[];
+    fieldsSource: "live-v1" | "live-i1" | "fallback" | "unknown";
+    rows: ProductFieldExportRow[];
+  }>;
+};
+
+// Identity columns are present on every category sheet.
+const IDENTITY_COLUMNS: Array<{ header: string; key: string; width: number }> = [
+  { header: "Row ID", key: "row_id", width: 14 },
+  { header: "Shopify Product ID", key: "shopify_product_id", width: 18 },
+  { header: "Shopify Variant ID", key: "shopify_variant_id", width: 18 },
+  { header: "Product Title", key: "product_title", width: 36 },
+  { header: "Vendor SKU", key: "vendor_sku", width: 18 },
+  { header: "Manufacturer Number", key: "manufacturer_number", width: 18 },
+  { header: "Brand", key: "brand", width: 18 },
+  { header: "Shopify Category Code", key: "shopify_category_code", width: 18 },
+  { header: "Shopify Product Type", key: "shopify_product_type", width: 18 },
+  { header: "Jomashop Category", key: "jomashop_category", width: 18 },
+  { header: "Jomashop Category ID", key: "jomashop_category_id", width: 16 },
+  { header: "Jomashop Brand ID", key: "jomashop_brand_id", width: 14 },
+  { header: "Current Push Status", key: "push_status", width: 16 },
+  { header: "Warnings", key: "warnings", width: 32 },
+];
+
+const TRAILING_COLUMNS: Array<{ header: string; key: string; width: number }> = [
+  { header: "Write Back?", key: "write_back", width: 12 },
+  { header: "Notes", key: "notes", width: 28 },
+];
+
+// Field names that conventionally apply to variants (size, etc). Used to
+// decide product vs variant metafield target during writeback. Tested in
+// `script/test-mapping.ts`.
+const VARIANT_FIELD_TOKENS = new Set<string>([
+  "size",
+  "variationsizeyesno",
+  "variation_size_yes_no",
+  "variationsize",
+  "variation",
+  "shoesize",
+  "size_us",
+]);
+
+export function fieldIsVariantTargeted(propertyName: string): boolean {
+  const tok = String(propertyName)
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
+  return VARIANT_FIELD_TOKENS.has(tok);
+}
+
+/**
+ * Derive a safe Shopify metafield namespace+key for a Jomashop schema field
+ * name. Mirrors the strategy used by the grouped enum-override workflow so
+ * the two paths land on the same metafield when they write to the same
+ * field.
+ *
+ *   "Article"                -> jomashop.article
+ *   "Variation Size (Yes/No)" -> jomashop.variation_size_yes_no
+ *   "Product ID Type"         -> jomashop.product_id_type
+ */
+export function deriveMetafieldTargetForProductField(propertyName: string): {
+  namespace: string;
+  key: string;
+} {
+  const key = String(propertyName)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 60);
+  return { namespace: "jomashop", key: key || "value" };
+}
+
+// ---------- Schema loading per category ----------
+
+async function loadLiveSchemaForCategory(category: string): Promise<{
+  fields: SchemaPropertyDescriptor[];
+  source: "live-v1" | "live-i1" | "fallback" | "unknown";
+}> {
+  // Start with bundled fallback so we always have SOMETHING for the column
+  // list.
+  const fallback = (FALLBACK_CATEGORY_SCHEMAS as Record<string, SchemaPropertyDescriptor[]>)[
+    category
+  ];
+  let baseFields: SchemaPropertyDescriptor[] = Array.isArray(fallback) ? [...fallback] : [];
+  let source: "live-v1" | "live-i1" | "fallback" | "unknown" =
+    baseFields.length > 0 ? "fallback" : "unknown";
+
+  if (!jomashopConfigured()) {
+    return { fields: baseFields, source };
+  }
+  try {
+    const v1 = await getV1CategoryDescriptors(category).catch(() => null);
+    if (v1 && (v1 as any).ok && Array.isArray((v1 as any).descriptors)) {
+      const live = (v1 as any).descriptors as SchemaPropertyDescriptor[];
+      if (live.length > 0) {
+        baseFields = live;
+        source = "live-v1";
+      }
+    }
+    if (source !== "live-v1") {
+      const rec = await resolveCategoryRecord(category).catch(() => null);
+      const liveId =
+        rec && (rec as any).ok && (rec as any).exact ? (rec as any).exact.id : null;
+      if (liveId !== null) {
+        const propsResp = await getCategoryPropertiesI1(liveId).catch(() => null);
+        if (propsResp && (propsResp as any).ok && (propsResp as any).data) {
+          const liveSchema = normalizeI1CategorySchema((propsResp as any).data);
+          if (liveSchema.length > 0) {
+            baseFields = liveSchema;
+            source = "live-i1";
+          }
+        }
+      }
+    }
+  } catch {
+    // ignore — keep fallback
+  }
+  return { fields: baseFields, source };
+}
+
+// ---------- Aggregation ----------
+
+/**
+ * Walk the cached product preview, group products by Jomashop category, and
+ * load each category's live schema. The result has all the data needed to
+ * build a multi-sheet workbook with one row per product (or variant if the
+ * product has multiple variants).
+ *
+ * `includeAll=false` (default) limits the output to products that are NOT
+ * push-ready — i.e. readiness != "ready" — so the operator's worklist
+ * matches the "what still needs filling" Mapping/Products UI buckets.
+ */
+export async function aggregateProductFieldRows(opts: {
+  includeAll?: boolean;
+} = {}): Promise<ProductFieldExportResult> {
+  const includeAll = opts.includeAll === true;
+  const conn = getActiveShopifyConnection();
+  const shopDomain =
+    conn?.shopDomain ??
+    storage.listStores().find((s) => s.oauthStatus === "connected")?.shopDomain ??
+    null;
+  const result: ProductFieldExportResult = {
+    shopDomain,
+    fromCache: false,
+    cachedAt: null,
+    totalProducts: 0,
+    includedAll: includeAll,
+    categories: [],
+  };
+  if (!shopDomain) return result;
+
+  const cache = storage.getProductCache(shopDomain);
+  if (!cache) return result;
+  result.fromCache = true;
+  result.cachedAt = cache.fetchedAt;
+
+  let payload: any;
+  try {
+    payload = JSON.parse(cache.payloadJson);
+  } catch {
+    return result;
+  }
+  const allMapped: any[] = Array.isArray(payload?.mapped) ? payload.mapped : [];
+  result.totalProducts = allMapped.length;
+
+  // Group products by Jomashop category.
+  const byCategory = new Map<string, any[]>();
+  for (const m of allMapped) {
+    const cat = String(m?.category || "").trim();
+    if (!cat) continue;
+    if (!includeAll && m?.readiness === "ready") continue;
+    let bucket = byCategory.get(cat);
+    if (!bucket) {
+      bucket = [];
+      byCategory.set(cat, bucket);
+    }
+    bucket.push(m);
+  }
+
+  // For each category, load the live schema and build rows.
+  for (const [category, products] of Array.from(byCategory.entries())) {
+    const { fields, source } = await loadLiveSchemaForCategory(category);
+    // Drop schema entries with empty/undefined names.
+    const cleanFields = fields.filter(
+      (f) => f && typeof f.field === "string" && f.field.trim() !== "" && f.field !== "undefined",
+    );
+    const rows: ProductFieldExportRow[] = [];
+    for (const m of products) {
+      const productId = m?.source?.shopify_product_id;
+      const variants = Array.isArray(m?.variants) ? m.variants : [];
+      const variantIds: Array<string | number> = Array.isArray(m?.source?.shopify_variant_ids)
+        ? m.source.shopify_variant_ids
+        : [];
+
+      const baseProps: Record<string, any> = (m?.properties && typeof m.properties === "object")
+        ? m.properties
+        : {};
+
+      const mkRow = (variantId: string, variantOptions: Record<string, string>, isVariant: boolean) => {
+        const fieldValues: Record<string, string> = {};
+        for (const f of cleanFields) {
+          // Look up the current app-derived value for this field by exact
+          // name first, then by case-insensitive match (covers the live vs
+          // fallback label drift).
+          let v: any = baseProps[f.field];
+          if (v === undefined) {
+            const wanted = f.field.toLowerCase().trim();
+            for (const [k, val] of Object.entries(baseProps)) {
+              if (String(k).toLowerCase().trim() === wanted) {
+                v = val;
+                break;
+              }
+            }
+          }
+          // Variant-targeted fields prefer the variant's own option value.
+          if (isVariant && fieldIsVariantTargeted(f.field) && variantOptions) {
+            for (const [k, val] of Object.entries(variantOptions)) {
+              if (String(k).toLowerCase().includes(f.field.toLowerCase())) {
+                v = val;
+                break;
+              }
+            }
+          }
+          fieldValues[f.field] =
+            v === undefined || v === null ? "" : String(v);
+        }
+        const rowId = crypto
+          .createHash("sha1")
+          .update(`${category}|${productId ?? ""}|${variantId}`)
+          .digest("hex")
+          .slice(0, 12);
+        rows.push({
+          rowId,
+          jomashopCategory: category,
+          shopifyProductId: productId ? String(productId) : "",
+          shopifyVariantId: variantId,
+          productTitle: String(m?.name ?? ""),
+          vendorSku: String(m?.vendor_sku ?? ""),
+          manufacturerNumber: String(m?.manufacturer_number ?? ""),
+          brand: String(m?.brand ?? ""),
+          shopifyCategoryCode: String(m?.raw_category ?? ""),
+          shopifyProductType: String(m?.raw_category ?? ""),
+          jomashopCategoryId: String(
+            m?.jomashop_resolution?.category_record?.id ?? "",
+          ),
+          jomashopBrandId: String(m?.jomashop_resolution?.manufacturer?.id ?? ""),
+          pushStatus: String(
+            m?.readiness ?? m?.push_state ?? "missing",
+          ),
+          warnings: Array.isArray(m?.warnings)
+            ? (m.warnings as string[]).slice(0, 3).join(" | ")
+            : "",
+          fieldValues,
+          isVariant,
+        });
+      };
+
+      if (variants.length > 1) {
+        // One row per variant when there is more than one.
+        for (let i = 0; i < variants.length; i++) {
+          const v = variants[i];
+          const variantId =
+            variantIds[i] !== undefined ? String(variantIds[i]) : String(v?.vendor_sku ?? "");
+          const opts = (v?.options && typeof v.options === "object") ? v.options as Record<string, string> : {};
+          mkRow(variantId, opts, true);
+        }
+      } else {
+        // Single row — variant id is the first (or empty).
+        const variantId =
+          variantIds[0] !== undefined ? String(variantIds[0]) : String(variants[0]?.vendor_sku ?? "");
+        const opts =
+          (variants[0]?.options && typeof variants[0].options === "object")
+            ? (variants[0].options as Record<string, string>)
+            : {};
+        mkRow(variantId, opts, false);
+      }
+    }
+    result.categories.push({
+      category,
+      fields: cleanFields,
+      fieldsSource: source,
+      rows,
+    });
+  }
+
+  // Sort categories alphabetically for stable sheet order.
+  result.categories.sort((a, b) => a.category.localeCompare(b.category));
+  return result;
+}
+
+// ---------- Workbook build ----------
+
+function sanitizeSheetName(name: string): string {
+  // Excel sheet names: max 31 chars, no : \ / ? * [ ]
+  return String(name).replace(/[:\\\/\?\*\[\]]/g, "_").slice(0, 31) || "Sheet";
+}
+
+export async function buildProductFieldWorkbook(
+  agg: ProductFieldExportResult,
+): Promise<Buffer> {
+  const wb = new ExcelJS.Workbook();
+  wb.creator = "LuxeSupply Jomashop Product Field Export";
+  wb.created = new Date();
+
+  // Instructions sheet.
+  const help = wb.addWorksheet("Instructions");
+  help.columns = [{ header: "How to use this workbook", key: "txt", width: 100 }];
+  help.getRow(1).font = { bold: true };
+  const lines = [
+    "One sheet per Jomashop category. One row per Shopify product (or per variant for multi-variant products).",
+    "Identity columns (left side) are for reference — do not edit Row ID, Shopify Product ID, or Shopify Variant ID.",
+    "Fill the per-field columns with the EXACT Jomashop-accepted value. Required fields are marked with * in the header.",
+    "Enum fields have a dropdown when the accepted list is short; longer lists are documented on the Accepted Options sheet.",
+    "Set Write Back? = Yes to also push the value to a Shopify metafield (namespace `jomashop`, key derived from the property name).",
+    "Variant-specific fields (e.g. Size) are written to variant metafields; product-level fields are written to product metafields.",
+    "Upload the completed file via the 'Upload Product Field Excel' button on the Mapping page.",
+    "Leave a cell blank to skip that field for that product.",
+  ];
+  for (const l of lines) help.addRow({ txt: l });
+
+  // Accepted Options helper sheet.
+  const acceptedSheet = wb.addWorksheet("Accepted Options");
+  acceptedSheet.columns = [
+    { header: "Jomashop Category", key: "category", width: 22 },
+    { header: "Property", key: "property", width: 28 },
+    { header: "Required", key: "required", width: 10 },
+    { header: "Accepted Options (one per line)", key: "options", width: 80 },
+  ];
+  acceptedSheet.getRow(1).font = { bold: true };
+
+  if (agg.categories.length === 0) {
+    // Nothing to write — emit an empty workbook with a single explanatory
+    // row so the operator gets a useful artifact even when the cache is
+    // empty.
+    const empty = wb.addWorksheet("No Products");
+    empty.columns = [{ header: "Status", key: "status", width: 80 }];
+    empty.addRow({
+      status:
+        agg.fromCache === false
+          ? "No connected Shopify store / no product cache. Click Refresh from Shopify first."
+          : "No matching products found in the cached preview.",
+    });
+    const buf = await wb.xlsx.writeBuffer();
+    return Buffer.from(buf);
+  }
+
+  for (const cat of agg.categories) {
+    const ws = wb.addWorksheet(sanitizeSheetName(cat.category), {
+      views: [{ state: "frozen", ySplit: 1 }],
+    });
+    const fieldColumns = cat.fields.map((f) => ({
+      header: `${f.field}${f.required ? " *" : ""}`,
+      key: `field__${f.field}`,
+      width: 22,
+    }));
+    ws.columns = [
+      ...IDENTITY_COLUMNS.map((c) => ({ header: c.header, key: c.key, width: c.width })),
+      ...fieldColumns,
+      ...TRAILING_COLUMNS.map((c) => ({ header: c.header, key: c.key, width: c.width })),
+    ];
+
+    // Header styling: identity = orange, editable = green, trailing = blue.
+    const header = ws.getRow(1);
+    header.font = { bold: true };
+    header.alignment = { vertical: "middle", horizontal: "center" };
+    let col = 1;
+    for (const _ of IDENTITY_COLUMNS) {
+      header.getCell(col).fill = {
+        type: "pattern",
+        pattern: "solid",
+        fgColor: { argb: "FFFFE0B2" },
+      };
+      header.getCell(col).note = "Identity / context column — do not edit.";
+      col++;
+    }
+    for (const f of cat.fields) {
+      const cell = header.getCell(col);
+      cell.fill = {
+        type: "pattern",
+        pattern: "solid",
+        fgColor: { argb: "FFC8E6C9" },
+      };
+      if (f.required) {
+        cell.note = `Required Jomashop field. Fill the EXACT accepted value.${
+          f.options && f.options.length > 0 ? " See Accepted Options sheet." : ""
+        }`;
+      }
+      col++;
+    }
+    for (const _ of TRAILING_COLUMNS) {
+      header.getCell(col).fill = {
+        type: "pattern",
+        pattern: "solid",
+        fgColor: { argb: "FFBBDEFB" },
+      };
+      col++;
+    }
+
+    // Body rows.
+    for (const r of cat.rows) {
+      const rowData: Record<string, string> = {
+        row_id: r.rowId,
+        shopify_product_id: r.shopifyProductId,
+        shopify_variant_id: r.shopifyVariantId,
+        product_title: r.productTitle,
+        vendor_sku: r.vendorSku,
+        manufacturer_number: r.manufacturerNumber,
+        brand: r.brand,
+        shopify_category_code: r.shopifyCategoryCode,
+        shopify_product_type: r.shopifyProductType,
+        jomashop_category: r.jomashopCategory,
+        jomashop_category_id: r.jomashopCategoryId,
+        jomashop_brand_id: r.jomashopBrandId,
+        push_status: r.pushStatus,
+        warnings: r.warnings,
+        write_back: "",
+        notes: "",
+      };
+      for (const f of cat.fields) {
+        rowData[`field__${f.field}`] = r.fieldValues[f.field] ?? "";
+      }
+      ws.addRow(rowData);
+    }
+
+    // Per-column data validation for enum fields with short option lists.
+    // Excel inline list cap is ~255 chars; use a generous size limit.
+    const identityCount = IDENTITY_COLUMNS.length;
+    for (let i = 0; i < cat.fields.length; i++) {
+      const f = cat.fields[i];
+      const colIdx = identityCount + 1 + i; // 1-based
+      const isShortEnum =
+        f.type === "enum" &&
+        Array.isArray(f.options) &&
+        f.options.length > 0 &&
+        f.options.length <= 50 &&
+        f.options.every((o) => !o.includes(","));
+      if (!isShortEnum) continue;
+      const letter = ws.getColumn(colIdx).letter;
+      for (let r = 0; r < cat.rows.length; r++) {
+        const rowNumber = r + 2;
+        ws.getCell(`${letter}${rowNumber}`).dataValidation = {
+          type: "list",
+          allowBlank: true,
+          formulae: ['"' + (f.options as string[]).join(",") + '"'],
+        };
+      }
+    }
+
+    // Write Back? as Yes/No dropdown.
+    const writeBackColIdx = identityCount + cat.fields.length + 1; // first trailing column
+    const wbLetter = ws.getColumn(writeBackColIdx).letter;
+    for (let r = 0; r < cat.rows.length; r++) {
+      const rowNumber = r + 2;
+      ws.getCell(`${wbLetter}${rowNumber}`).dataValidation = {
+        type: "list",
+        allowBlank: true,
+        formulae: ['"Yes,No"'],
+      };
+    }
+
+    if (cat.rows.length > 0) {
+      ws.autoFilter = {
+        from: { row: 1, column: 1 },
+        to: { row: 1, column: identityCount + cat.fields.length + TRAILING_COLUMNS.length },
+      };
+    }
+
+    // Accepted Options helper sheet entries for enum fields.
+    for (const f of cat.fields) {
+      if (f.type !== "enum") continue;
+      const opts = Array.isArray(f.options) ? f.options : [];
+      if (opts.length === 0) continue;
+      acceptedSheet.addRow({
+        category: cat.category,
+        property: f.field,
+        required: f.required ? "Yes" : "No",
+        options: opts.join("\n"),
+      });
+    }
+  }
+
+  const buf = await wb.xlsx.writeBuffer();
+  return Buffer.from(buf);
+}
+
+// ---------- Upload parsing ----------
+
+export type ParsedProductFieldRow = {
+  rowNumber: number;
+  sheetName: string;
+  rowId: string;
+  jomashopCategory: string;
+  shopifyProductId: string;
+  shopifyVariantId: string;
+  vendorSku: string;
+  /** field name -> user-supplied value (already trimmed). Blank cells omitted. */
+  fieldValues: Record<string, string>;
+  writeBack: boolean;
+  notes: string;
+  isValid: boolean;
+  errors: string[];
+};
+
+export type ParseProductFieldUploadResult = {
+  rows: ParsedProductFieldRow[];
+  headerErrors: string[];
+  perCategoryWarnings: string[];
+};
+
+function readCell(cell: ExcelJS.Cell): string {
+  const v = cell.value;
+  if (v === null || v === undefined) return "";
+  if (typeof v === "object") {
+    if ("richText" in (v as any) && Array.isArray((v as any).richText)) {
+      return ((v as any).richText as Array<{ text: string }>)
+        .map((t) => t.text)
+        .join("")
+        .trim();
+    }
+    if ("text" in (v as any)) return String((v as any).text ?? "").trim();
+    if ("result" in (v as any)) return String((v as any).result ?? "").trim();
+  }
+  return String(v).trim();
+}
+
+export async function parseProductFieldUpload(
+  buffer: Buffer,
+  agg: ProductFieldExportResult,
+): Promise<ParseProductFieldUploadResult> {
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(buffer);
+  const headerErrors: string[] = [];
+  const perCategoryWarnings: string[] = [];
+  const rows: ParsedProductFieldRow[] = [];
+
+  // Build a map of category name -> live schema fields, for validation.
+  const aggByCategory = new Map<string, ProductFieldExportResult["categories"][number]>();
+  for (const c of agg.categories) {
+    aggByCategory.set(sanitizeSheetName(c.category).toLowerCase(), c);
+  }
+  // Also key by raw category name for the case where the operator renamed
+  // the sheet to match the live category exactly.
+  for (const c of agg.categories) {
+    aggByCategory.set(c.category.toLowerCase(), c);
+  }
+
+  for (const ws of wb.worksheets) {
+    if (ws.name === "Instructions" || ws.name === "Accepted Options" || ws.name === "No Products") {
+      continue;
+    }
+    const sheetKey = ws.name.toLowerCase();
+    const cat = aggByCategory.get(sheetKey);
+    if (!cat) {
+      perCategoryWarnings.push(
+        `Sheet "${ws.name}" doesn't match any known Jomashop category; skipping.`,
+      );
+      continue;
+    }
+
+    // Build column-by-header lookup.
+    const headerByCol: Record<number, string> = {};
+    ws.getRow(1).eachCell((cell, c) => {
+      headerByCol[c] = String(cell.value ?? "").trim();
+    });
+    const colByHeader = new Map<string, number>();
+    for (const [c, name] of Object.entries(headerByCol)) {
+      colByHeader.set(name, Number(c));
+    }
+    // The category sheet must include at least Row ID + identity columns.
+    const requiredHeaders = ["Row ID", "Shopify Product ID", "Write Back?"];
+    for (const h of requiredHeaders) {
+      if (!colByHeader.has(h)) {
+        headerErrors.push(`Sheet "${ws.name}": missing required header "${h}"`);
+      }
+    }
+    // Field name -> column index (strip trailing " *").
+    const fieldColByName = new Map<string, number>();
+    for (const [header, c] of Array.from(colByHeader.entries())) {
+      const fieldName = header.replace(/\s*\*\s*$/, "").trim();
+      // A header counts as a field column when it matches one of the
+      // category's schema fields.
+      if (cat.fields.some((f) => f.field === fieldName)) {
+        fieldColByName.set(fieldName, c);
+      }
+    }
+    const get = (rowNum: number, header: string): string => {
+      const col = colByHeader.get(header);
+      if (!col) return "";
+      return readCell(ws.getRow(rowNum).getCell(col));
+    };
+
+    for (let r = 2; r <= ws.rowCount; r++) {
+      const wsRow = ws.getRow(r);
+      if (!wsRow || !wsRow.hasValues) continue;
+      const rowId = get(r, "Row ID");
+      // Collect field values (only non-blank).
+      const fieldValues: Record<string, string> = {};
+      const errors: string[] = [];
+      for (const [fieldName, c] of Array.from(fieldColByName.entries())) {
+        const cell = wsRow.getCell(c);
+        const val = readCell(cell);
+        if (val === "") continue;
+        // Validate against accepted options if the schema field is an enum
+        // with options.
+        const fdef = cat.fields.find((f) => f.field === fieldName);
+        if (fdef && fdef.type === "enum" && Array.isArray(fdef.options) && fdef.options.length > 0) {
+          const ok = fdef.options.some((o) => o.toLowerCase().trim() === val.toLowerCase().trim());
+          if (!ok) {
+            errors.push(
+              `"${fieldName}" value "${val}" is not in the live accepted-options list (${fdef.options.length} options). Accepted: ${fdef.options.slice(0, 8).join(", ")}${fdef.options.length > 8 ? "…" : ""}`,
+            );
+            continue;
+          }
+        }
+        // Basic numeric type validation.
+        if (fdef && (fdef.type === "number" || fdef.type === "integer")) {
+          const n = Number(val);
+          if (!Number.isFinite(n)) {
+            errors.push(`"${fieldName}" expects a number; got "${val}"`);
+            continue;
+          }
+        }
+        // String length sanity: 1000 char cap (matches Shopify single-line metafield max).
+        if (val.length > 1000) {
+          errors.push(`"${fieldName}" exceeds 1000 character cap.`);
+          continue;
+        }
+        fieldValues[fieldName] = val;
+      }
+      // Check required fields are present whenever the operator has filled
+      // at least one cell on this row (skip silent blank rows).
+      const anyValue = Object.keys(fieldValues).length > 0;
+      if (!rowId && !anyValue) continue;
+      if (anyValue) {
+        for (const f of cat.fields) {
+          if (!f.required) continue;
+          if (!fieldValues[f.field]) {
+            // Allow operator to leave required fields blank IF the current
+            // value coming back from the source already has one — we can't
+            // see that here, so report a soft warning rather than a hard
+            // error. We'll flag as a note in `errors` only when no other
+            // values are present.
+            errors.push(
+              `Required field "${f.field}" left blank — provide a value to fill the gap.`,
+            );
+          }
+        }
+      }
+      const writeBackRaw = get(r, "Write Back?").toLowerCase();
+      const writeBack = writeBackRaw === "yes" || writeBackRaw === "y" || writeBackRaw === "true";
+      rows.push({
+        rowNumber: r,
+        sheetName: ws.name,
+        rowId,
+        jomashopCategory: cat.category,
+        shopifyProductId: get(r, "Shopify Product ID"),
+        shopifyVariantId: get(r, "Shopify Variant ID"),
+        vendorSku: get(r, "Vendor SKU"),
+        fieldValues,
+        writeBack,
+        notes: get(r, "Notes"),
+        isValid: errors.length === 0,
+        errors,
+      });
+    }
+  }
+
+  return { rows, headerErrors, perCategoryWarnings };
+}
+
+// ---------- Shopify metafield write ----------
+
+const ADMIN_API_VERSION = "2024-10";
+
+async function writeMetafield(
+  conn: { shopDomain: string; accessToken: string },
+  ownerId: string,
+  namespace: string,
+  key: string,
+  value: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const endpoint = `https://${conn.shopDomain}/admin/api/${ADMIN_API_VERSION}/graphql.json`;
+  const query = `
+    mutation Set($metafields: [MetafieldsSetInput!]!) {
+      metafieldsSet(metafields: $metafields) {
+        metafields { id namespace key }
+        userErrors { field message }
+      }
+    }
+  `;
+  const variables = {
+    metafields: [
+      {
+        ownerId,
+        namespace,
+        key,
+        type: "single_line_text_field",
+        value,
+      },
+    ],
+  };
+  let res: Response;
+  try {
+    res = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": conn.accessToken,
+      },
+      body: JSON.stringify({ query, variables }),
+    });
+  } catch (err) {
+    return { ok: false, error: (err as Error).message };
+  }
+  const body = (await res.json().catch(() => null)) as
+    | {
+        data?: {
+          metafieldsSet?: {
+            userErrors?: Array<{ field: string[]; message: string }>;
+          };
+        };
+        errors?: Array<{ message: string }>;
+      }
+    | null;
+  if (!res.ok || !body) return { ok: false, error: `Shopify Admin API ${res.status}` };
+  if (body.errors && body.errors.length > 0) {
+    return { ok: false, error: body.errors.map((e) => e.message).join("; ") };
+  }
+  const ue = body.data?.metafieldsSet?.userErrors ?? [];
+  if (ue.length > 0) {
+    return { ok: false, error: ue.map((e) => e.message).join("; ") };
+  }
+  return { ok: true };
+}
+
+export type ProductFieldWriteResult = {
+  rowId: string;
+  ownerId: string;
+  ownerType: "product" | "variant";
+  field: string;
+  namespace: string;
+  key: string;
+  ok: boolean;
+  error: string | null;
+};
+
+// ---------- Route registration ----------
+
+type Session = {
+  id: string;
+  createdAt: number;
+  rows: ParsedProductFieldRow[];
+  aggSnapshot: ProductFieldExportResult;
+};
+const SESSION_TTL_MS = 60 * 60 * 1000;
+const SESSIONS = new Map<string, Session>();
+function newSessionId(): string {
+  return crypto.randomBytes(16).toString("hex");
+}
+function gcSessions(): void {
+  const cutoff = Date.now() - SESSION_TTL_MS;
+  const stale: string[] = [];
+  SESSIONS.forEach((s, id) => {
+    if (s.createdAt < cutoff) stale.push(id);
+  });
+  for (const id of stale) SESSIONS.delete(id);
+}
+
+export function registerJomashopProductFieldExcelRoutes(app: Express): void {
+  const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 20 * 1024 * 1024 },
+  });
+
+  // GET: JSON summary (debug / UI preview).
+  app.get("/api/jomashop-product-fields/summary", async (req, res) => {
+    try {
+      const includeAll = String(req.query.all ?? "") === "1" || String(req.query.all ?? "") === "true";
+      const agg = await aggregateProductFieldRows({ includeAll });
+      res.json({
+        ok: true,
+        shopDomain: agg.shopDomain,
+        fromCache: agg.fromCache,
+        cachedAt: agg.cachedAt,
+        totalProducts: agg.totalProducts,
+        includedAll: agg.includedAll,
+        categories: agg.categories.map((c) => ({
+          category: c.category,
+          fieldsSource: c.fieldsSource,
+          fields: c.fields.map((f) => ({
+            field: f.field,
+            required: f.required,
+            type: f.type ?? "string",
+            optionCount: Array.isArray(f.options) ? f.options.length : 0,
+          })),
+          rowCount: c.rows.length,
+        })),
+      });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: (err as Error).message });
+    }
+  });
+
+  // GET: XLSX export.
+  app.get("/api/jomashop-product-fields/export.xlsx", async (req, res) => {
+    try {
+      const includeAll = String(req.query.all ?? "") === "1" || String(req.query.all ?? "") === "true";
+      const agg = await aggregateProductFieldRows({ includeAll });
+      if (!agg.shopDomain) {
+        return res.status(503).json({
+          ok: false,
+          error: "No connected Shopify store. Complete OAuth install first.",
+        });
+      }
+      if (!agg.fromCache) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "No cached product preview. Click Refresh from Shopify on the Products page first.",
+        });
+      }
+      const buf = await buildProductFieldWorkbook(agg);
+      const filename = `jomashop-product-fields-${agg.shopDomain.replace(/\.myshopify\.com$/, "")}-${
+        includeAll ? "all" : "unready"
+      }-${new Date().toISOString().slice(0, 10)}.xlsx`;
+      res.setHeader(
+        "Content-Type",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      );
+      res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+      const rowCount = agg.categories.reduce((acc, c) => acc + c.rows.length, 0);
+      res.setHeader("X-Export-Rows", String(rowCount));
+      res.setHeader("X-Export-Sheets", String(agg.categories.length));
+      res.setHeader("X-Export-Shop", agg.shopDomain);
+      storage.appendLog({
+        level: "info",
+        message: `Exported Jomashop product-field XLSX (${rowCount} row(s), ${agg.categories.length} sheet(s)) for ${agg.shopDomain}`,
+        detailsJson: JSON.stringify({
+          totalProducts: agg.totalProducts,
+          includedAll: agg.includedAll,
+          categories: agg.categories.map((c) => ({
+            category: c.category,
+            rows: c.rows.length,
+            fields: c.fields.length,
+            fieldsSource: c.fieldsSource,
+          })),
+        }),
+        createdAt: Date.now(),
+      });
+      res.end(buf);
+    } catch (err) {
+      const msg = (err as Error).message;
+      storage.appendLog({
+        level: "error",
+        message: `Jomashop product-field XLSX export failed: ${msg}`,
+        detailsJson: null,
+        createdAt: Date.now(),
+      });
+      res.status(500).json({ ok: false, error: msg });
+    }
+  });
+
+  // POST: upload XLSX, validate, hold the parsed result in a session.
+  app.post(
+    "/api/jomashop-product-fields/import-preview",
+    upload.single("file"),
+    async (req, res) => {
+      gcSessions();
+      const file = req.file;
+      if (!file) {
+        return res.status(400).json({ ok: false, error: "Missing uploaded file." });
+      }
+      try {
+        const agg = await aggregateProductFieldRows({ includeAll: true });
+        const parsed = await parseProductFieldUpload(file.buffer, agg);
+        const sessionId = newSessionId();
+        SESSIONS.set(sessionId, {
+          id: sessionId,
+          createdAt: Date.now(),
+          rows: parsed.rows,
+          aggSnapshot: agg,
+        });
+        const validRows = parsed.rows.filter((r) => r.isValid);
+        const errorRows = parsed.rows.filter((r) => !r.isValid);
+        const writebackRows = validRows.filter((r) => r.writeBack);
+        res.json({
+          ok: parsed.headerErrors.length === 0,
+          sessionId,
+          headerErrors: parsed.headerErrors,
+          perCategoryWarnings: parsed.perCategoryWarnings,
+          totals: {
+            total: parsed.rows.length,
+            valid: validRows.length,
+            errors: errorRows.length,
+            writeback: writebackRows.length,
+            metafieldsFillable: validRows.reduce(
+              (acc, r) => acc + Object.keys(r.fieldValues).length,
+              0,
+            ),
+          },
+          rows: parsed.rows.map((r) => ({
+            rowNumber: r.rowNumber,
+            sheetName: r.sheetName,
+            rowId: r.rowId,
+            jomashop_category: r.jomashopCategory,
+            shopify_product_id: r.shopifyProductId,
+            shopify_variant_id: r.shopifyVariantId,
+            vendor_sku: r.vendorSku,
+            field_count: Object.keys(r.fieldValues).length,
+            field_values: r.fieldValues,
+            write_back: r.writeBack,
+            notes: r.notes,
+            is_valid: r.isValid,
+            errors: r.errors,
+          })),
+        });
+      } catch (err) {
+        const msg = (err as Error).message;
+        res.status(400).json({ ok: false, error: `Could not parse XLSX: ${msg}` });
+      }
+    },
+  );
+
+  // POST: apply — write Shopify metafields + invalidate cache.
+  app.post("/api/jomashop-product-fields/apply", async (req, res) => {
+    gcSessions();
+    const body = (req.body ?? {}) as {
+      sessionId?: string;
+      confirm?: boolean;
+      ignoreErrors?: boolean;
+    };
+    if (!body.confirm) {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing confirmation. Set `confirm: true` to apply.",
+      });
+    }
+    if (!body.sessionId) {
+      return res.status(400).json({ ok: false, error: "Missing sessionId." });
+    }
+    const session = SESSIONS.get(body.sessionId);
+    if (!session) {
+      return res
+        .status(404)
+        .json({ ok: false, error: "Session not found or expired. Re-upload the XLSX." });
+    }
+    const ignoreErrors = body.ignoreErrors === true;
+    const validRows = session.rows.filter((r) => r.isValid || ignoreErrors);
+    const skippedInvalid = session.rows.length - validRows.length;
+
+    const conn = getActiveShopifyConnection();
+    const shopDomain =
+      conn?.shopDomain ??
+      storage.listStores().find((s) => s.oauthStatus === "connected")?.shopDomain ??
+      null;
+
+    const writes: ProductFieldWriteResult[] = [];
+    let attempted = 0;
+    let succeeded = 0;
+    let failed = 0;
+
+    if (conn) {
+      for (const row of validRows) {
+        if (!row.writeBack) continue;
+        for (const [fieldName, value] of Object.entries(row.fieldValues)) {
+          if (!value) continue;
+          const target = deriveMetafieldTargetForProductField(fieldName);
+          const isVariant = fieldIsVariantTargeted(fieldName);
+          const ownerId =
+            isVariant && row.shopifyVariantId
+              ? row.shopifyVariantId.startsWith("gid://")
+                ? row.shopifyVariantId
+                : `gid://shopify/ProductVariant/${row.shopifyVariantId}`
+              : row.shopifyProductId
+              ? row.shopifyProductId.startsWith("gid://")
+                ? row.shopifyProductId
+                : `gid://shopify/Product/${row.shopifyProductId}`
+              : "";
+          if (!ownerId) {
+            writes.push({
+              rowId: row.rowId,
+              ownerId: "",
+              ownerType: isVariant ? "variant" : "product",
+              field: fieldName,
+              namespace: target.namespace,
+              key: target.key,
+              ok: false,
+              error: "Missing Shopify product/variant id; cannot write metafield.",
+            });
+            failed++;
+            attempted++;
+            continue;
+          }
+          attempted++;
+          const result = await writeMetafield(
+            conn,
+            ownerId,
+            target.namespace,
+            target.key,
+            value,
+          );
+          writes.push({
+            rowId: row.rowId,
+            ownerId,
+            ownerType: isVariant ? "variant" : "product",
+            field: fieldName,
+            namespace: target.namespace,
+            key: target.key,
+            ok: result.ok,
+            error: result.ok ? null : result.error,
+          });
+          if (result.ok) succeeded++;
+          else failed++;
+        }
+      }
+    }
+
+    // Invalidate cached preview so the next refresh re-derives the
+    // properties from the freshly-written metafields.
+    if (shopDomain) {
+      try {
+        storage.clearProductCache(shopDomain);
+      } catch {
+        // non-fatal
+      }
+    }
+
+    storage.appendLog({
+      level: "info",
+      message: `Applied Jomashop product-field XLSX: ${validRows.length} row(s), ${succeeded}/${attempted} metafield writes succeeded`,
+      detailsJson: JSON.stringify({
+        sessionId: session.id,
+        rowsProcessed: session.rows.length,
+        validRows: validRows.length,
+        skippedInvalid,
+        writeAttempted: attempted,
+        writeSucceeded: succeeded,
+        writeFailed: failed,
+      }),
+      createdAt: Date.now(),
+    });
+
+    SESSIONS.delete(session.id);
+    res.json({
+      ok: true,
+      rowsProcessed: session.rows.length,
+      validRowsApplied: validRows.length,
+      skippedInvalidRows: skippedInvalid,
+      cacheInvalidatedFor: shopDomain,
+      shopifyConnected: Boolean(conn),
+      metafieldWriteSummary: { attempted, succeeded, failed },
+      metafieldWrites: writes,
+      warnings: !conn
+        ? ["No connected Shopify store — metafield writes were skipped."]
+        : [],
+      note: shopDomain
+        ? "Applied. Click Refresh from Shopify on the Products page to recompute readiness with the new metafields."
+        : "Applied.",
+    });
+  });
+}

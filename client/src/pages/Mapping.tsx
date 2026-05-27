@@ -7,6 +7,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { PageHeader, LoadingRows, ErrorBlock } from "@/components/AppShell";
 import type { CategorySchema } from "@/lib/types";
 import { JomashopMappingExcelCard } from "@/components/JomashopMappingExcel";
+import { JomashopProductFieldExcelCard } from "@/components/JomashopProductFieldExcel";
 
 const CATEGORIES = ["Shoes", "Handbags", "Clothing"] as const;
 type Cat = (typeof CATEGORIES)[number];
@@ -103,7 +104,8 @@ export default function Mapping() {
         title="Field mapping"
         description="Map Shopify product fields to Jomashop category properties. Schemas are fetched live from /v1/categories/:name when credentials are available."
       />
-      <div className="mb-6">
+      <div className="mb-6 space-y-6">
+        <JomashopProductFieldExcelCard />
         <JomashopMappingExcelCard />
       </div>
       <Card>
