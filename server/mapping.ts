@@ -627,6 +627,19 @@ export type SchemaPropertyDescriptor = {
    *  enum fields like Apparel's "Article" where the public guess list does
    *  not match Jomashop's actual accepted set. */
   options_unverified?: boolean;
+  /** Live-schema hint: the field accepts multiple values (comma-separated on
+   *  the wire). Surfaces in the per-product XLSX as a header note so the
+   *  operator knows to comma-separate, and tells the upload validator to
+   *  validate each token against the accepted-options list. */
+  multiple?: boolean;
+  /** Live-schema string-length hints (mirrors v1 `data.min_length` /
+   *  `max_length`). Surfaced as header notes and enforced on upload. */
+  min_length?: number;
+  max_length?: number;
+  /** Live-schema numeric hints. */
+  min_value?: number;
+  max_value?: number;
+  only_integer?: boolean;
 };
 
 /** Collapse a label/field to a single comparable token. */
@@ -1067,6 +1080,17 @@ export function normalizeV1CategorySchema(raw: unknown): SchemaPropertyDescripto
     }
     const hasOptions = options.length > 0;
     if (hasOptions && !type) type = "enum";
+    const num = (v: unknown): number | undefined =>
+      typeof v === "number" && Number.isFinite(v) ? v : undefined;
+    const multiple = Boolean(dataObj?.multiple);
+    const min_length = num(dataObj?.min_length);
+    const max_length = num(dataObj?.max_length);
+    const min_value = num(dataObj?.min_value ?? dataObj?.min);
+    const max_value = num(dataObj?.max_value ?? dataObj?.max);
+    const only_integer =
+      kindRaw === "integer" ||
+      Boolean(dataObj?.only_integer) ||
+      Boolean(dataObj?.integer);
     out.push({
       field,
       label,
@@ -1076,6 +1100,12 @@ export function normalizeV1CategorySchema(raw: unknown): SchemaPropertyDescripto
       // v1 options are LIVE and verified — never mark as unverified.
       allow_omit: !required,
       omit_when_unknown_enum: !required && hasOptions,
+      multiple: multiple || undefined,
+      min_length,
+      max_length,
+      min_value,
+      max_value,
+      only_integer: only_integer || undefined,
     });
   }
   return out;
@@ -1141,6 +1171,15 @@ export function normalizeI1CategorySchema(raw: unknown): SchemaPropertyDescripto
     //     never carries an explicit null for a field Jomashop did not
     //     require (some validators reject explicit nulls).
     const hasOptions = options.length > 0;
+    const num = (v: unknown): number | undefined =>
+      typeof v === "number" && Number.isFinite(v) ? v : undefined;
+    const multiple = Boolean(it.multiple);
+    const min_length = num(it.min_length ?? it.minLength);
+    const max_length = num(it.max_length ?? it.maxLength);
+    const min_value = num(it.min_value ?? it.min);
+    const max_value = num(it.max_value ?? it.max);
+    const only_integer =
+      type === "integer" || Boolean(it.only_integer) || Boolean(it.integer);
     out.push({
       field,
       label: typeof label === "string" ? label : undefined,
@@ -1149,6 +1188,12 @@ export function normalizeI1CategorySchema(raw: unknown): SchemaPropertyDescripto
       options: hasOptions ? options : undefined,
       allow_omit: !required,
       omit_when_unknown_enum: !required && hasOptions,
+      multiple: multiple || undefined,
+      min_length,
+      max_length,
+      min_value,
+      max_value,
+      only_integer: only_integer || undefined,
     });
   }
   return out;

@@ -368,6 +368,37 @@ function sanitizeSheetName(name: string): string {
   return String(name).replace(/[:\\\/\?\*\[\]]/g, "_").slice(0, 31) || "Sheet";
 }
 
+/**
+ * Defined-name slug used to reference an enum's accepted-values range from a
+ * data validation formula. Must be a valid Excel defined name: letters,
+ * digits, dot, underscore; cannot start with a digit; cannot match a cell
+ * reference. We collapse non-alphanumeric chars to "_" and prefix with
+ * "opts_" to guarantee a safe start.
+ */
+export function buildOptionsRangeName(category: string, field: string): string {
+  const slug = (s: string) =>
+    String(s)
+      .replace(/[^A-Za-z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "");
+  return `opts_${slug(category)}_${slug(field)}`.slice(0, 255);
+}
+
+/**
+ * Convert a 1-based column index to its Excel letter (A, B, … Z, AA, AB, …).
+ * Used to build absolute cell references for defined names and data
+ * validation formulae.
+ */
+function columnLetter(idx: number): string {
+  let n = idx;
+  let s = "";
+  while (n > 0) {
+    const rem = (n - 1) % 26;
+    s = String.fromCharCode(65 + rem) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
+}
+
 export async function buildProductFieldWorkbook(
   agg: ProductFieldExportResult,
 ): Promise<Buffer> {
@@ -382,21 +413,89 @@ export async function buildProductFieldWorkbook(
   const lines = [
     "One sheet per Jomashop category. One row per Shopify product (or per variant for multi-variant products).",
     "Identity columns (left side) are for reference — do not edit Row ID, Shopify Product ID, or Shopify Variant ID.",
-    "Fill the per-field columns with the EXACT Jomashop-accepted value. Required fields are marked with * in the header.",
-    "Enum fields have a dropdown when the accepted list is short; longer lists are documented on the Accepted Options sheet.",
+    "Fill the per-field columns with the EXACT Jomashop-accepted value. Required fields are marked with * in the header and highlighted yellow.",
+    "Every enum field has a dropdown that pulls from the live Jomashop accepted-values list — even when the list is long.",
+    "Fields that accept multiple values (multi-select on Jomashop) are noted in the header; enter comma-separated values matching the dropdown options.",
+    "Numeric fields show min/max/integer-only hints in their header note.",
     "Set Write Back? = Yes to also push the value to a Shopify metafield (namespace `jomashop`, key derived from the property name).",
     "Variant-specific fields (e.g. Size) are written to variant metafields; product-level fields are written to product metafields.",
     "Upload the completed file via the 'Upload Product Field Excel' button on the Mapping page.",
     "Leave a cell blank to skip that field for that product.",
+    "Note: Upload validation is authoritative — even if you bypass a dropdown, any enum value not on the live accepted list will be rejected on upload.",
   ];
   for (const l of lines) help.addRow({ txt: l });
 
-  // Accepted Options helper sheet.
+  // Hidden helper sheet that holds the accepted-values list for every enum
+  // field across every category. One COLUMN per (category, field); the
+  // workbook defines a name pointing at that column's data range. Category
+  // sheets reference those named ranges in their data validation. This is
+  // the only way to support enum lists that exceed Excel's ~255-char inline
+  // list limit (e.g. Country of Origin with ~200 countries).
+  const optionsSheet = wb.addWorksheet("_Options");
+  // Mark the sheet hidden so the operator only sees the editable category
+  // sheets. exceljs accepts "hidden" / "veryHidden".
+  optionsSheet.state = "hidden";
+
+  // Plan all columns first so we can lay them out side-by-side with one
+  // header row + values down each column.
+  type OptionCol = {
+    category: string;
+    field: string;
+    rangeName: string;
+    columnIndex: number; // 1-based
+    options: string[];
+  };
+  const optionCols: OptionCol[] = [];
+  let nextCol = 1;
+  for (const cat of agg.categories) {
+    for (const f of cat.fields) {
+      if (f.type !== "enum") continue;
+      const opts = Array.isArray(f.options) ? f.options.filter((o) => o && o.trim()) : [];
+      if (opts.length === 0) continue;
+      optionCols.push({
+        category: cat.category,
+        field: f.field,
+        rangeName: buildOptionsRangeName(cat.category, f.field),
+        columnIndex: nextCol,
+        options: opts,
+      });
+      nextCol++;
+    }
+  }
+  // Header row of the hidden sheet: "<Category>!<Field>" for readability if
+  // the operator unhides the sheet. The header is intentionally NOT part of
+  // the named range — only the values below are.
+  if (optionCols.length > 0) {
+    for (const oc of optionCols) {
+      optionsSheet.getCell(1, oc.columnIndex).value = `${oc.category} :: ${oc.field}`;
+      optionsSheet.getCell(1, oc.columnIndex).font = { bold: true };
+      for (let i = 0; i < oc.options.length; i++) {
+        optionsSheet.getCell(i + 2, oc.columnIndex).value = oc.options[i];
+      }
+      const lastRow = oc.options.length + 1; // header is row 1, first value row 2
+      const letter = columnLetter(oc.columnIndex);
+      // Defined name -> absolute reference into the _Options sheet.
+      const ref = `_Options!$${letter}$2:$${letter}$${lastRow}`;
+      wb.definedNames.add(ref, oc.rangeName);
+    }
+    optionsSheet.getColumn(1).width = 32;
+  }
+
+  const optionColByKey = new Map<string, OptionCol>();
+  for (const oc of optionCols) {
+    optionColByKey.set(`${oc.category}::${oc.field}`, oc);
+  }
+
+  // Accepted Options helper sheet — human-readable reference. Kept even
+  // though dropdowns now cover all enum lengths, because operators
+  // sometimes need to copy-paste large lists or cross-check the published
+  // accepted values offline.
   const acceptedSheet = wb.addWorksheet("Accepted Options");
   acceptedSheet.columns = [
     { header: "Jomashop Category", key: "category", width: 22 },
     { header: "Property", key: "property", width: 28 },
     { header: "Required", key: "required", width: 10 },
+    { header: "Multiple", key: "multiple", width: 10 },
     { header: "Accepted Options (one per line)", key: "options", width: 80 },
   ];
   acceptedSheet.getRow(1).font = { bold: true };
@@ -417,6 +516,13 @@ export async function buildProductFieldWorkbook(
     return Buffer.from(buf);
   }
 
+  // Provide at least 1 placeholder body row so per-column data validation
+  // can be applied to a non-empty range even when the category has zero
+  // matching products. Without this, exceljs writes the validation but
+  // there are no cells to attach it to, so the operator-visible dropdown
+  // disappears on the first new row.
+  const VALIDATION_ROW_PAD = 50;
+
   for (const cat of agg.categories) {
     const ws = wb.addWorksheet(sanitizeSheetName(cat.category), {
       views: [{ state: "frozen", ySplit: 1 }],
@@ -432,7 +538,8 @@ export async function buildProductFieldWorkbook(
       ...TRAILING_COLUMNS.map((c) => ({ header: c.header, key: c.key, width: c.width })),
     ];
 
-    // Header styling: identity = orange, editable = green, trailing = blue.
+    // Header styling: identity = orange, optional editable = green,
+    // required editable = yellow (per spec), trailing = blue.
     const header = ws.getRow(1);
     header.font = { bold: true };
     header.alignment = { vertical: "middle", horizontal: "center" };
@@ -451,13 +558,38 @@ export async function buildProductFieldWorkbook(
       cell.fill = {
         type: "pattern",
         pattern: "solid",
-        fgColor: { argb: "FFC8E6C9" },
+        fgColor: { argb: f.required ? "FFFFE082" : "FFC8E6C9" },
       };
       if (f.required) {
-        cell.note = `Required Jomashop field. Fill the EXACT accepted value.${
-          f.options && f.options.length > 0 ? " See Accepted Options sheet." : ""
-        }`;
+        cell.font = { bold: true, color: { argb: "FFB71C1C" } };
       }
+      const noteParts: string[] = [];
+      if (f.required) noteParts.push("REQUIRED Jomashop field — must be filled.");
+      if (f.type === "enum" && Array.isArray(f.options) && f.options.length > 0) {
+        noteParts.push(
+          `Pick a value from the dropdown (live accepted list, ${f.options.length} option${f.options.length === 1 ? "" : "s"}).`,
+        );
+      }
+      if (f.multiple) {
+        noteParts.push(
+          "Accepts multiple values — enter comma-separated tokens; each token must be in the accepted list.",
+        );
+      }
+      if (f.type === "number" || f.type === "integer" || f.only_integer) {
+        const bounds: string[] = [];
+        if (typeof f.min_value === "number") bounds.push(`min=${f.min_value}`);
+        if (typeof f.max_value === "number") bounds.push(`max=${f.max_value}`);
+        noteParts.push(
+          `Numeric${f.only_integer ? " (integer only)" : ""}${bounds.length > 0 ? `; ${bounds.join(", ")}` : ""}.`,
+        );
+      }
+      if (f.type === "string" || (!f.type && !Array.isArray(f.options))) {
+        const bounds: string[] = [];
+        if (typeof f.min_length === "number") bounds.push(`min length=${f.min_length}`);
+        if (typeof f.max_length === "number") bounds.push(`max length=${f.max_length}`);
+        if (bounds.length > 0) noteParts.push(`Free text; ${bounds.join(", ")}.`);
+      }
+      if (noteParts.length > 0) cell.note = noteParts.join(" ");
       col++;
     }
     for (const _ of TRAILING_COLUMNS) {
@@ -495,36 +627,114 @@ export async function buildProductFieldWorkbook(
       ws.addRow(rowData);
     }
 
-    // Per-column data validation for enum fields with short option lists.
-    // Excel inline list cap is ~255 chars; use a generous size limit.
+    // Compute number of body rows we attach validations to. Use the larger
+    // of actual data rows OR a small pad so the operator can drag-fill new
+    // rows without losing the dropdown.
+    const dataRowCount = Math.max(cat.rows.length, VALIDATION_ROW_PAD);
+
+    // Per-column data validation for EVERY enum field. References the
+    // hidden _Options sheet via a workbook-level defined name — works for
+    // any length of accepted-values list (Excel's ~255-char inline list
+    // cap doesn't apply).
     const identityCount = IDENTITY_COLUMNS.length;
     for (let i = 0; i < cat.fields.length; i++) {
       const f = cat.fields[i];
       const colIdx = identityCount + 1 + i; // 1-based
-      const isShortEnum =
-        f.type === "enum" &&
-        Array.isArray(f.options) &&
-        f.options.length > 0 &&
-        f.options.length <= 50 &&
-        f.options.every((o) => !o.includes(","));
-      if (!isShortEnum) continue;
-      const letter = ws.getColumn(colIdx).letter;
-      for (let r = 0; r < cat.rows.length; r++) {
-        const rowNumber = r + 2;
-        ws.getCell(`${letter}${rowNumber}`).dataValidation = {
-          type: "list",
-          allowBlank: true,
-          formulae: ['"' + (f.options as string[]).join(",") + '"'],
-        };
+      const colLetter = columnLetter(colIdx);
+      const oc = optionColByKey.get(`${cat.category}::${f.field}`);
+
+      // Highlight required body cells with a faint yellow tint so they
+      // visually stand out from optional columns.
+      if (f.required) {
+        for (let r = 0; r < dataRowCount; r++) {
+          const cell = ws.getCell(`${colLetter}${r + 2}`);
+          if (!cell.fill || (cell.fill as { type?: string }).type !== "pattern") {
+            cell.fill = {
+              type: "pattern",
+              pattern: "solid",
+              fgColor: { argb: "FFFFF8E1" },
+            };
+          }
+        }
+      }
+
+      if (f.type === "enum" && oc) {
+        // Single-select enum: use the named range directly.
+        // Multi-select enum (f.multiple === true): Excel's data validation
+        // doesn't natively support multi-select against a list, so we use
+        // a prompt-only validation pointing at the list — operator types
+        // comma-separated values; upload validation enforces each token.
+        const formula = `=${oc.rangeName}`;
+        if (f.multiple === true) {
+          for (let r = 0; r < dataRowCount; r++) {
+            ws.getCell(`${colLetter}${r + 2}`).dataValidation = {
+              type: "list",
+              allowBlank: true,
+              showInputMessage: true,
+              prompt:
+                "Enter comma-separated values. Each token must be one of the listed accepted values.",
+              promptTitle: `${f.field} (multi-select)`,
+              formulae: [formula],
+            };
+          }
+        } else {
+          for (let r = 0; r < dataRowCount; r++) {
+            ws.getCell(`${colLetter}${r + 2}`).dataValidation = {
+              type: "list",
+              allowBlank: !f.required,
+              showErrorMessage: true,
+              errorStyle: "stop",
+              errorTitle: `Invalid ${f.field}`,
+              error: `Value must be one of the Jomashop-accepted options for "${f.field}".`,
+              formulae: [formula],
+            };
+          }
+        }
+      } else if (f.type === "number" || f.type === "integer" || f.only_integer) {
+        // Numeric data validation — bounds when known.
+        const isInt = f.only_integer === true || f.type === "integer";
+        for (let r = 0; r < dataRowCount; r++) {
+          ws.getCell(`${colLetter}${r + 2}`).dataValidation = {
+            type: isInt ? "whole" : "decimal",
+            allowBlank: !f.required,
+            operator: "between",
+            formulae: [
+              typeof f.min_value === "number" ? String(f.min_value) : "-1E308",
+              typeof f.max_value === "number" ? String(f.max_value) : "1E308",
+            ],
+            errorStyle: "stop",
+            errorTitle: `Invalid ${f.field}`,
+            error: isInt
+              ? `Enter an integer${typeof f.min_value === "number" || typeof f.max_value === "number" ? ` between ${f.min_value ?? "-∞"} and ${f.max_value ?? "∞"}` : ""}.`
+              : `Enter a number${typeof f.min_value === "number" || typeof f.max_value === "number" ? ` between ${f.min_value ?? "-∞"} and ${f.max_value ?? "∞"}` : ""}.`,
+          };
+        }
+      } else if (
+        (f.type === "string" || !f.type) &&
+        (typeof f.max_length === "number" || typeof f.min_length === "number")
+      ) {
+        // Free-text fields with length hints — apply textLength validation.
+        const min = typeof f.min_length === "number" ? f.min_length : 0;
+        const max = typeof f.max_length === "number" ? f.max_length : 1000;
+        for (let r = 0; r < dataRowCount; r++) {
+          ws.getCell(`${colLetter}${r + 2}`).dataValidation = {
+            type: "textLength",
+            allowBlank: !f.required,
+            operator: "between",
+            formulae: [String(min), String(max)],
+            errorStyle: "stop",
+            errorTitle: `Invalid ${f.field}`,
+            error: `Text length must be between ${min} and ${max} characters.`,
+          };
+        }
       }
     }
 
     // Write Back? as Yes/No dropdown.
     const writeBackColIdx = identityCount + cat.fields.length + 1; // first trailing column
-    const wbLetter = ws.getColumn(writeBackColIdx).letter;
-    for (let r = 0; r < cat.rows.length; r++) {
-      const rowNumber = r + 2;
-      ws.getCell(`${wbLetter}${rowNumber}`).dataValidation = {
+    const wbLetter = columnLetter(writeBackColIdx);
+    for (let r = 0; r < dataRowCount; r++) {
+      ws.getCell(`${wbLetter}${r + 2}`).dataValidation = {
         type: "list",
         allowBlank: true,
         formulae: ['"Yes,No"'],
@@ -547,6 +757,7 @@ export async function buildProductFieldWorkbook(
         category: cat.category,
         property: f.field,
         required: f.required ? "Yes" : "No",
+        multiple: f.multiple ? "Yes" : "No",
         options: opts.join("\n"),
       });
     }
@@ -673,28 +884,81 @@ export async function parseProductFieldUpload(
         const cell = wsRow.getCell(c);
         const val = readCell(cell);
         if (val === "") continue;
-        // Validate against accepted options if the schema field is an enum
-        // with options.
         const fdef = cat.fields.find((f) => f.field === fieldName);
-        if (fdef && fdef.type === "enum" && Array.isArray(fdef.options) && fdef.options.length > 0) {
-          const ok = fdef.options.some((o) => o.toLowerCase().trim() === val.toLowerCase().trim());
-          if (!ok) {
+        // Enum validation — authoritative even if the operator bypasses the
+        // dropdown. For multi-select fields validate each comma-separated
+        // token individually.
+        if (
+          fdef &&
+          fdef.type === "enum" &&
+          Array.isArray(fdef.options) &&
+          fdef.options.length > 0
+        ) {
+          const optSet = new Set(fdef.options.map((o) => o.toLowerCase().trim()));
+          const tokens = fdef.multiple === true
+            ? val.split(",").map((t) => t.trim()).filter((t) => t !== "")
+            : [val.trim()];
+          const bad: string[] = [];
+          for (const t of tokens) {
+            if (!optSet.has(t.toLowerCase().trim())) bad.push(t);
+          }
+          if (bad.length > 0) {
+            const preview = fdef.options.slice(0, 8).join(", ");
             errors.push(
-              `"${fieldName}" value "${val}" is not in the live accepted-options list (${fdef.options.length} options). Accepted: ${fdef.options.slice(0, 8).join(", ")}${fdef.options.length > 8 ? "…" : ""}`,
+              `"${fieldName}" ${fdef.multiple ? "token(s)" : "value"} "${bad.join(", ")}" not in the live accepted-options list (${fdef.options.length} options). Accepted: ${preview}${fdef.options.length > 8 ? "…" : ""}`,
             );
             continue;
           }
         }
-        // Basic numeric type validation.
-        if (fdef && (fdef.type === "number" || fdef.type === "integer")) {
+        // Numeric type validation with min/max/only_integer enforcement.
+        if (
+          fdef &&
+          (fdef.type === "number" || fdef.type === "integer" || fdef.only_integer)
+        ) {
           const n = Number(val);
           if (!Number.isFinite(n)) {
             errors.push(`"${fieldName}" expects a number; got "${val}"`);
             continue;
           }
+          if (
+            (fdef.only_integer === true || fdef.type === "integer") &&
+            !Number.isInteger(n)
+          ) {
+            errors.push(`"${fieldName}" expects an integer; got "${val}"`);
+            continue;
+          }
+          if (typeof fdef.min_value === "number" && n < fdef.min_value) {
+            errors.push(
+              `"${fieldName}" value ${n} is below min_value=${fdef.min_value}.`,
+            );
+            continue;
+          }
+          if (typeof fdef.max_value === "number" && n > fdef.max_value) {
+            errors.push(
+              `"${fieldName}" value ${n} exceeds max_value=${fdef.max_value}.`,
+            );
+            continue;
+          }
         }
-        // String length sanity: 1000 char cap (matches Shopify single-line metafield max).
-        if (val.length > 1000) {
+        // String length bounds when schema declares them.
+        if (fdef && (fdef.type === "string" || (!fdef.type && !Array.isArray(fdef.options)))) {
+          if (typeof fdef.min_length === "number" && val.length < fdef.min_length) {
+            errors.push(
+              `"${fieldName}" length ${val.length} is below min_length=${fdef.min_length}.`,
+            );
+            continue;
+          }
+          if (typeof fdef.max_length === "number" && val.length > fdef.max_length) {
+            errors.push(
+              `"${fieldName}" length ${val.length} exceeds max_length=${fdef.max_length}.`,
+            );
+            continue;
+          }
+        }
+        // Global 1000-char cap (Shopify single-line metafield max). Skipped
+        // when the schema declared its own larger max_length, which takes
+        // precedence.
+        if (val.length > 1000 && !(fdef && typeof fdef.max_length === "number" && fdef.max_length > 1000)) {
           errors.push(`"${fieldName}" exceeds 1000 character cap.`);
           continue;
         }

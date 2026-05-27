@@ -58,6 +58,7 @@ import {
   parseProductFieldUpload,
   deriveMetafieldTargetForProductField,
   fieldIsVariantTargeted,
+  buildOptionsRangeName,
   type ProductFieldExportResult,
 } from "../server/jomashop_product_field_excel";
 
@@ -3682,6 +3683,510 @@ async function runJomashopProductFieldExcelHelpers() {
   );
 }
 
+// ---------- Case 46: dropdown coverage via hidden helper sheet ----------
+
+async function runProductFieldDropdownCoverage() {
+  console.log(
+    "Case 46: per-product workbook dropdowns reference hidden _Options sheet via named ranges (works for long lists)",
+  );
+  const ExcelJS = (await import("exceljs")).default;
+
+  // Build a realistic agg covering: Apparel Article (required enum),
+  // Apparel Variation Size (Yes/No) (enum), Footwear Country of Origin
+  // (long enum that exceeds Excel's inline 255-char cap), and Handbags
+  // Style (optional short enum).
+  const longCountryList = [
+    "United States", "United Kingdom", "France", "Italy", "Spain", "Germany",
+    "Switzerland", "Japan", "China", "Hong Kong", "Vietnam", "Portugal",
+    "Mexico", "India", "Romania", "Turkey", "Bulgaria", "Tunisia", "Morocco",
+    "Bangladesh", "Sri Lanka", "Thailand", "Indonesia", "Malaysia",
+    "Philippines", "South Korea", "Taiwan", "Cambodia", "Pakistan", "Egypt",
+    "Greece", "Poland", "Czech Republic", "Slovakia", "Hungary", "Austria",
+    "Belgium", "Netherlands", "Denmark", "Sweden", "Norway", "Finland",
+    "Ireland", "Croatia", "Serbia", "Albania", "Macedonia", "Estonia",
+    "Latvia", "Lithuania",
+  ];
+  // Sanity check: ensure the inline encoding would exceed Excel's limit.
+  assert(
+    longCountryList.join(",").length > 260,
+    "Case 46 pre: long country list exceeds Excel inline list limit (forces named-range path)",
+  );
+
+  const agg: ProductFieldExportResult = {
+    shopDomain: "luxe-test.myshopify.com",
+    fromCache: true,
+    cachedAt: 1700000000000,
+    totalProducts: 4,
+    includedAll: true,
+    categories: [
+      {
+        category: "Apparel",
+        fieldsSource: "live-v1",
+        fields: [
+          {
+            field: "Article",
+            label: "Article",
+            required: true,
+            type: "enum",
+            options: ["Coats & Jackets", "Jackets", "Pants", "Shirts"],
+          },
+          {
+            field: "Variation Size (Yes/No)",
+            label: "Variation Size (Yes/No)",
+            required: false,
+            type: "enum",
+            options: ["Yes", "No"],
+          },
+          {
+            field: "Gender",
+            label: "Gender",
+            required: true,
+            type: "enum",
+            options: ["Men", "Women", "Unisex"],
+          },
+        ],
+        rows: [
+          {
+            rowId: "row-apparel-001",
+            jomashopCategory: "Apparel",
+            shopifyProductId: "111",
+            shopifyVariantId: "v-111",
+            productTitle: "Canada Goose Parka",
+            vendorSku: "CG-OUTW-1",
+            manufacturerNumber: "CG-OUTW-1-MFR",
+            brand: "Canada Goose",
+            shopifyCategoryCode: "OUTW",
+            shopifyProductType: "OUTW",
+            jomashopCategoryId: "42",
+            jomashopBrandId: "7",
+            pushStatus: "missing",
+            warnings: "Missing required Article",
+            fieldValues: { Article: "", "Variation Size (Yes/No)": "", Gender: "Men" },
+            isVariant: false,
+          },
+        ],
+      },
+      {
+        category: "Footwear",
+        fieldsSource: "live-v1",
+        fields: [
+          {
+            field: "Gender",
+            label: "Gender",
+            required: true,
+            type: "enum",
+            options: ["Men", "Women", "Unisex", "Kids"],
+          },
+          {
+            field: "Country of Origin",
+            label: "Country of Origin",
+            required: false,
+            type: "enum",
+            options: longCountryList,
+          },
+        ],
+        rows: [
+          {
+            rowId: "row-footwear-001",
+            jomashopCategory: "Footwear",
+            shopifyProductId: "222",
+            shopifyVariantId: "v-222",
+            productTitle: "Tod's Boot",
+            vendorSku: "TODS-1",
+            manufacturerNumber: "TODS-1-MFR",
+            brand: "Tod's",
+            shopifyCategoryCode: "SHOE",
+            shopifyProductType: "SHOE",
+            jomashopCategoryId: "5",
+            jomashopBrandId: "11",
+            pushStatus: "missing",
+            warnings: "",
+            fieldValues: { Gender: "", "Country of Origin": "" },
+            isVariant: false,
+          },
+        ],
+      },
+      {
+        category: "Handbags",
+        fieldsSource: "live-v1",
+        fields: [
+          {
+            field: "Style",
+            label: "Style",
+            required: false,
+            type: "enum",
+            options: ["Shoulder", "Tote", "Crossbody", "Clutch", "Backpack", "Top-handle"],
+          },
+          {
+            field: "Color",
+            label: "Color",
+            required: true,
+            type: "string",
+            max_length: 80,
+          },
+          {
+            field: "Tags",
+            label: "Tags",
+            required: false,
+            type: "enum",
+            multiple: true,
+            options: ["seasonal", "limited", "classic", "sport"],
+          },
+          {
+            field: "Pieces",
+            label: "Pieces",
+            required: false,
+            type: "integer",
+            only_integer: true,
+            min_value: 1,
+            max_value: 10,
+          },
+        ],
+        rows: [
+          {
+            rowId: "row-handbag-001",
+            jomashopCategory: "Handbags",
+            shopifyProductId: "333",
+            shopifyVariantId: "v-333",
+            productTitle: "Designer Tote",
+            vendorSku: "TT-1",
+            manufacturerNumber: "TT-1-MFR",
+            brand: "Designer",
+            shopifyCategoryCode: "TOTE",
+            shopifyProductType: "TOTE",
+            jomashopCategoryId: "13",
+            jomashopBrandId: "3",
+            pushStatus: "needs-fill",
+            warnings: "",
+            fieldValues: { Style: "", Color: "", Tags: "", Pieces: "" },
+            isVariant: false,
+          },
+        ],
+      },
+    ],
+  };
+
+  const buf = await buildProductFieldWorkbook(agg);
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(buf);
+
+  // 46a: hidden _Options sheet exists, is hidden, and contains one column per
+  // (category, enum field).
+  const optionsSheet = wb.getWorksheet("_Options");
+  assert(optionsSheet !== undefined, "Case 46a: _Options sheet present");
+  assert(
+    (optionsSheet as any).state === "hidden" ||
+      (optionsSheet as any).state === "veryHidden",
+    `Case 46a2: _Options sheet hidden (got state=${(optionsSheet as any).state})`,
+  );
+
+  const expectedRanges: Array<{ category: string; field: string; size: number }> = [
+    { category: "Apparel", field: "Article", size: 4 },
+    { category: "Apparel", field: "Variation Size (Yes/No)", size: 2 },
+    { category: "Apparel", field: "Gender", size: 3 },
+    { category: "Footwear", field: "Gender", size: 4 },
+    { category: "Footwear", field: "Country of Origin", size: longCountryList.length },
+    { category: "Handbags", field: "Style", size: 6 },
+    { category: "Handbags", field: "Tags", size: 4 },
+  ];
+  // Read the workbook definedNames model (one entry per name).
+  const dn = (wb as any).definedNames;
+  const namesModel: Array<{ name: string; ranges: string[] }> = (dn?.model ?? []) as Array<{
+    name: string;
+    ranges: string[];
+  }>;
+  const nameByKey = new Map(namesModel.map((m) => [m.name, m.ranges]));
+  for (const e of expectedRanges) {
+    const expectedName = buildOptionsRangeName(e.category, e.field);
+    const ranges = nameByKey.get(expectedName);
+    assert(
+      Array.isArray(ranges) && ranges.length > 0,
+      `Case 46b: defined name "${expectedName}" exists for ${e.category}/${e.field}`,
+    );
+    // Range references _Options sheet.
+    assert(
+      ranges![0].includes("_Options"),
+      `Case 46c: defined name "${expectedName}" references _Options sheet (got ${ranges![0]})`,
+    );
+  }
+
+  // 46d: Apparel sheet's Article column carries a list-type data validation
+  // pointing at the named range (NOT an inline quoted list).
+  const apparelSheet = wb.getWorksheet("Apparel")!;
+  const headerByCol: Record<number, string> = {};
+  apparelSheet.getRow(1).eachCell((cell, c) => {
+    headerByCol[c] = String(cell.value ?? "").trim();
+  });
+  const findCol = (header: string): number => {
+    const found = Object.entries(headerByCol).find(([, h]) => h === header);
+    if (!found) throw new Error(`Apparel sheet missing column "${header}"`);
+    return Number(found[0]);
+  };
+  const articleCol = findCol("Article *");
+  const articleCell = apparelSheet.getRow(2).getCell(articleCol);
+  const articleDV = (articleCell as any).dataValidation as
+    | { type: string; formulae: string[] }
+    | undefined;
+  assert(
+    articleDV && articleDV.type === "list",
+    `Case 46d: Article cell has list-type data validation (got ${JSON.stringify(articleDV)})`,
+  );
+  assert(
+    typeof articleDV!.formulae[0] === "string" &&
+      articleDV!.formulae[0].includes(buildOptionsRangeName("Apparel", "Article")),
+    `Case 46e: Article validation formula references named range (got ${articleDV!.formulae[0]})`,
+  );
+
+  // 46f: Variation Size (Yes/No) — short enum, also via named range.
+  const varSizeCol = findCol("Variation Size (Yes/No)");
+  const varSizeDV = (apparelSheet.getRow(2).getCell(varSizeCol) as any).dataValidation as
+    | { type: string; formulae: string[] }
+    | undefined;
+  assert(
+    varSizeDV && varSizeDV.type === "list",
+    `Case 46f: Variation Size (Yes/No) cell has list validation`,
+  );
+  assert(
+    varSizeDV!.formulae[0].includes(
+      buildOptionsRangeName("Apparel", "Variation Size (Yes/No)"),
+    ),
+    `Case 46g: Variation Size (Yes/No) formula references the named range`,
+  );
+
+  // 46h: Required column header (Article) is highlighted yellow with bold red.
+  const articleHeader = apparelSheet.getRow(1).getCell(articleCol);
+  const fillObj = (articleHeader.fill as { fgColor?: { argb?: string } } | undefined) ?? undefined;
+  assert(
+    fillObj?.fgColor?.argb === "FFFFE082",
+    `Case 46h: required Article header is yellow-highlighted (got fill=${JSON.stringify(fillObj)})`,
+  );
+  // Note text mentions REQUIRED.
+  const articleHeaderNote = (articleHeader as any).note;
+  const noteText =
+    typeof articleHeaderNote === "string"
+      ? articleHeaderNote
+      : typeof articleHeaderNote?.texts === "object"
+        ? Array.isArray(articleHeaderNote.texts)
+          ? articleHeaderNote.texts.map((t: any) => t.text ?? "").join("")
+          : ""
+        : "";
+  assert(
+    noteText.toUpperCase().includes("REQUIRED"),
+    `Case 46i: required header note mentions REQUIRED (got ${JSON.stringify(noteText)})`,
+  );
+
+  // 46j: Footwear Country of Origin — LONG list — still uses a named range,
+  // not an inline list. This is the critical case the named-range design
+  // exists for.
+  const footwearSheet = wb.getWorksheet("Footwear")!;
+  const footwearHeaderByCol: Record<number, string> = {};
+  footwearSheet.getRow(1).eachCell((cell, c) => {
+    footwearHeaderByCol[c] = String(cell.value ?? "").trim();
+  });
+  const cooCol = Number(
+    Object.entries(footwearHeaderByCol).find(([, h]) => h === "Country of Origin")![0],
+  );
+  const cooDV = (footwearSheet.getRow(2).getCell(cooCol) as any).dataValidation as
+    | { type: string; formulae: string[] }
+    | undefined;
+  assert(
+    cooDV && cooDV.type === "list",
+    `Case 46j: Country of Origin (long list) has list validation`,
+  );
+  assert(
+    cooDV!.formulae[0].includes(buildOptionsRangeName("Footwear", "Country of Origin")),
+    `Case 46k: long Country of Origin uses named-range reference (got ${cooDV!.formulae[0]})`,
+  );
+  assert(
+    !cooDV!.formulae[0].startsWith('"') ||
+      cooDV!.formulae[0].length < 260,
+    `Case 46l: long list NOT inlined as a quoted formula (would exceed Excel limit)`,
+  );
+
+  // 46m: _Options sheet column for Country of Origin actually contains all
+  // ~50 entries (sanity check the data backing the named range).
+  // Look for the column whose header is "Footwear :: Country of Origin".
+  let cooOptCol: number | null = null;
+  optionsSheet!.getRow(1).eachCell((cell, c) => {
+    if (String(cell.value ?? "") === "Footwear :: Country of Origin") cooOptCol = c;
+  });
+  assert(cooOptCol !== null, "Case 46m: _Options carries Footwear/Country of Origin column");
+  const firstCountry = optionsSheet!.getRow(2).getCell(cooOptCol!).value;
+  const lastCountry = optionsSheet!.getRow(longCountryList.length + 1).getCell(cooOptCol!).value;
+  assert(
+    String(firstCountry) === longCountryList[0],
+    `Case 46n: first option present (got ${firstCountry})`,
+  );
+  assert(
+    String(lastCountry) === longCountryList[longCountryList.length - 1],
+    `Case 46o: last option present (got ${lastCountry})`,
+  );
+
+  // 46p: Handbags Style (optional short enum) — still uses a named range,
+  // not inline, so the convention is consistent.
+  const handbagsSheet = wb.getWorksheet("Handbags")!;
+  const handbagsHeaderByCol: Record<number, string> = {};
+  handbagsSheet.getRow(1).eachCell((cell, c) => {
+    handbagsHeaderByCol[c] = String(cell.value ?? "").trim();
+  });
+  const styleCol = Number(
+    Object.entries(handbagsHeaderByCol).find(([, h]) => h === "Style")![0],
+  );
+  const styleDV = (handbagsSheet.getRow(2).getCell(styleCol) as any).dataValidation as
+    | { type: string; formulae: string[] }
+    | undefined;
+  assert(
+    styleDV && styleDV.type === "list",
+    `Case 46p: Handbags Style has list validation`,
+  );
+  assert(
+    styleDV!.formulae[0].includes(buildOptionsRangeName("Handbags", "Style")),
+    `Case 46q: Handbags Style formula references named range`,
+  );
+
+  // 46r: Handbags Tags is a multi-select enum (multiple=true). Validation
+  // is "list" with a prompt; upload validation enforces each token.
+  const tagsCol = Number(
+    Object.entries(handbagsHeaderByCol).find(([, h]) => h === "Tags")![0],
+  );
+  const tagsDV = (handbagsSheet.getRow(2).getCell(tagsCol) as any).dataValidation as
+    | { type: string; formulae: string[]; prompt?: string }
+    | undefined;
+  assert(
+    tagsDV && tagsDV.type === "list",
+    `Case 46r: Tags multi-select carries a list validation referencing the named range`,
+  );
+  assert(
+    typeof tagsDV!.prompt === "string" && tagsDV!.prompt.toLowerCase().includes("comma"),
+    `Case 46s: multi-select prompt mentions comma-separated values (got ${JSON.stringify(tagsDV!.prompt)})`,
+  );
+
+  // 46t: Handbags Pieces is an integer with min=1/max=10. Should carry a
+  // "whole"-type data validation, not a list.
+  const piecesCol = Number(
+    Object.entries(handbagsHeaderByCol).find(([, h]) => h === "Pieces")![0],
+  );
+  const piecesDV = (handbagsSheet.getRow(2).getCell(piecesCol) as any).dataValidation as
+    | { type: string; formulae: string[] }
+    | undefined;
+  assert(
+    piecesDV && piecesDV.type === "whole",
+    `Case 46t: integer Pieces uses whole-number validation (got ${JSON.stringify(piecesDV)})`,
+  );
+  assert(
+    Number(piecesDV!.formulae[0]) === 1 && Number(piecesDV!.formulae[1]) === 10,
+    `Case 46u: integer bounds carried into formula (got ${JSON.stringify(piecesDV!.formulae)})`,
+  );
+
+  // 46v: Color (string field with max_length=80) uses textLength validation.
+  const colorCol = Number(
+    Object.entries(handbagsHeaderByCol).find(([, h]) => h === "Color *")![0],
+  );
+  const colorDV = (handbagsSheet.getRow(2).getCell(colorCol) as any).dataValidation as
+    | { type: string; formulae: string[] }
+    | undefined;
+  assert(
+    colorDV && colorDV.type === "textLength",
+    `Case 46v: string Color with max_length uses textLength validation (got ${JSON.stringify(colorDV)})`,
+  );
+
+  // 46w: Free-text fields without bounds (none in this agg, but verify
+  // Color note hints at max length).
+  const colorHeaderNote = (handbagsSheet.getRow(1).getCell(colorCol) as any).note;
+  const colorNoteText =
+    typeof colorHeaderNote === "string"
+      ? colorHeaderNote
+      : Array.isArray(colorHeaderNote?.texts)
+        ? colorHeaderNote.texts.map((t: any) => t.text ?? "").join("")
+        : "";
+  assert(
+    colorNoteText.includes("max length=80") || colorNoteText.includes("80"),
+    `Case 46w: Color header note mentions max length (got ${JSON.stringify(colorNoteText)})`,
+  );
+
+  // 46x: Upload validation rejects multi-select tokens not in the list,
+  // even though Excel allowed the input.
+  const wbEdit = new ExcelJS.Workbook();
+  await wbEdit.xlsx.load(buf);
+  const editHandbags = wbEdit.getWorksheet("Handbags")!;
+  const editHeaderByCol: Record<string, number> = {};
+  editHandbags.getRow(1).eachCell((cell, c) => {
+    editHeaderByCol[String(cell.value)] = c;
+  });
+  editHandbags.getRow(2).getCell(editHeaderByCol["Tags"]).value = "seasonal, weird-token, classic";
+  editHandbags.getRow(2).getCell(editHeaderByCol["Color *"]).value = "Black";
+  const badBuf = Buffer.from(await wbEdit.xlsx.writeBuffer());
+  const parsed = await parseProductFieldUpload(badBuf, agg);
+  const handbagRow = parsed.rows.find((r) => r.rowId === "row-handbag-001")!;
+  assert(
+    !handbagRow.isValid &&
+      handbagRow.errors.some(
+        (e) => e.includes("Tags") && e.toLowerCase().includes("weird-token"),
+      ),
+    `Case 46x: multi-select rejected when any token is not in accepted list (errors=${JSON.stringify(handbagRow.errors)})`,
+  );
+
+  // 46y: Numeric out-of-bounds rejected.
+  const wbEdit2 = new ExcelJS.Workbook();
+  await wbEdit2.xlsx.load(buf);
+  const editHandbags2 = wbEdit2.getWorksheet("Handbags")!;
+  const editHeaderByCol2: Record<string, number> = {};
+  editHandbags2.getRow(1).eachCell((cell, c) => {
+    editHeaderByCol2[String(cell.value)] = c;
+  });
+  editHandbags2.getRow(2).getCell(editHeaderByCol2["Pieces"]).value = 99;
+  editHandbags2.getRow(2).getCell(editHeaderByCol2["Color *"]).value = "Red";
+  const badBuf2 = Buffer.from(await wbEdit2.xlsx.writeBuffer());
+  const parsed2 = await parseProductFieldUpload(badBuf2, agg);
+  const handbagRow2 = parsed2.rows.find((r) => r.rowId === "row-handbag-001")!;
+  assert(
+    !handbagRow2.isValid &&
+      handbagRow2.errors.some((e) => e.includes("Pieces") && e.includes("max_value")),
+    `Case 46y: integer above max_value rejected (errors=${JSON.stringify(handbagRow2.errors)})`,
+  );
+
+  // 46z: Footwear Country of Origin — accepts a long-list value present in
+  // the accepted set (server-side authoritative).
+  const wbEdit3 = new ExcelJS.Workbook();
+  await wbEdit3.xlsx.load(buf);
+  const editFootwear = wbEdit3.getWorksheet("Footwear")!;
+  const editHdr: Record<string, number> = {};
+  editFootwear.getRow(1).eachCell((cell, c) => {
+    editHdr[String(cell.value)] = c;
+  });
+  editFootwear.getRow(2).getCell(editHdr["Gender *"]).value = "Men";
+  editFootwear.getRow(2).getCell(editHdr["Country of Origin"]).value = "Italy";
+  const goodBuf = Buffer.from(await wbEdit3.xlsx.writeBuffer());
+  const parsedGood = await parseProductFieldUpload(goodBuf, agg);
+  const footwearRow = parsedGood.rows.find((r) => r.rowId === "row-footwear-001")!;
+  assert(
+    footwearRow.isValid,
+    `Case 46z: long-list value "Italy" accepted (errors=${JSON.stringify(footwearRow.errors)})`,
+  );
+
+  // 46aa: Upload of an invalid long-list value rejected server-side even
+  // when the dropdown would have prevented it.
+  const wbEdit4 = new ExcelJS.Workbook();
+  await wbEdit4.xlsx.load(buf);
+  const editFootwear2 = wbEdit4.getWorksheet("Footwear")!;
+  const editHdr2: Record<string, number> = {};
+  editFootwear2.getRow(1).eachCell((cell, c) => {
+    editHdr2[String(cell.value)] = c;
+  });
+  editFootwear2.getRow(2).getCell(editHdr2["Gender *"]).value = "Men";
+  editFootwear2.getRow(2).getCell(editHdr2["Country of Origin"]).value = "Atlantis";
+  const badBuf3 = Buffer.from(await wbEdit4.xlsx.writeBuffer());
+  const parsedBad3 = await parseProductFieldUpload(badBuf3, agg);
+  const footwearRow2 = parsedBad3.rows.find((r) => r.rowId === "row-footwear-001")!;
+  assert(
+    !footwearRow2.isValid &&
+      footwearRow2.errors.some(
+        (e) => e.includes("Country of Origin") && e.toLowerCase().includes("not in the live"),
+      ),
+    `Case 46aa: invalid long-list value rejected on upload (errors=${JSON.stringify(footwearRow2.errors)})`,
+  );
+}
+
 // ---------- Case 43: optional unresolved enum is omitted, not blocked ------
 function runOptionalUnresolvedOmitted() {
   console.log("Case 43: optional unresolved enum is omitted, never blocks preflight");
@@ -3767,6 +4272,7 @@ runOperatorOverrideBeatsSynonym();
 runOptionalUnresolvedOmitted();
 await runJomashopMappingExcelHelpers();
 await runJomashopProductFieldExcelHelpers();
+await runProductFieldDropdownCoverage();
 
 if (failures > 0) {
   console.error(`\n${failures} assertion(s) failed.`);
