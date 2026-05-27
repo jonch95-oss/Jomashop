@@ -73,7 +73,12 @@ import { releaseLock, withLockOr409 } from "./stability";
 // list, debug echo) is moved behind /api/products/full/:id so a list view
 // only ever ships the compact projection.
 const DEFAULT_LIST_LIMIT = 200;
-const MAX_LIST_LIMIT = 500;
+// Raised from 500 → 5000 so ?limit=all on /api/products/cache returns the
+// full cached catalog for shops with thousands of products. The cache stores
+// "compact" rows (no debug payloads, no image arrays), so a 3000+ product
+// store fits comfortably in a single JSON response. Operators on multi-
+// thousand stores can still keep the default 200/page if they prefer.
+const MAX_LIST_LIMIT = 5000;
 
 function clampLimit(raw: unknown, fallback = DEFAULT_LIST_LIMIT, max = MAX_LIST_LIMIT): number {
   if (raw === undefined || raw === null || raw === "") return fallback;

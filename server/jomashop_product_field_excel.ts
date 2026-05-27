@@ -307,11 +307,27 @@ export async function aggregateProductFieldRows(opts: {
   const includeAll = opts.includeAll === true;
   const categoryFilter = (opts.categoryFilter || "").trim().toLowerCase();
   const rowLimit = typeof opts.rowLimit === "number" && opts.rowLimit > 0 ? opts.rowLimit : Infinity;
+  // Resolve a shopDomain. Prefer the live connection, then a connected
+  // store row, but ALSO fall back to any store that has a populated
+  // product cache — that's what lets an operator export the cached
+  // catalog after the OAuth session has lapsed (export is a read-only
+  // operation that only needs the cached snapshot, not a live token).
   const conn = getActiveShopifyConnection();
-  const shopDomain =
+  let shopDomain: string | null =
     conn?.shopDomain ??
     storage.listStores().find((s) => s.oauthStatus === "connected")?.shopDomain ??
     null;
+  let cache = shopDomain ? storage.getProductCache(shopDomain) : undefined;
+  if (!cache) {
+    for (const s of storage.listStores()) {
+      const c = storage.getProductCache(s.shopDomain);
+      if (c) {
+        shopDomain = s.shopDomain;
+        cache = c;
+        break;
+      }
+    }
+  }
   const result: ProductFieldExportResult = {
     shopDomain,
     fromCache: false,
@@ -321,8 +337,6 @@ export async function aggregateProductFieldRows(opts: {
     categories: [],
   };
   if (!shopDomain) return result;
-
-  const cache = storage.getProductCache(shopDomain);
   if (!cache) return result;
   result.fromCache = true;
   result.cachedAt = cache.fetchedAt;
@@ -1497,9 +1511,13 @@ export function registerJomashopProductFieldExcelRoutes(app: Express): void {
         rowLimit: MAX_EXPORT_ROWS + 1,
       });
       if (!agg.shopDomain) {
+        // No store at all (never installed, or all rows deleted). Surface
+        // a clear reconnect CTA the UI can render as a button.
         return res.status(503).json({
           ok: false,
-          error: "No connected Shopify store. Complete OAuth install first.",
+          error:
+            "No Shopify store on file. Complete OAuth install at Setup → Begin install before exporting.",
+          reconnectUrl: "/#/setup",
         });
       }
       if (!agg.fromCache) {
@@ -1507,6 +1525,7 @@ export function registerJomashopProductFieldExcelRoutes(app: Express): void {
           ok: false,
           error:
             "No cached product preview. Click Refresh from Shopify on the Products page first.",
+          reconnectUrl: "/#/products",
         });
       }
       const rowCount = agg.categories.reduce((acc, c) => acc + c.rows.length, 0);

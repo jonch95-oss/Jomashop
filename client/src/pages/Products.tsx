@@ -59,6 +59,14 @@ type PushResult = {
 type PreviewData = {
   mapped: MappedProduct[];
   count: number;
+  /**
+   * Total number of products in the server-side cache. The `mapped` array
+   * may only contain the page-sized slice currently in view; `totalCount` is
+   * always the full cached catalog size so the UI can show
+   * "200 shown of 3103 total" instead of "200 of 200".
+   */
+  totalCount?: number;
+  page?: { offset: number; limit: number; hasMore: boolean };
   schemas: any;
   usingSamples?: boolean;
   shopifyConnected?: boolean;
@@ -188,9 +196,18 @@ export default function Products() {
   });
 
   // On mount: try to render from cache (instant). Only refresh from Shopify
-  // when the user clicks "Refresh from Shopify".
+  // when the user clicks "Refresh from Shopify". We pass ?limit=all so the
+  // UI receives the entire compact catalog and can render correct totals,
+  // filter counts, and pagination over the full dataset — not just the
+  // server-default 200-row slice.
   const cacheQ = useQuery<PreviewData & { cached?: boolean }>({
-    queryKey: ["/api/products/cache"],
+    queryKey: ["/api/products/cache", "all"],
+    queryFn: async () => {
+      const res = await fetch("/api/products/cache?limit=all", {
+        credentials: "include",
+      });
+      return res.json();
+    },
     refetchOnWindowFocus: false,
   });
 
@@ -225,7 +242,12 @@ export default function Products() {
 
   const refresh = useMutation({
     mutationFn: async () => {
-      const res = await apiRequest("POST", "/api/products/refresh", {});
+      // Ask the server to return the full mapped catalog in the response so
+      // the page renders the complete product list immediately after a
+      // refresh, not just the first 200 rows.
+      const res = await apiRequest("POST", "/api/products/refresh", {
+        responseLimit: "all",
+      });
       return res.json();
     },
     onSuccess: (d: PreviewData) => {
@@ -465,6 +487,11 @@ export default function Products() {
             {typeof data.pageCount === "number" && data.pageCount > 0
               ? ` across ${data.pageCount} page${data.pageCount === 1 ? "" : "s"}`
               : ""}
+            {typeof data.totalCount === "number" &&
+            typeof data.mapped?.length === "number" &&
+            data.totalCount > data.mapped.length
+              ? ` · ${data.mapped.length} of ${data.totalCount} shown`
+              : ""}
             {data.hasMore ? " · more available" : data.dataSource === "live" ? " · complete" : ""}
           </span>
         )}
@@ -561,7 +588,20 @@ export default function Products() {
                 </div>
               </div>
               <div className="text-[11px] text-muted-foreground" data-testid="text-filtered-count">
-                {filteredProducts.length} match{filteredProducts.length === 1 ? "" : "es"} of {filterCounts.all}
+                {(() => {
+                  // `filterCounts.all` reflects what's loaded in the
+                  // browser; `totalCount` reflects the full cached catalog
+                  // on the server. When they differ (e.g. the server clipped
+                  // a slice), surface both so operators don't misread a
+                  // 200-row page as "only 200 products exist".
+                  const shown = filteredProducts.length;
+                  const loaded = filterCounts.all;
+                  const total = typeof data?.totalCount === "number" ? data.totalCount : loaded;
+                  if (total > loaded) {
+                    return `${shown} match${shown === 1 ? "" : "es"} of ${loaded} loaded · ${total} total in cache`;
+                  }
+                  return `${shown} match${shown === 1 ? "" : "es"} of ${loaded} total`;
+                })()}
               </div>
             </div>
 

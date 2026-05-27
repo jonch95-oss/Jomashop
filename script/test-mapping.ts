@@ -5579,6 +5579,117 @@ async function runGoLivePatchTests() {
   }
 }
 
+// Case 52: full-catalog visibility + category-filtered export + cache-only
+// export when Shopify session is gone. Each block seeds the sqlite-backed
+// cache, runs the aggregator, and cleans up.
+async function runFullCatalogAndDisconnectedExportTests() {
+  console.log("Case 52: full-catalog visibility, category filter, and disconnected cache export");
+  const { storage } = await import("../server/storage");
+  const { aggregateProductFieldRows } = await import(
+    "../server/jomashop_product_field_excel"
+  );
+
+  const SHOP = "test-cache-export.myshopify.com";
+  // Build a mapped catalog with mixed categories. Mark some "ready" so the
+  // includeAll=false path still has something to do (it filters those out).
+  const mapped = [
+    ...Array.from({ length: 5 }, (_, i) => ({
+      vendor_sku: `APP-${i}`,
+      category: "Apparel",
+      readiness: "needs-mapping",
+      properties: {},
+      variants: [],
+      source: { shopify_product_id: `p-app-${i}`, shopify_variant_ids: [] },
+    })),
+    ...Array.from({ length: 3 }, (_, i) => ({
+      vendor_sku: `BAG-${i}`,
+      category: "Handbags",
+      readiness: "needs-mapping",
+      properties: {},
+      variants: [],
+      source: { shopify_product_id: `p-bag-${i}`, shopify_variant_ids: [] },
+    })),
+    {
+      vendor_sku: "SHO-ready",
+      category: "Footwear",
+      readiness: "ready",
+      properties: {},
+      variants: [],
+      source: { shopify_product_id: "p-sho", shopify_variant_ids: [] },
+    },
+  ];
+  const payload = {
+    mapperVersion: "test",
+    mapped,
+    schemas: {},
+    dataSource: "live",
+    shopifyConnected: true,
+    shopDomain: SHOP,
+    fetchedCount: mapped.length,
+    pageCount: 1,
+    hasMore: false,
+  };
+  storage.upsertStore({
+    shopDomain: SHOP,
+    oauthStatus: "disconnected",
+  } as any);
+  storage.upsertProductCache({
+    shopDomain: SHOP,
+    fetchedCount: mapped.length,
+    pageCount: 1,
+    hasMore: false,
+    payloadJson: JSON.stringify(payload),
+    fetchedAt: Date.now(),
+  });
+
+  try {
+    // 52a — full catalog visibility: even with no active Shopify connection,
+    // the aggregator falls back to the cached snapshot via the shop's cache row.
+    const aggAll = await aggregateProductFieldRows({ includeAll: true });
+    assert(
+      aggAll.fromCache === true,
+      `Case 52a: aggregator falls back to cache when Shopify session is gone (fromCache=${aggAll.fromCache})`,
+    );
+    assert(
+      aggAll.shopDomain === SHOP,
+      `Case 52a: aggregator picks the cached shop domain (got ${aggAll.shopDomain})`,
+    );
+    assert(
+      aggAll.totalProducts === mapped.length,
+      `Case 52a: totalProducts reflects the full cached catalog (got ${aggAll.totalProducts})`,
+    );
+
+    // 52b — category filter narrows the export to one Jomashop category.
+    const aggHandbags = await aggregateProductFieldRows({
+      includeAll: true,
+      categoryFilter: "Handbags",
+    });
+    assert(
+      aggHandbags.categories.length === 1 &&
+        aggHandbags.categories[0]?.category === "Handbags",
+      `Case 52b: category filter returns only Handbags sheet (got ${aggHandbags.categories.map((c) => c.category).join(",")})`,
+    );
+    assert(
+      aggHandbags.categories[0].rows.length === 3,
+      `Case 52b: Handbags filter returns the 3 cached Handbags rows (got ${aggHandbags.categories[0].rows.length})`,
+    );
+
+    // 52c — category filter is case-insensitive and doesn't bleed rows.
+    const aggLower = await aggregateProductFieldRows({
+      includeAll: true,
+      categoryFilter: "apparel",
+    });
+    assert(
+      aggLower.categories.length === 1 &&
+        aggLower.categories[0].category === "Apparel" &&
+        aggLower.categories[0].rows.length === 5,
+      `Case 52c: category filter is case-insensitive (got ${aggLower.categories.map((c) => `${c.category}:${c.rows.length}`).join(",")})`,
+    );
+  } finally {
+    storage.clearProductCache(SHOP);
+  }
+}
+
 runResolvedRecordsRequiredForReadiness();
 runBuiltInBrandSeeds();
 await runResolutionAuditHelpers();
@@ -5624,6 +5735,7 @@ await runJomashopProductFieldExcelHelpers();
 await runProductFieldDropdownCoverage();
 await runProductFieldSheetRecognitionAndForceWriteback();
 await runGoLivePatchTests();
+await runFullCatalogAndDisconnectedExportTests();
 
 if (failures > 0) {
   console.error(`\n${failures} assertion(s) failed.`);

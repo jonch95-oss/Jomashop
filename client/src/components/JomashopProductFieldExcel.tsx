@@ -14,7 +14,7 @@
 //      the next refresh re-derives properties from the new metafields.
 
 import { useRef, useState } from "react";
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -87,30 +87,87 @@ type ApplyResponse = {
   note: string;
 };
 
+type ProductFieldSummary = {
+  ok: boolean;
+  shopDomain: string | null;
+  fromCache: boolean;
+  cachedAt: number | null;
+  totalProducts: number;
+  includedAll: boolean;
+  categories: Array<{
+    category: string;
+    fieldsSource: string;
+    fields: unknown[];
+    rowCount: number;
+  }>;
+};
+
 export function JomashopProductFieldExcelCard() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [preview, setPreview] = useState<PreviewResponse | null>(null);
   const [applyResult, setApplyResult] = useState<ApplyResponse | null>(null);
-  const [exportError, setExportError] = useState<string | null>(null);
+  const [exportError, setExportError] = useState<
+    | { message: string; status?: number; reconnectUrl?: string | null }
+    | null
+  >(null);
   const [exportInfo, setExportInfo] = useState<string | null>(null);
   const [includeAll, setIncludeAll] = useState(false);
   const [forceWriteback, setForceWriteback] = useState(false);
+  // "" means "All categories" — passes no category param.
+  const [categoryFilter, setCategoryFilter] = useState("");
+
+  // List of Jomashop categories present in the cache, sourced from the same
+  // aggregator the export uses so the dropdown always reflects what is
+  // actually exportable. Drives the category filter dropdown.
+  const summaryQ = useQuery<ProductFieldSummary>({
+    queryKey: ["/api/jomashop-product-fields/summary", includeAll],
+    queryFn: async () => {
+      const res = await fetch(
+        `/api/jomashop-product-fields/summary${includeAll ? "?all=1" : ""}`,
+        { headers: authHeaders() },
+      );
+      return (await res.json()) as ProductFieldSummary;
+    },
+    refetchOnWindowFocus: false,
+  });
 
   const exportMut = useMutation({
     mutationFn: async () => {
-      const url = `/api/jomashop-product-fields/export.xlsx${includeAll ? "?all=1" : ""}`;
+      const params = new URLSearchParams();
+      if (includeAll) params.set("all", "1");
+      if (categoryFilter.trim() !== "") params.set("category", categoryFilter.trim());
+      const qs = params.toString();
+      const url = `/api/jomashop-product-fields/export.xlsx${qs ? `?${qs}` : ""}`;
       const res = await fetch(url, { headers: authHeaders() });
       if (!res.ok) {
+        // Try to extract a friendlier message from the JSON error body so
+        // operators see "No connected Shopify store…" or row-cap guidance
+        // instead of the raw 503 status text.
+        let parsed: { error?: string; reconnectUrl?: string } | null = null;
         const text = await res.text().catch(() => "");
-        throw new Error(`Export failed (${res.status}): ${text || res.statusText}`);
+        try {
+          parsed = text ? JSON.parse(text) : null;
+        } catch {
+          parsed = null;
+        }
+        const friendly =
+          (parsed && typeof parsed.error === "string" && parsed.error) || text || res.statusText;
+        const err = new Error(`Export failed (${res.status}): ${friendly}`);
+        (err as any).status = res.status;
+        (err as any).reconnectUrl = parsed?.reconnectUrl ?? null;
+        throw err;
       }
       const blob = await res.blob();
       const rowCount = res.headers.get("X-Export-Rows") ?? "?";
       const sheetCount = res.headers.get("X-Export-Sheets") ?? "?";
       const shop = res.headers.get("X-Export-Shop") ?? "shop";
+      const catSuffix =
+        categoryFilter.trim() !== ""
+          ? `-${categoryFilter.trim().replace(/[^A-Za-z0-9]+/g, "_")}`
+          : "";
       const filename = `jomashop-product-fields-${shop.replace(/\.myshopify\.com$/, "")}-${
         includeAll ? "all" : "unready"
-      }-${new Date().toISOString().slice(0, 10)}.xlsx`;
+      }${catSuffix}-${new Date().toISOString().slice(0, 10)}.xlsx`;
       const blobUrl = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = blobUrl;
@@ -128,7 +185,13 @@ export function JomashopProductFieldExcelCard() {
       );
     },
     onError: (e: Error) => {
-      setExportError(e.message);
+      const status = (e as any).status as number | undefined;
+      const reconnectUrl = (e as any).reconnectUrl as string | null | undefined;
+      setExportError({
+        message: e.message,
+        status,
+        reconnectUrl: reconnectUrl ?? null,
+      });
       setExportInfo(null);
     },
   });
@@ -215,6 +278,29 @@ export function JomashopProductFieldExcelCard() {
             />
             Writeback every filled value (ignore blank Write Back? cells)
           </label>
+          <label className="flex items-center gap-2 text-xs">
+            <span className="text-muted-foreground">Category:</span>
+            <select
+              data-testid="select-product-field-category"
+              className="h-8 rounded-md border border-input bg-background px-2 font-mono text-xs"
+              value={categoryFilter}
+              onChange={(e) => setCategoryFilter(e.target.value)}
+            >
+              <option value="">All categories</option>
+              {(summaryQ.data?.categories ?? []).map((c) => (
+                <option key={c.category} value={c.category}>
+                  {c.category} ({c.rowCount})
+                </option>
+              ))}
+            </select>
+            {categoryFilter === "" &&
+              typeof summaryQ.data?.totalProducts === "number" &&
+              summaryQ.data.totalProducts > 0 && (
+                <span className="text-[10px] text-amber-600">
+                  Large exports may be rejected — filter to one category to be safe.
+                </span>
+              )}
+          </label>
           <Button
             onClick={() => exportMut.mutate()}
             disabled={exportMut.isPending}
@@ -255,8 +341,35 @@ export function JomashopProductFieldExcelCard() {
           </div>
         )}
         {exportError && (
-          <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
-            {exportError}
+          <div
+            data-testid="export-error-banner"
+            className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive"
+          >
+            <div className="font-medium">
+              {exportError.status === 503
+                ? "Shopify is not connected"
+                : "Export failed"}
+            </div>
+            <div className="mt-0.5">{exportError.message}</div>
+            {exportError.status === 503 && (
+              <div className="mt-2 flex flex-wrap items-center gap-2 text-foreground">
+                <a
+                  data-testid="link-reconnect-shopify"
+                  href={exportError.reconnectUrl || "/#/setup"}
+                  className="inline-flex items-center rounded-md border border-input bg-background px-3 py-1 text-xs font-medium hover:bg-accent"
+                >
+                  Reconnect Shopify
+                </a>
+                <span className="text-[10px] text-muted-foreground">
+                  Open Setup → Begin install to authorize the store before exporting.
+                </span>
+              </div>
+            )}
+            {exportError.status === 413 && (
+              <div className="mt-1 text-[10px] text-muted-foreground">
+                Tip: pick a single category from the dropdown above to keep the export under the row cap.
+              </div>
+            )}
           </div>
         )}
         {previewMut.isError && (
