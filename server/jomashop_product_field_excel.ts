@@ -286,10 +286,27 @@ async function loadLiveSchemaForCategory(category: string): Promise<{
  * push-ready — i.e. readiness != "ready" — so the operator's worklist
  * matches the "what still needs filling" Mapping/Products UI buckets.
  */
+/**
+ * Hard cap on rows we'll aggregate for a single export. Anything beyond is
+ * rejected at the route layer with a 413 so we don't blow Render's 512MB
+ * worker on a runaway export.
+ */
+export const MAX_EXPORT_ROWS = 12000;
+
 export async function aggregateProductFieldRows(opts: {
   includeAll?: boolean;
-} = {}): Promise<ProductFieldExportResult> {
+  /** Optional filter — restrict to one Jomashop category. Case-insensitive
+   *  match against the cached `m.category` field. Used by the export route
+   *  to keep large multi-thousand-product shops exportable in chunks. */
+  categoryFilter?: string;
+  /** Stop aggregating once this many rows are produced (across all sheets).
+   *  Used as a safety guard so a single export request can't pin O(rows)
+   *  memory regardless of cap behaviour at the route layer. */
+  rowLimit?: number;
+} = {}): Promise<ProductFieldExportResult & { truncated?: boolean }> {
   const includeAll = opts.includeAll === true;
+  const categoryFilter = (opts.categoryFilter || "").trim().toLowerCase();
+  const rowLimit = typeof opts.rowLimit === "number" && opts.rowLimit > 0 ? opts.rowLimit : Infinity;
   const conn = getActiveShopifyConnection();
   const shopDomain =
     conn?.shopDomain ??
@@ -319,12 +336,15 @@ export async function aggregateProductFieldRows(opts: {
   const allMapped: any[] = Array.isArray(payload?.mapped) ? payload.mapped : [];
   result.totalProducts = allMapped.length;
 
-  // Group products by Jomashop category.
+  // Group products by Jomashop category, honouring the optional category
+  // filter so a single export call can target one sheet at a time on shops
+  // with thousands of unready rows.
   const byCategory = new Map<string, any[]>();
   for (const m of allMapped) {
     const cat = String(m?.category || "").trim();
     if (!cat) continue;
     if (!includeAll && m?.readiness === "ready") continue;
+    if (categoryFilter && cat.toLowerCase() !== categoryFilter) continue;
     let bucket = byCategory.get(cat);
     if (!bucket) {
       bucket = [];
@@ -334,14 +354,26 @@ export async function aggregateProductFieldRows(opts: {
   }
 
   // For each category, load the live schema and build rows.
+  let totalRows = 0;
+  let truncated = false;
   for (const [category, products] of Array.from(byCategory.entries())) {
+    if (totalRows >= rowLimit) {
+      truncated = true;
+      break;
+    }
     const { fields, source } = await loadLiveSchemaForCategory(category);
     // Drop schema entries with empty/undefined names.
     const cleanFields = fields.filter(
       (f) => f && typeof f.field === "string" && f.field.trim() !== "" && f.field !== "undefined",
     );
     const rows: ProductFieldExportRow[] = [];
+    let stopCategoryEarly = false;
     for (const m of products) {
+      if (totalRows >= rowLimit) {
+        stopCategoryEarly = true;
+        truncated = true;
+        break;
+      }
       const productId = m?.source?.shopify_product_id;
       const variants = Array.isArray(m?.variants) ? m.variants : [];
       const variantIds: Array<string | number> = Array.isArray(m?.source?.shopify_variant_ids)
@@ -460,16 +492,20 @@ export async function aggregateProductFieldRows(opts: {
       };
 
       if (variants.length > 1) {
-        // One row per variant when there is more than one.
         for (let i = 0; i < variants.length; i++) {
+          if (totalRows >= rowLimit) {
+            stopCategoryEarly = true;
+            truncated = true;
+            break;
+          }
           const v = variants[i];
           const variantId =
             variantIds[i] !== undefined ? String(variantIds[i]) : String(v?.vendor_sku ?? "");
           const opts = (v?.options && typeof v.options === "object") ? v.options as Record<string, string> : {};
           mkRow(variantId, opts, true);
+          totalRows += 1;
         }
       } else {
-        // Single row — variant id is the first (or empty).
         const variantId =
           variantIds[0] !== undefined ? String(variantIds[0]) : String(variants[0]?.vendor_sku ?? "");
         const opts =
@@ -477,7 +513,9 @@ export async function aggregateProductFieldRows(opts: {
             ? (variants[0].options as Record<string, string>)
             : {};
         mkRow(variantId, opts, false);
+        totalRows += 1;
       }
+      if (stopCategoryEarly) break;
     }
     result.categories.push({
       category,
@@ -487,9 +525,9 @@ export async function aggregateProductFieldRows(opts: {
     });
   }
 
-  // Sort categories alphabetically for stable sheet order.
   result.categories.sort((a, b) => a.category.localeCompare(b.category));
-  return result;
+  (result as ProductFieldExportResult & { truncated?: boolean }).truncated = truncated;
+  return result as ProductFieldExportResult & { truncated?: boolean };
 }
 
 // ---------- Workbook build ----------
@@ -1435,10 +1473,29 @@ export function registerJomashopProductFieldExcelRoutes(app: Express): void {
   });
 
   // GET: XLSX export.
+  //
+  // Hardening against Render OOM / exit 134:
+  //   - acquires the `productFieldExport` lock so two concurrent operators
+  //     can't double the working set;
+  //   - logs RSS before aggregation, after aggregation, and after workbook
+  //     build so post-mortems can pinpoint where memory blew;
+  //   - rejects with 413 when the resulting row count would exceed
+  //     MAX_EXPORT_ROWS, asking the operator to add ?category=X;
+  //   - releases the row + workbook buffers to GC before responding.
   app.get("/api/jomashop-product-fields/export.xlsx", async (req, res) => {
+    const includeAll = String(req.query.all ?? "") === "1" || String(req.query.all ?? "") === "true";
+    const categoryFilter = typeof req.query.category === "string" ? req.query.category.trim() : "";
+    if (!withLockOr409(res, "productFieldExport")) return;
     try {
-      const includeAll = String(req.query.all ?? "") === "1" || String(req.query.all ?? "") === "true";
-      const agg = await aggregateProductFieldRows({ includeAll });
+      logMemory("productFieldExport.start", { includeAll, categoryFilter });
+      // First pass: count rows under the safety cap. If the operator asked
+      // for an unfiltered export and the row count would exceed
+      // MAX_EXPORT_ROWS, fail fast with a 413 and an actionable message.
+      const agg = await aggregateProductFieldRows({
+        includeAll,
+        categoryFilter: categoryFilter || undefined,
+        rowLimit: MAX_EXPORT_ROWS + 1,
+      });
       if (!agg.shopDomain) {
         return res.status(503).json({
           ok: false,
@@ -1452,25 +1509,54 @@ export function registerJomashopProductFieldExcelRoutes(app: Express): void {
             "No cached product preview. Click Refresh from Shopify on the Products page first.",
         });
       }
+      const rowCount = agg.categories.reduce((acc, c) => acc + c.rows.length, 0);
+      if (rowCount > MAX_EXPORT_ROWS) {
+        return res.status(413).json({
+          ok: false,
+          error:
+            `Export would produce ${rowCount} rows (cap is ${MAX_EXPORT_ROWS}). ` +
+            `Filter to a single category via ?category=<JomashopCategory> ` +
+            `or set ?all=0 to limit to unready rows only.`,
+          rowCount,
+          maxExportRows: MAX_EXPORT_ROWS,
+          availableCategories: agg.categories.map((c) => ({
+            category: c.category,
+            rows: c.rows.length,
+          })),
+        });
+      }
+      logMemory("productFieldExport.aggregated", {
+        rows: rowCount,
+        sheets: agg.categories.length,
+      });
       const buf = await buildProductFieldWorkbook(agg);
+      logMemory("productFieldExport.workbookBuilt", {
+        rows: rowCount,
+        bytes: buf.length,
+      });
       const filename = `jomashop-product-fields-${agg.shopDomain.replace(/\.myshopify\.com$/, "")}-${
         includeAll ? "all" : "unready"
-      }-${new Date().toISOString().slice(0, 10)}.xlsx`;
+      }${categoryFilter ? `-${categoryFilter.replace(/[^A-Za-z0-9]+/g, "_")}` : ""}-${new Date()
+        .toISOString()
+        .slice(0, 10)}.xlsx`;
       res.setHeader(
         "Content-Type",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
       );
       res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
-      const rowCount = agg.categories.reduce((acc, c) => acc + c.rows.length, 0);
       res.setHeader("X-Export-Rows", String(rowCount));
       res.setHeader("X-Export-Sheets", String(agg.categories.length));
       res.setHeader("X-Export-Shop", agg.shopDomain);
+      if (agg.truncated) res.setHeader("X-Export-Truncated", "1");
       storage.appendLog({
         level: "info",
-        message: `Exported Jomashop product-field XLSX (${rowCount} row(s), ${agg.categories.length} sheet(s)) for ${agg.shopDomain}`,
+        message: `Exported Jomashop product-field XLSX (${rowCount} row(s), ${agg.categories.length} sheet(s)) for ${agg.shopDomain}${categoryFilter ? ` [category=${categoryFilter}]` : ""}`,
         detailsJson: JSON.stringify({
           totalProducts: agg.totalProducts,
           includedAll: agg.includedAll,
+          categoryFilter: categoryFilter || null,
+          truncated: Boolean(agg.truncated),
+          bytes: buf.length,
           categories: agg.categories.map((c) => ({
             category: c.category,
             rows: c.rows.length,
@@ -1480,9 +1566,14 @@ export function registerJomashopProductFieldExcelRoutes(app: Express): void {
         }),
         createdAt: Date.now(),
       });
+      // Drop the aggregation reference before sending the buffer so its
+      // backing arrays can be released while we stream the response.
+      (agg as any).categories = null;
       res.end(buf);
+      logMemory("productFieldExport.responded", { bytes: buf.length });
     } catch (err) {
       const msg = (err as Error).message;
+      logMemory("productFieldExport.failed", { message: msg });
       storage.appendLog({
         level: "error",
         message: `Jomashop product-field XLSX export failed: ${msg}`,
@@ -1490,6 +1581,8 @@ export function registerJomashopProductFieldExcelRoutes(app: Express): void {
         createdAt: Date.now(),
       });
       res.status(500).json({ ok: false, error: msg });
+    } finally {
+      releaseLock("productFieldExport");
     }
   });
 

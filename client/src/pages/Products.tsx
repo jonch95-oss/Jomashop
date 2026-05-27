@@ -278,9 +278,38 @@ export default function Products() {
       });
       return res.json();
     },
-    onSuccess: (r) => {
+    onSuccess: (r, target) => {
       setPushResult(r);
+      // Optimistically flip the row to "pushed" so the product immediately
+      // moves out of the "Not pushed" filter without waiting for the cache
+      // refetch round-trip. The cache endpoint will then overlay the
+      // persisted push_status on its next fetch and confirm the state.
+      if (r && r.ok) {
+        const vendorSku = target.variantSku || target.mapped.vendor_sku || target.mapped.sku || "";
+        const jomashopSku = (r as any)?.payloadPreview?.vendor_sku ?? (r as any)?.payloadPreview?.sku ?? vendorSku;
+        setData((prev) => {
+          if (!prev || !Array.isArray((prev as any).mapped)) return prev;
+          const nextMapped = (prev as any).mapped.map((row: any) => {
+            if (String(row.vendor_sku) !== String(vendorSku)) return row;
+            return {
+              ...row,
+              push_state: "pushed",
+              jomashop_sku: jomashopSku,
+              last_push_error: null,
+              last_pushed_at: Date.now(),
+              last_invalid_params: null,
+              last_rejected_category: null,
+              last_rejected_brand: null,
+            };
+          });
+          return { ...(prev as any), mapped: nextMapped };
+        });
+      }
+      // Refetch cache so the overlay (push_statuses joined onto cached
+      // payload) takes effect, and refresh the dedicated push-statuses
+      // endpoint used by other panels.
       queryClient.invalidateQueries({ queryKey: ["/api/products/cache"] });
+      queryClient.refetchQueries({ queryKey: ["/api/products/cache"] });
       queryClient.invalidateQueries({ queryKey: ["/api/push-statuses"] });
     },
     onError: (e: Error) => {

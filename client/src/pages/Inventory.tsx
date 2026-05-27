@@ -1,15 +1,37 @@
-import { useQuery } from "@tanstack/react-query";
-import { Download } from "lucide-react";
+import { useState } from "react";
+import { useMutation, useQuery } from "@tanstack/react-query";
+import { Download, RefreshCw } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { PageHeader, LoadingRows, ErrorBlock } from "@/components/AppShell";
+import { apiRequest } from "@/lib/queryClient";
 
 type Row = { vendor_sku: string; price: number; status: string; quantity: number };
 type Preview = { headers: string[]; rows: Row[]; note: string };
+type SyncResult = {
+  ok: boolean;
+  attempted?: number;
+  applied?: number;
+  skipped?: number;
+  rejected?: number;
+  truncated?: boolean;
+  results?: Array<{ sku: string; status: string; message: string }>;
+  error?: string;
+  note?: string;
+};
 
 export default function Inventory() {
   const q = useQuery<Preview>({ queryKey: ["/api/sync/inventory-preview"] });
+  const [syncResult, setSyncResult] = useState<SyncResult | null>(null);
+  const sync = useMutation({
+    mutationFn: async (args: { shopifySku?: string }): Promise<SyncResult> => {
+      const res = await apiRequest("POST", "/api/jomashop/inventory-sync", args);
+      return (await res.json()) as SyncResult;
+    },
+    onSuccess: (r) => setSyncResult(r),
+    onError: (e: Error) => setSyncResult({ ok: false, error: e.message }),
+  });
 
   if (q.isLoading) return <LoadingRows />;
   if (q.isError) return <ErrorBlock message={(q.error as Error).message} />;
@@ -36,15 +58,46 @@ export default function Inventory() {
         title="Inventory"
         description="Bulk inventory update preview. Maps to PUT /v1/inventory/update-statuses or POST /v1/inventory/upload-updates."
         actions={
-          <Button data-testid="button-download-csv" onClick={downloadCsv} variant="outline" size="sm">
-            <Download className="mr-2 h-3.5 w-3.5" /> Export preview CSV
-          </Button>
+          <div className="flex flex-wrap gap-2">
+            <Button
+              data-testid="button-sync-inventory"
+              onClick={() => sync.mutate({})}
+              disabled={sync.isPending}
+              variant="default"
+              size="sm"
+            >
+              <RefreshCw className={`mr-2 h-3.5 w-3.5 ${sync.isPending ? "animate-spin" : ""}`} />{" "}
+              {sync.isPending ? "Syncing…" : "Sync inventory to Jomashop"}
+            </Button>
+            <Button data-testid="button-download-csv" onClick={downloadCsv} variant="outline" size="sm">
+              <Download className="mr-2 h-3.5 w-3.5" /> Export preview CSV
+            </Button>
+          </div>
         }
       />
 
       <div className="mb-4 rounded-md border border-border bg-card/40 px-4 py-2.5 text-xs text-muted-foreground">
         {q.data.note}
       </div>
+
+      {syncResult && (
+        <div
+          data-testid="banner-sync-result"
+          className={`mb-4 rounded-md border px-4 py-2.5 text-xs ${
+            syncResult.ok
+              ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
+              : "border-rose-500/50 bg-rose-500/10 text-rose-700 dark:text-rose-400"
+          }`}
+        >
+          {syncResult.ok
+            ? `Synced ${syncResult.attempted ?? 0} SKU(s): ${syncResult.applied ?? 0} applied, ${
+                syncResult.skipped ?? 0
+              } skipped, ${syncResult.rejected ?? 0} rejected${
+                syncResult.truncated ? " (truncated to first 250)" : ""
+              }${syncResult.note ? ` — ${syncResult.note}` : ""}`
+            : `Sync failed: ${syncResult.error ?? "unknown error"}`}
+        </div>
+      )}
 
       <Card>
         <CardHeader className="border-b border-card-border">

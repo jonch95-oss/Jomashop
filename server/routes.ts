@@ -40,6 +40,7 @@ import {
 } from "./mapping";
 import {
   encryptToken,
+  fetchShopifyProductImages,
   fetchShopifyProducts,
   getActiveShopifyConnection,
   MAPPER_VERSION,
@@ -59,7 +60,7 @@ import {
 import { registerResolutionAuditRoutes } from "./resolution_audit";
 import { registerJomashopMappingExcelRoutes } from "./jomashop_mapping_excel";
 import { registerJomashopProductFieldExcelRoutes } from "./jomashop_product_field_excel";
-import { registerWebhookRoutes, registerShopifyWebhooks } from "./webhooks";
+import { pushInventoryUpdate, registerWebhookRoutes, registerShopifyWebhooks } from "./webhooks";
 import { logMemory } from "./memlog";
 import { releaseLock, withLockOr409 } from "./stability";
 
@@ -310,9 +311,67 @@ function compactifyMapped(m: any): CompactMappedProduct {
 }
 
 /**
+ * Build a vendor-sku → live push-status overlay so cached rows reflect the
+ * latest push state without requiring a full /api/products/refresh. The push
+ * handler upserts into the push_statuses table on every success/failure;
+ * this lets the cache fast-path surface "pushed" / "rejected" as soon as
+ * the next list fetch happens.
+ */
+function buildPushStatusOverlay(shopDomain: string | null): Map<
+  string,
+  {
+    state: string;
+    jomashopSku: string | null;
+    lastError: string | null;
+    lastPushedAt: number | null;
+    lastInvalidParams: string[] | null;
+    lastRejectedCategory: string | null;
+    lastRejectedBrand: string | null;
+  }
+> {
+  const overlay = new Map<
+    string,
+    {
+      state: string;
+      jomashopSku: string | null;
+      lastError: string | null;
+      lastPushedAt: number | null;
+      lastInvalidParams: string[] | null;
+      lastRejectedCategory: string | null;
+      lastRejectedBrand: string | null;
+    }
+  >();
+  for (const ps of storage.listPushStatuses(shopDomain ?? undefined)) {
+    let invalidParams: string[] | null = null;
+    if (ps.lastInvalidParams) {
+      try {
+        const parsed = JSON.parse(ps.lastInvalidParams);
+        if (Array.isArray(parsed)) invalidParams = parsed.map(String);
+      } catch {
+        // ignore
+      }
+    }
+    overlay.set(ps.shopifySku, {
+      state: ps.state,
+      jomashopSku: ps.jomashopSku,
+      lastError: ps.lastError,
+      lastPushedAt: ps.lastPushedAt,
+      lastInvalidParams: invalidParams,
+      lastRejectedCategory: ps.lastRejectedCategory,
+      lastRejectedBrand: ps.lastRejectedBrand,
+    });
+  }
+  return overlay;
+}
+
+/**
  * Slice + project a cache payload for transport. Always returns compact
  * mapped rows (never debug_raw / full metafields), and applies pagination so
  * we don't ship the full 3000-item list to a single client.
+ *
+ * Overlays the latest push_statuses table contents over the cached payload
+ * so a freshly-pushed SKU moves to the "Pushed" group on the very next
+ * fetch without needing a full Shopify refresh.
  */
 function paginateCachePayload(
   payload: any,
@@ -322,7 +381,24 @@ function paginateCachePayload(
   const totalCount = allMapped.length;
   const start = Math.min(opts.offset, totalCount);
   const end = Math.min(start + opts.limit, totalCount);
-  const slice = allMapped.slice(start, end).map(compactifyMapped);
+  const overlay = buildPushStatusOverlay(opts.shopDomain);
+  const slice = allMapped
+    .slice(start, end)
+    .map((m) => {
+      const compact = compactifyMapped(m);
+      const live = overlay.get(compact.vendor_sku);
+      if (!live) return compact;
+      return {
+        ...compact,
+        push_state: live.state ?? compact.push_state,
+        jomashop_sku: live.jomashopSku ?? compact.jomashop_sku,
+        last_push_error: live.lastError ?? null,
+        last_pushed_at: live.lastPushedAt ?? compact.last_pushed_at,
+        last_invalid_params: live.lastInvalidParams ?? compact.last_invalid_params,
+        last_rejected_category: live.lastRejectedCategory ?? compact.last_rejected_category,
+        last_rejected_brand: live.lastRejectedBrand ?? compact.last_rejected_brand,
+      };
+    });
   return {
     mapperVersion: payload?.mapperVersion ?? null,
     schemas: payload?.schemas ?? null,
@@ -1950,6 +2026,131 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     });
   });
 
+  // Manual inventory sync. Pushes the current Shopify inventory state to
+  // Jomashop for one SKU or every pushed SKU. Inventory webhooks remain the
+  // primary path (set up via /api/shopify/register-webhooks), but this
+  // endpoint lets the operator force a reconciliation when:
+  //
+  //   - webhooks haven't propagated yet on a freshly-installed app,
+  //   - a SKU's stock state drifted between Shopify and Jomashop,
+  //   - the operator wants to roll a manual price/MSRP update.
+  //
+  // body: { shopifySku?: string }
+  //   - shopifySku set: sync that one SKU.
+  //   - shopifySku absent: sync ALL pushed SKUs (state === "pushed").
+  app.post("/api/jomashop/inventory-sync", async (req, res) => {
+    if (!jomashopConfigured()) {
+      return res.status(503).json({
+        ok: false,
+        error: "Jomashop credentials not configured. Set JOMASHOP_EMAIL and JOMASHOP_PASSWORD.",
+      });
+    }
+    const conn = getActiveShopifyConnection();
+    if (!conn) {
+      return res.status(503).json({
+        ok: false,
+        error: "No connected Shopify store with an access token.",
+      });
+    }
+    const shopDomain = conn.shopDomain;
+    const targetSku = typeof req.body?.shopifySku === "string" ? req.body.shopifySku.trim() : "";
+
+    // Resolve the candidate rows. Single-SKU path is a fast lookup; bulk
+    // path filters to "pushed" rows so we never try to push inventory for a
+    // SKU we never created.
+    type Candidate = { shopifySku: string; productId: string | null };
+    let candidates: Candidate[] = [];
+    if (targetSku) {
+      const lookup = storage.getPushStatusBySku(shopDomain, targetSku);
+      if (!lookup) {
+        return res.status(404).json({
+          ok: false,
+          error: `No push_status row found for SKU ${targetSku} in store ${shopDomain}. Push the product first.`,
+        });
+      }
+      candidates.push({ shopifySku: lookup.shopifySku, productId: lookup.shopifyProductId });
+    } else {
+      const all = storage.listPushStatuses(shopDomain);
+      candidates = all
+        .filter((p) => p.state === "pushed")
+        .map((p) => ({ shopifySku: p.shopifySku, productId: p.shopifyProductId }));
+    }
+    if (candidates.length === 0) {
+      return res.json({
+        ok: true,
+        attempted: 0,
+        applied: 0,
+        skipped: 0,
+        rejected: 0,
+        results: [],
+        note: "No pushed SKUs to sync.",
+      });
+    }
+    // Hard cap so we never spend an hour serializing through a few thousand
+    // SKUs from a single HTTP request. The operator can paginate via repeated
+    // calls; webhooks are still the long-term real-time path.
+    const MAX_BULK = 250;
+    if (candidates.length > MAX_BULK) {
+      candidates = candidates.slice(0, MAX_BULK);
+    }
+
+    // Resolve current Shopify inventory state in bulk by paginating products
+    // and indexing variants by SKU. We stop streaming as soon as we've found
+    // every requested SKU.
+    const wantedSkus = new Set(candidates.map((c) => c.shopifySku));
+    const skuQuantities = new Map<string, number | null>();
+    try {
+      const { streamShopifyProducts } = await import("./shopify");
+      await streamShopifyProducts((pageProducts) => {
+        for (const p of pageProducts) {
+          for (const v of p.variants || []) {
+            const sku = (v.sku ?? "").trim();
+            if (!sku || !wantedSkus.has(sku) || skuQuantities.has(sku)) continue;
+            skuQuantities.set(
+              sku,
+              typeof v.inventory_quantity === "number" ? v.inventory_quantity : null,
+            );
+          }
+        }
+        if (skuQuantities.size >= wantedSkus.size) return false;
+      });
+    } catch (err) {
+      // Fall through with whatever we resolved — push handler tolerates a
+      // null quantity by reusing the cached value on the push_status row.
+      void err;
+    }
+
+    const results: Array<{ sku: string; status: string; message: string }> = [];
+    for (const c of candidates) {
+      const qty = skuQuantities.get(c.shopifySku) ?? null;
+      const r = await pushInventoryUpdate({
+        shopifySku: c.shopifySku,
+        quantity: qty,
+        topic: "manual-sync",
+        shopDomain,
+      });
+      results.push({ sku: c.shopifySku, status: r.status, message: r.message });
+    }
+    const applied = results.filter((r) => r.status === "applied").length;
+    const skipped = results.filter((r) => r.status === "skipped").length;
+    const rejected = results.filter((r) => r.status === "rejected").length;
+    storage.appendLog({
+      level: rejected > 0 ? "warn" : "info",
+      message: `Manual inventory sync: ${applied} applied / ${skipped} skipped / ${rejected} rejected (${results.length} attempted)`,
+      detailsJson: JSON.stringify({ targetSku: targetSku || "(all pushed)", results }),
+      createdAt: Date.now(),
+    });
+    return res.json({
+      ok: true,
+      attempted: results.length,
+      applied,
+      skipped,
+      rejected,
+      truncated: candidates.length === MAX_BULK && !targetSku,
+      results,
+    });
+  });
+
   app.get("/api/sync/orders-preview", (_req, res) => {
     const now = new Date();
     const samples = [
@@ -2053,6 +2254,51 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const hit = lookupEnumOverride(cat, field, sourceValue, acceptedOptions);
       return hit ? hit.jomashopOption : null;
     };
+
+    // Hydrate the FULL image list before mapping. The compact list payload
+    // only carries the first image (to keep cache + transport small), so on
+    // push we fetch every available image directly from the Shopify Admin
+    // API by product id. Deduped + stable order. Falls back to whatever the
+    // client supplied on any failure.
+    let imagesFetched: number | null = null;
+    let imagesFetchError: string | null = null;
+    const productIdForImages = (body.product as any)?.id;
+    if (productIdForImages !== undefined && productIdForImages !== null && String(productIdForImages).trim() !== "") {
+      try {
+        const detail = await fetchShopifyProductImages(String(productIdForImages));
+        if (detail && detail.images.length > 0) {
+          // Preserve the client-supplied first image at the head when it
+          // matches; otherwise just use the full list as Shopify ordered it.
+          const existing = Array.isArray(body.product!.images) ? body.product!.images : [];
+          const existingUrls = new Set(
+            existing.map((i: any) => (typeof i?.src === "string" ? i.src.trim() : "")).filter(Boolean),
+          );
+          const merged: Array<{ src: string; alt?: string | null }> = [];
+          const seen = new Set<string>();
+          for (const img of detail.images) {
+            if (seen.has(img.src)) continue;
+            seen.add(img.src);
+            merged.push({ src: img.src, alt: img.alt });
+          }
+          for (const img of existing) {
+            const src = typeof img?.src === "string" ? img.src.trim() : "";
+            if (!src || seen.has(src)) continue;
+            seen.add(src);
+            merged.push({ src, alt: (img as any)?.alt ?? null });
+          }
+          body.product = { ...body.product!, images: merged };
+          imagesFetched = merged.length;
+          // Suppress unused-variable lint while keeping the diagnostic info.
+          void existingUrls;
+        } else if (detail && detail.images.length === 0) {
+          imagesFetched = 0;
+        } else {
+          imagesFetchError = "image detail lookup returned null";
+        }
+      } catch (err) {
+        imagesFetchError = (err as Error).message;
+      }
+    }
 
     // Resolve live (or fallback) schema for the inferred/forced category.
     // Always lift to the canonical Jomashop name (Clothing→Apparel,
@@ -2218,6 +2464,11 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     // bundled Clothing options" — the exact mismatch this fix addresses.
     (pushDebug as any).schemaSource = liveSchemaSource;
     (pushDebug as any).schemaCategoryName = schemaCategory;
+    (pushDebug as any).imagesFetched = imagesFetched;
+    (pushDebug as any).imagesFetchError = imagesFetchError;
+    (pushDebug as any).imagesCount = Array.isArray((payload as any)?.images)
+      ? (payload as any).images.length
+      : 0;
 
     // If the chosen schema produced an unsafe (lowercase-only) payload but we
     // have a Title Case bundled fallback for this category, re-map against

@@ -75,7 +75,7 @@ function inventoryStatusFor(qty: number | undefined | null): "active" | "out_of_
   return "active";
 }
 
-async function pushInventoryUpdate(opts: {
+export async function pushInventoryUpdate(opts: {
   shopifySku: string;
   quantity: number | null;
   topic: string;

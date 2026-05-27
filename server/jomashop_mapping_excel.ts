@@ -392,10 +392,81 @@ export async function aggregateUnresolvedMappings(): Promise<AggregateMappingsRe
 
 // ---------- Workbook build ----------
 
+// Defined-name builder mirrored from jomashop_product_field_excel — same rules
+// (letters/digits/underscore only, no leading digit) so the two workbooks can
+// share helper logic in tests.
+export function buildMappingOptionsRangeName(category: string, field: string): string {
+  const slug = (s: string) =>
+    String(s).replace(/[^A-Za-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  return `mopts_${slug(category)}_${slug(field)}`.slice(0, 255);
+}
+
+function columnLetter(idx: number): string {
+  let n = idx;
+  let s = "";
+  while (n > 0) {
+    const rem = (n - 1) % 26;
+    s = String.fromCharCode(65 + rem) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
+}
+
 export async function buildMappingWorkbook(agg: AggregateMappingsResult): Promise<Buffer> {
   const wb = new ExcelJS.Workbook();
   wb.creator = "LuxeSupply Jomashop Mapping";
   wb.created = new Date();
+
+  // Hidden helper sheet that holds the accepted-values list for every enum
+  // field across every (category, property). One COLUMN per pair; the
+  // workbook defines a name pointing at that column's data range so the
+  // main sheet's data validation can reference an arbitrarily long list
+  // (Excel's ~255-char inline cap doesn't apply via named ranges).
+  const optionsSheet = wb.addWorksheet("_Options");
+  optionsSheet.state = "hidden";
+
+  type OptionCol = {
+    category: string;
+    field: string;
+    rangeName: string;
+    columnIndex: number;
+    options: string[];
+  };
+  const optionCols: OptionCol[] = [];
+  const optionColByKey = new Map<string, OptionCol>();
+  let nextCol = 1;
+  for (const r of agg.rows) {
+    const key = `${r.jomashopCategory}::${r.jomashopPropertyName}`;
+    if (optionColByKey.has(key)) continue;
+    const opts = Array.isArray(r.acceptedJomashopOptions)
+      ? r.acceptedJomashopOptions.filter((o) => o && o.trim())
+      : [];
+    if (opts.length === 0) continue;
+    const oc: OptionCol = {
+      category: r.jomashopCategory,
+      field: r.jomashopPropertyName,
+      rangeName: buildMappingOptionsRangeName(r.jomashopCategory, r.jomashopPropertyName),
+      columnIndex: nextCol,
+      options: opts,
+    };
+    optionCols.push(oc);
+    optionColByKey.set(key, oc);
+    nextCol += 1;
+  }
+  if (optionCols.length > 0) {
+    for (const oc of optionCols) {
+      optionsSheet.getCell(1, oc.columnIndex).value = `${oc.category} :: ${oc.field}`;
+      optionsSheet.getCell(1, oc.columnIndex).font = { bold: true };
+      for (let i = 0; i < oc.options.length; i++) {
+        optionsSheet.getCell(i + 2, oc.columnIndex).value = oc.options[i];
+      }
+      const lastRow = oc.options.length + 1;
+      const letter = columnLetter(oc.columnIndex);
+      const ref = `_Options!$${letter}$2:$${letter}$${lastRow}`;
+      wb.definedNames.add(ref, oc.rangeName);
+    }
+    optionsSheet.getColumn(1).width = 32;
+  }
 
   const ws = wb.addWorksheet("Jomashop Mapping", { views: [{ state: "frozen", ySplit: 1 }] });
   ws.columns = COLUMNS.map((c) => ({ header: c.header, key: c.key, width: c.width }));
@@ -472,11 +543,11 @@ export async function buildMappingWorkbook(agg: AggregateMappingsResult): Promis
 
   ws.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: COLUMNS.length } };
 
-  // Per-row data validation for user_value when we have a live accepted list.
-  // Excel data-validation lists are typed inline as a comma-joined string. We
-  // skip rows with no live list so the operator can still type a free-text
-  // accepted value (then the operator must mark `operator_verified` via the
-  // dashboard, or supply a valid list themselves).
+  // Per-row data validation for user_value. We attach a list dropdown that
+  // references the hidden _Options sheet via a workbook-level defined name,
+  // which lifts the Excel ~255-char inline-list cap and gives operators a
+  // dropdown for EVERY enum field — including long lists (Country of Origin,
+  // Article, ...) that the previous inline approach silently skipped.
   const userValueColIdx = COLUMNS.findIndex((c) => c.key === "user_value") + 1;
   const writeBackColIdx = COLUMNS.findIndex((c) => c.key === "write_back") + 1;
   if (userValueColIdx > 0) {
@@ -484,16 +555,16 @@ export async function buildMappingWorkbook(agg: AggregateMappingsResult): Promis
     for (let i = 0; i < agg.rows.length; i++) {
       const r = agg.rows[i];
       const rowNumber = i + 2;
-      if (
-        r.acceptedJomashopOptions &&
-        r.acceptedJomashopOptions.length > 0 &&
-        r.acceptedJomashopOptions.length <= 50 &&
-        r.acceptedJomashopOptions.every((o) => !o.includes(","))
-      ) {
+      const oc = optionColByKey.get(`${r.jomashopCategory}::${r.jomashopPropertyName}`);
+      if (oc) {
         ws.getCell(`${colLetter}${rowNumber}`).dataValidation = {
           type: "list",
           allowBlank: true,
-          formulae: ['"' + r.acceptedJomashopOptions.join(",") + '"'],
+          showErrorMessage: true,
+          errorStyle: "stop",
+          errorTitle: `Invalid ${r.jomashopPropertyName}`,
+          error: `Value must be one of the Jomashop-accepted options for "${r.jomashopPropertyName}".`,
+          formulae: [`=${oc.rangeName}`],
         };
       }
     }

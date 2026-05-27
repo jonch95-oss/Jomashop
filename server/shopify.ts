@@ -524,3 +524,68 @@ export async function fetchShopifyProducts(
     ...(stream.partialStatus !== undefined ? { partialStatus: stream.partialStatus } : {}),
   };
 }
+
+// Cap on images pulled per product detail fetch. Shopify allows up to 250 per
+// page; 50 is a safe upper bound that covers virtually every real product
+// (handbag listings rarely exceed ~20 lifestyle shots).
+const PUSH_DETAIL_IMAGES_PER_PRODUCT = 50;
+
+/**
+ * Fetch the FULL image list for a single Shopify product, by numeric id.
+ * Used by the Jomashop push flow so the outbound payload carries every
+ * available image rather than the single image cached in the list view.
+ *
+ * Returns deduped URLs in stable Shopify position order. Returns `null` on
+ * any network/lookup failure — callers should fall back to whatever images
+ * they already have (usually the cached first image).
+ */
+export async function fetchShopifyProductImages(
+  productId: string | number,
+): Promise<{ images: Array<{ src: string; alt: string | null }>; count: number } | null> {
+  const conn = getActiveShopifyConnection();
+  if (!conn) return null;
+  const numericId = String(productId).match(/(\d+)$/)?.[1] ?? String(productId);
+  const gid = `gid://shopify/Product/${numericId}`;
+  const endpoint = `https://${conn.shopDomain}/admin/api/${ADMIN_API_VERSION}/graphql.json`;
+  const query = `
+    query ProductImages($id: ID!, $first: Int!) {
+      product(id: $id) {
+        id
+        images(first: $first) { edges { node { url altText } } }
+      }
+    }
+  `;
+  try {
+    const res = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": conn.accessToken,
+      },
+      body: JSON.stringify({
+        query,
+        variables: { id: gid, first: PUSH_DETAIL_IMAGES_PER_PRODUCT },
+      }),
+    });
+    if (!res.ok) return null;
+    const body = (await res.json()) as {
+      data?: { product?: { images?: { edges: Array<{ node: { url: string; altText: string | null } }> } } };
+      errors?: Array<{ message: string }>;
+    };
+    if (body.errors && body.errors.length > 0) return null;
+    const edges = body.data?.product?.images?.edges ?? [];
+    const seen = new Set<string>();
+    const out: Array<{ src: string; alt: string | null }> = [];
+    for (const e of edges) {
+      const url = e?.node?.url;
+      if (typeof url !== "string" || !url) continue;
+      const key = url.trim();
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      out.push({ src: key, alt: e.node.altText ?? null });
+    }
+    return { images: out, count: out.length };
+  } catch {
+    return null;
+  }
+}
