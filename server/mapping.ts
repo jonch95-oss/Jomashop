@@ -6,6 +6,7 @@ import {
   SUPPORTED_CATEGORIES,
   type SupportedCategory,
 } from "@shared/schema";
+import { resolveCategorySynonym } from "./synonym_resolver";
 
 export type ShopifyVariant = {
   id?: string | number;
@@ -55,6 +56,12 @@ export type MappedProduct = {
    *  the push must be blocked because Jomashop's accepted set isn't known.
    *  Each entry includes the canonical value (if any) we'd have sent. */
   unverified_required_options?: Array<{ field: string; value?: string }>;
+  /** Enum coercions performed automatically by the category-code synonym
+   *  resolver. Each entry surfaces the live schema field, the chosen
+   *  accepted option, and the source code that drove the resolution. The
+   *  UI shows these as "auto-resolved" so the operator can audit / override
+   *  the choice. */
+  auto_resolved_enums?: Array<{ field: string; chosen: string; sourceCode: string; reason: string }>;
   category: SupportedCategory;
   /** True when this mapping was produced from a built-in demo fixture rather
    *  than a real Shopify product. The UI uses this to block pushes and label
@@ -574,6 +581,19 @@ export type CanonicalProductFields = {
   dimensions?: string;
   interior_material?: string;
   raw_category_code?: string;
+  /** "UPC" or "EAN" when the product carries a real UPC/EAN identifier on
+   *  the first variant.barcode or a UPC/EAN metafield. Never derived from
+   *  category code or product type — Jomashop's Product ID Type enum only
+   *  accepts UPC / EAN, so any other source is dropped. */
+  product_id_type?: string;
+  /** The actual UPC/EAN value. Paired with product_id_type. */
+  product_id?: string;
+  /** ASIN value, when an explicit ASIN metafield is present. Never inferred. */
+  asin?: string;
+  /** "Yes" when the product carries a size variant (multiple sizes OR a
+   *  single non-empty size), "No" when it does not. Never the literal size
+   *  value (e.g. "4") — Jomashop's Variation Size enum is a Yes/No flag. */
+  variation_size_yes_no?: string;
 };
 
 /**
@@ -753,6 +773,52 @@ export function buildCanonicalProductFields(p: ShopifyProduct): CanonicalProduct
   const dimensions = readMetafieldAny(p, ["dimensions", "Dimensions"]);
   const interior_material = readMetafieldAny(p, ["interior_material", "Interior Material"]);
 
+  // Product ID (UPC/EAN) and ASIN must NEVER be derived from category code
+  // or product type — Jomashop's Product ID Type enum accepts only UPC and
+  // EAN. We source them strictly from explicit identifier fields.
+  //
+  // UPC = 12 digits, EAN = 13 digits. variant.barcode is the canonical
+  // Shopify carrier; metafields with the literal label "UPC" / "EAN" / "ASIN"
+  // are honored too.
+  const firstBarcode =
+    (firstVariant?.barcode && String(firstVariant.barcode).trim()) || undefined;
+  const upcMeta = readMetafieldAny(p, ["UPC", "upc", "Upc", "custom.upc", "luxe.upc"]);
+  const eanMeta = readMetafieldAny(p, ["EAN", "ean", "Ean", "custom.ean", "luxe.ean"]);
+  const asinMeta = readMetafieldAny(p, ["ASIN", "asin", "Asin", "custom.asin", "luxe.asin"]);
+
+  let product_id: string | undefined;
+  let product_id_type: string | undefined;
+  if (upcMeta && /^\d{11,13}$/.test(upcMeta.trim())) {
+    product_id = upcMeta.trim();
+    product_id_type = product_id.length === 13 ? "EAN" : "UPC";
+  } else if (eanMeta && /^\d{12,13}$/.test(eanMeta.trim())) {
+    product_id = eanMeta.trim();
+    product_id_type = "EAN";
+  } else if (firstBarcode && /^\d{12,13}$/.test(firstBarcode)) {
+    product_id = firstBarcode;
+    product_id_type = firstBarcode.length === 13 ? "EAN" : "UPC";
+  }
+  const asin = asinMeta && asinMeta.trim() ? asinMeta.trim() : undefined;
+
+  // Variation Size (Yes/No) is a boolean-style enum on Jomashop. "Yes" when
+  // the product has a size option (one or more variants with a non-empty
+  // size value). Never the literal size value — "4" is not in the accepted
+  // Yes/No list.
+  let variation_size_yes_no: string | undefined;
+  if (sizeOpt) {
+    const hasNonEmptySize = (p.variants || []).some((v) => {
+      const val = (v as unknown as Record<string, unknown>)[sizeOpt] as string | null | undefined;
+      return typeof val === "string" && val.trim() !== "";
+    });
+    variation_size_yes_no = hasNonEmptySize ? "Yes" : "No";
+  } else if (size) {
+    // No "Size" option but a size value resolved from a metafield — still
+    // counts as having a size variation.
+    variation_size_yes_no = "Yes";
+  } else {
+    variation_size_yes_no = "No";
+  }
+
   return {
     brand: brand || undefined,
     model: p.title || undefined,
@@ -776,6 +842,10 @@ export function buildCanonicalProductFields(p: ShopifyProduct): CanonicalProduct
     dimensions: dimensions || undefined,
     interior_material: interior_material || undefined,
     raw_category_code: rawCategoryCode || undefined,
+    product_id_type,
+    product_id,
+    asin,
+    variation_size_yes_no,
   };
 }
 
@@ -848,7 +918,15 @@ function pickCanonicalField(prop: SchemaPropertyDescriptor): keyof CanonicalProd
   const tokens = [labelToken(prop.field), labelToken(prop.label)].filter((s) => s.length > 0);
   if (tokens.length === 0) return null;
   const has = (sub: string) => tokens.some((t) => t.includes(sub));
-  // Most-specific first so "Apparel Size Type" doesn't fall through to "size".
+  // Most-specific first so "Variation Size (Yes/No)" and "Apparel Size Type"
+  // don't fall through to "size".
+  if (has("variationsize") || has("variantsize") || has("sizevariation") || has("sizeyesno"))
+    return "variation_size_yes_no";
+  if (has("productidtype") || has("productidkind") || has("idtype")) return "product_id_type";
+  if (has("productid") && !has("productidtype") && !has("productidkind")) return "product_id";
+  if (has("upc") && !has("upclookup")) return "product_id";
+  if (has("ean") && !has("eancode") || tokens.some((t) => t === "ean")) return "product_id";
+  if (has("asin")) return "asin";
   if (has("apparelsizetype") || has("sizetype") || has("sizesystem") || has("sizescale")) return "size_system";
   if (has("apparelsize") || has("size")) return "size";
   if (has("countryoforigin") || has("origin") || has("madein") || has("country")) return "country_of_origin";
@@ -1138,6 +1216,11 @@ export function buildSchemaProperties(
    *  blocker; the operator must load the live option list (or map values)
    *  before the field can be sent. */
   unverifiedRequiredOptions: Array<{ field: string; value?: string }>;
+  /** Enum coercions performed by the data-driven category-code synonym
+   *  resolver. Surfaces in the UI as "auto-resolved" so the operator can
+   *  audit / override the choice. Each entry records the live schema field,
+   *  the chosen accepted option, and the source code that drove it. */
+  autoResolvedEnums: Array<{ field: string; chosen: string; sourceCode: string; reason: string }>;
 } {
   const properties: Record<string, string | number | boolean | null> = {};
   const missingRequired: string[] = [];
@@ -1145,6 +1228,7 @@ export function buildSchemaProperties(
   const invalidEnums: Array<{ field: string; value: string; options: string[] }> = [];
   const omittedFields: string[] = [];
   const unverifiedRequiredOptions: Array<{ field: string; value?: string }> = [];
+  const autoResolvedEnums: Array<{ field: string; chosen: string; sourceCode: string; reason: string }> = [];
 
   // Build the prioritized list of source values to feed the enum-override
   // resolver for a single property. The resolver checks each in order and
@@ -1190,6 +1274,32 @@ export function buildSchemaProperties(
     return null;
   }
 
+  // Synonym resolver — option-aware mapping from Shopify category codes
+  // (OUTW, HEEL, CRBD, ...) to the live accepted-options list. Only runs
+  // when the schema property carries a VERIFIED option list (not
+  // options_unverified) AND the operator override didn't already supply a
+  // value. Resolution is null-safe: a code that doesn't map to any accepted
+  // option returns null and the caller falls through to the existing
+  // omit / preflight path.
+  function resolveSynonymFor(
+    prop: SchemaPropertyDescriptor,
+    canonicalValue: string | undefined,
+  ): { value: string; source: string } | null {
+    if (prop.options_unverified) return null;
+    if (!Array.isArray(prop.options) || prop.options.length === 0) return null;
+    const sources: string[] = [];
+    if (canonical.raw_category_code) sources.push(canonical.raw_category_code);
+    if (canonical.apparel_type) sources.push(canonical.apparel_type);
+    if (canonical.category_type) sources.push(canonical.category_type);
+    if (canonical.style) sources.push(canonical.style);
+    if (canonicalValue) sources.push(canonicalValue);
+    for (const src of sources) {
+      const hit = resolveCategorySynonym(prop.field, src, prop.options);
+      if (hit) return { value: hit, source: src };
+    }
+    return null;
+  }
+
   for (const prop of schema) {
     if (!prop || typeof prop.field !== "string" || prop.field.trim() === "" || prop.field === "undefined") {
       continue;
@@ -1229,32 +1339,61 @@ export function buildSchemaProperties(
       continue;
     }
 
-    // Normalize against schema options if present. A canonical value that
-    // doesn't match any option is dropped here — sending an invalid enum
-    // value triggers Jomashop's "X is not included in the list" rejection.
-    // Before dropping, we consult the operator override map: a saved mapping
-    // (Shopify code → accepted Jomashop option) takes precedence.
+    // Resolution order for enum fields with a verified accepted-options
+    // list:
+    //   1) Operator override (verified mapping) — always wins when present.
+    //      A saved operator mapping is a deliberate choice and must beat any
+    //      auto-resolution, even when the canonical value would otherwise
+    //      match directly. This preserves operator intent across pushes.
+    //   2) Direct enum coercion against the canonical value (matchSchemaOption).
+    //   3) Data-driven category-code synonym resolver, gated on the live
+    //      accepted-options list. Surfaces in auto_resolved_enums.
+    //   4) Drop (enumCoercionFailed) — surfaces in invalid_enums.
+    //
+    // Non-enum fields (no options) pass through unchanged.
     let enumCoercionFailed = false;
-    if (value && prop.options && prop.options.length > 0) {
-      const coerced = matchSchemaOption(value, prop.options);
-      if (coerced === undefined || coerced === "") {
-        const override = resolveOverrideFor(prop, value);
-        if (override) {
-          value = override.value;
-        } else {
-          enumCoercionFailed = true;
-          value = undefined;
-        }
-      } else {
-        value = coerced;
-      }
-    } else if (!value) {
-      // No canonical value at all — try override on the raw_category_code as
-      // a last-resort signal (e.g. OUTW → "Outerwear" for Article when no
-      // Article metafield exists).
-      const override = resolveOverrideFor(prop, undefined);
+    if (prop.options && prop.options.length > 0) {
+      // (1) Try operator override first so a verified mapping always wins.
+      const override = resolveOverrideFor(prop, value);
       if (override) {
         value = override.value;
+      } else if (value) {
+        // (2) Direct coercion against the accepted-options list.
+        const coerced = matchSchemaOption(value, prop.options);
+        if (coerced === undefined || coerced === "") {
+          // (3) Synonym resolver as fallback.
+          const synonym = resolveSynonymFor(prop, value);
+          if (synonym) {
+            value = synonym.value;
+            autoResolvedEnums.push({
+              field: outKey,
+              chosen: synonym.value,
+              sourceCode: synonym.source,
+              reason: "category-code synonym matched live accepted option",
+            });
+          } else {
+            // (4) Drop — caller decides whether this is preflight-blocking.
+            enumCoercionFailed = true;
+            value = undefined;
+          }
+        } else {
+          value = coerced;
+        }
+      } else {
+        // No canonical value AND no override — try the synonym resolver as
+        // a last resort (e.g. OUTW → "Coats & Jackets" when no Article
+        // metafield exists). Gated on the live accepted-options list so we
+        // never emit a guess.
+        const synonym = resolveSynonymFor(prop, undefined);
+        if (synonym) {
+          value = synonym.value;
+          autoResolvedEnums.push({
+            field: outKey,
+            chosen: synonym.value,
+            sourceCode: synonym.source,
+            reason: "category-code synonym matched live accepted option",
+          });
+        }
       }
     }
 
@@ -1290,6 +1429,7 @@ export function buildSchemaProperties(
     invalidEnums,
     omittedFields,
     unverifiedRequiredOptions,
+    autoResolvedEnums,
   };
 }
 
@@ -1432,6 +1572,7 @@ export function mapShopifyToJomashop(
   let invalidEnums: Array<{ field: string; value: string; options: string[] }> = [];
   let omittedOptionalFields: string[] = [];
   let unverifiedRequiredOptions: Array<{ field: string; value?: string }> = [];
+  let autoResolvedEnums: Array<{ field: string; chosen: string; sourceCode: string; reason: string }> = [];
 
   if (usesLiveSchemaLabels) {
     let canonical = buildCanonicalProductFields(product);
@@ -1461,6 +1602,12 @@ export function mapShopifyToJomashop(
     invalidEnums = built.invalidEnums;
     omittedOptionalFields = built.omittedFields;
     unverifiedRequiredOptions = built.unverifiedRequiredOptions;
+    autoResolvedEnums = built.autoResolvedEnums;
+    for (const r of autoResolvedEnums) {
+      warnings.push(
+        `Auto-resolved ${category} field "${r.field}" to "${r.chosen}" from source code "${r.sourceCode}" — ${r.reason}. Add a verified enum mapping to override.`,
+      );
+    }
     for (const inv of invalidEnums) {
       warnings.push(
         `Value "${inv.value}" for ${category} field "${inv.field}" is not in Jomashop's accepted list (${inv.options.slice(0, 8).join(", ")}${inv.options.length > 8 ? "…" : ""}). Add a mapping or correct the source metafield.`,
@@ -1730,6 +1877,7 @@ export function mapShopifyToJomashop(
     invalid_enums: invalidEnums,
     omitted_optional_fields: omittedOptionalFields,
     unverified_required_options: unverifiedRequiredOptions,
+    auto_resolved_enums: autoResolvedEnums,
     category,
     is_sample: sampleFixture,
     raw_category: rawCategory,
@@ -1836,6 +1984,7 @@ export function buildJomashopProductPayload(
     invalidEnums: Array<{ field: string; value: string; options: string[] }>;
     omittedOptionalFields: string[];
     unverifiedRequiredOptions: Array<{ field: string; value?: string }>;
+    autoResolvedEnums: Array<{ field: string; chosen: string; sourceCode: string; reason: string }>;
   };
 } {
   const variant =
@@ -1933,6 +2082,7 @@ export function buildJomashopProductPayload(
   const invalidEnums = mapped.invalid_enums || [];
   const omittedOptionalFields = mapped.omitted_optional_fields || [];
   const unverifiedRequiredOptions = mapped.unverified_required_options || [];
+  const autoResolvedEnums = mapped.auto_resolved_enums || [];
 
   const pushDebug = {
     category: (overrides.category && overrides.category.trim()) || mapped.category,
@@ -1943,6 +2093,7 @@ export function buildJomashopProductPayload(
     invalidEnums,
     omittedOptionalFields,
     unverifiedRequiredOptions,
+    autoResolvedEnums,
   };
 
   return {

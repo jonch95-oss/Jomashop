@@ -138,6 +138,7 @@ type CompactMappedProduct = {
   missing_required: string[];
   missing_top_level: string[];
   unverified_required_options: Array<{ field: string; value?: string }>;
+  auto_resolved_enums: Array<{ field: string; chosen: string; sourceCode: string; reason: string }>;
   source: { shopify_product_id?: string | number; shopify_variant_ids: Array<string | number> };
   // Push state (preserved as-is from the original payload).
   push_state: string;
@@ -246,6 +247,17 @@ function compactifyMapped(m: any): CompactMappedProduct {
           .map((u: any) => ({
             field: String(u.field),
             value: u.value !== undefined && u.value !== null ? String(u.value) : undefined,
+          }))
+      : [],
+    auto_resolved_enums: Array.isArray(m.auto_resolved_enums)
+      ? m.auto_resolved_enums
+          .filter((r: any) => r && typeof r.field === "string" && r.field)
+          .map((r: any) => ({
+            field: String(r.field),
+            chosen: r.chosen !== undefined && r.chosen !== null ? String(r.chosen) : "",
+            sourceCode:
+              r.sourceCode !== undefined && r.sourceCode !== null ? String(r.sourceCode) : "",
+            reason: r.reason !== undefined && r.reason !== null ? String(r.reason) : "",
           }))
       : [],
     source: {

@@ -2805,6 +2805,477 @@ function runV1ApparelArticleAcceptedOptions() {
   );
 }
 
+// ---------- Case 38: Canada Goose OUTW maps Article/Apparel Type to ----------
+//           "Coats & Jackets" via the synonym resolver on a v1-like Apparel
+//           schema. Also verifies Variation Size (Yes/No) → "Yes" from the
+//           presence of a Size option, and Product ID Type / Product ID /
+//           ASIN are OMITTED when no UPC/EAN/ASIN is supplied.
+function runCanadaGooseOutwLiveSynonymResolver() {
+  console.log("Case 38: Canada Goose OUTW → Coats & Jackets via synonym resolver");
+  const apparelLiveLikeSchema: SchemaPropertyDescriptor[] = [
+    {
+      field: "Gender",
+      label: "Gender",
+      required: true,
+      type: "enum",
+      options: ["Men", "Women", "Unisex"],
+    },
+    { field: "Age", label: "Age", required: true, type: "enum", options: ["Adult", "Kids"] },
+    {
+      field: "Apparel Type",
+      label: "Apparel Type",
+      required: true,
+      type: "enum",
+      options: ["Outerwear", "Pants", "Shirts"],
+    },
+    {
+      field: "Article",
+      label: "Article",
+      required: true,
+      type: "enum",
+      options: [
+        "Active & Lounge",
+        "Blazers",
+        "Cardigans & Sweaters",
+        "Casual Button-Downs",
+        "Coats & Jackets",
+        "Cocktail & Party Dresses",
+        "Cover-Ups",
+        "Dress Shirts",
+        "Pants",
+        "Shorts",
+        "Skirts",
+        "Suits",
+        "Tuxedos",
+      ],
+    },
+    {
+      field: "Product ID Type",
+      label: "Product ID Type",
+      required: false,
+      type: "enum",
+      options: ["EAN", "UPC"],
+      allow_omit: true,
+      omit_when_unknown_enum: true,
+    },
+    { field: "Product ID", label: "Product ID", required: false, type: "string", allow_omit: true },
+    { field: "ASIN", label: "ASIN", required: false, type: "string", allow_omit: true },
+    {
+      field: "Variation Size (Yes/No)",
+      label: "Variation Size (Yes/No)",
+      required: false,
+      type: "enum",
+      options: ["Yes", "No"],
+      allow_omit: true,
+      omit_when_unknown_enum: true,
+    },
+    { field: "Apparel Size Type", label: "Apparel Size Type", required: false, options: ["US", "EU", "UK"], allow_omit: true, omit_when_unknown_enum: true },
+    { field: "Apparel Size", label: "Apparel Size", required: false, type: "string", allow_omit: true },
+    { field: "Color", label: "Color", required: true, type: "string" },
+    { field: "Detailed Description", label: "Detailed Description", required: true, type: "string" },
+    { field: "Total Number of Pieces", label: "Total Number of Pieces", required: true, type: "string" },
+    { field: "Country of Origin", label: "Country of Origin", required: false, type: "string", allow_omit: true },
+    { field: "Fabric Material", label: "Fabric Material", required: false, type: "string", allow_omit: true },
+  ];
+  const product: ShopifyProduct = {
+    id: "shopify-cg-kids-outw-live",
+    title: "Canada Goose Kids Black Outerwear",
+    body_html: "<p>Kids' down parka in black.</p>",
+    vendor: "Canada Goose",
+    product_type: "OUTW",
+    tags: ["Kids", "Outerwear"],
+    images: [{ src: "https://example.com/cg.jpg" }],
+    options: [{ name: "Size", values: ["4"] }],
+    variants: [
+      { id: 9501, sku: "CG-KIDS-OUTW-4", price: "650.00", inventory_quantity: 1, option1: "4" },
+    ],
+    metafields: [
+      { namespace: "custom", key: "color", value: "Black", name: "Color" },
+      { namespace: "custom", key: "composition", value: "Cotton" },
+      { namespace: "custom", key: "ff_country_of_origin", value: "CA" },
+      { namespace: "custom", key: "ff_designer_id", value: "CG-PARKA-001" },
+      { namespace: "custom", key: "size_scale", value: "US" },
+    ],
+  };
+  const mapped = mapShopifyToJomashop(product, apparelLiveLikeSchema, "Apparel");
+  // Article must be auto-resolved to "Coats & Jackets" from OUTW
+  assert(
+    mapped.properties.Article === "Coats & Jackets",
+    `Case 38: properties.Article === "Coats & Jackets" (got ${JSON.stringify(mapped.properties.Article)})`,
+  );
+  assert(
+    mapped.properties["Apparel Type"] === "Outerwear",
+    `Case 38: properties["Apparel Type"] === "Outerwear" (got ${JSON.stringify(mapped.properties["Apparel Type"])})`,
+  );
+  // Variation Size (Yes/No) must be "Yes" — NEVER the literal size value "4".
+  assert(
+    mapped.properties["Variation Size (Yes/No)"] === "Yes",
+    `Case 38: Variation Size (Yes/No) === "Yes" (got ${JSON.stringify(mapped.properties["Variation Size (Yes/No)"])})`,
+  );
+  // Product ID Type / Product ID / ASIN MUST be omitted (no UPC/EAN/ASIN).
+  assert(
+    !("Product ID Type" in mapped.properties),
+    `Case 38: Product ID Type omitted (got ${JSON.stringify(Object.keys(mapped.properties))})`,
+  );
+  assert(
+    !("Product ID" in mapped.properties),
+    `Case 38: Product ID omitted (got ${JSON.stringify(Object.keys(mapped.properties))})`,
+  );
+  assert(
+    !("ASIN" in mapped.properties),
+    `Case 38: ASIN omitted (got ${JSON.stringify(Object.keys(mapped.properties))})`,
+  );
+  // Preflight must NOT block — Article is resolved, no required field missing.
+  assert(
+    !(mapped.missing_required || []).includes("Article"),
+    `Case 38: missing_required does not include Article (got ${JSON.stringify(mapped.missing_required)})`,
+  );
+  assert(
+    !(mapped.missing_required || []).includes("Apparel Type"),
+    `Case 38: missing_required does not include Apparel Type (got ${JSON.stringify(mapped.missing_required)})`,
+  );
+  // Optional unmappable Apparel Size Type: "US" is in options so it's emitted.
+  assert(
+    mapped.properties["Apparel Size Type"] === "US",
+    `Case 38: Apparel Size Type === "US" (got ${JSON.stringify(mapped.properties["Apparel Size Type"])})`,
+  );
+  // The auto-resolution must be surfaced in auto_resolved_enums.
+  const articleResolution = (mapped.auto_resolved_enums || []).find((r) => r.field === "Article");
+  assert(
+    articleResolution !== undefined && articleResolution.chosen === "Coats & Jackets",
+    `Case 38: auto_resolved_enums surfaces Article (got ${JSON.stringify(mapped.auto_resolved_enums)})`,
+  );
+}
+
+// ---------- Case 39: ASIN/UPC sourced strictly from explicit identifiers ----
+function runProductIdSourcedFromUpcOnly() {
+  console.log("Case 39: Product ID Type / Product ID emitted only when UPC/EAN present");
+  const apparelLiveLikeSchema: SchemaPropertyDescriptor[] = [
+    {
+      field: "Product ID Type",
+      label: "Product ID Type",
+      required: false,
+      type: "enum",
+      options: ["EAN", "UPC"],
+      allow_omit: true,
+      omit_when_unknown_enum: true,
+    },
+    { field: "Product ID", label: "Product ID", required: false, type: "string", allow_omit: true },
+    { field: "ASIN", label: "ASIN", required: false, type: "string", allow_omit: true },
+    { field: "Color", label: "Color", required: false, type: "string", allow_omit: true },
+  ];
+  // (a) Product with a UPC metafield → Product ID Type=UPC, Product ID=12-digit value.
+  const upcProduct: ShopifyProduct = {
+    id: "shopify-upc-1",
+    title: "Test UPC product",
+    vendor: "Test",
+    product_type: "OUTW",
+    images: [],
+    options: [{ name: "Size", values: ["M"] }],
+    variants: [
+      { id: 1, sku: "TST-1", price: "10.00", inventory_quantity: 1, option1: "M", barcode: "012345678905" },
+    ],
+    metafields: [{ namespace: "custom", key: "color", value: "Red", name: "Color" }],
+  };
+  const mappedUpc = mapShopifyToJomashop(upcProduct, apparelLiveLikeSchema, "Apparel");
+  assert(
+    mappedUpc.properties["Product ID Type"] === "UPC",
+    `Case 39a: Product ID Type === "UPC" (got ${JSON.stringify(mappedUpc.properties["Product ID Type"])})`,
+  );
+  assert(
+    mappedUpc.properties["Product ID"] === "012345678905",
+    `Case 39a: Product ID === "012345678905" (got ${JSON.stringify(mappedUpc.properties["Product ID"])})`,
+  );
+  // (b) EAN-13 barcode → Product ID Type=EAN.
+  const eanProduct: ShopifyProduct = {
+    ...upcProduct,
+    id: "shopify-ean-1",
+    variants: [
+      { id: 2, sku: "TST-2", price: "10.00", inventory_quantity: 1, option1: "M", barcode: "5901234123457" },
+    ],
+  };
+  const mappedEan = mapShopifyToJomashop(eanProduct, apparelLiveLikeSchema, "Apparel");
+  assert(
+    mappedEan.properties["Product ID Type"] === "EAN",
+    `Case 39b: Product ID Type === "EAN" (got ${JSON.stringify(mappedEan.properties["Product ID Type"])})`,
+  );
+  // (c) No identifier at all → Product ID Type / Product ID / ASIN all OMITTED.
+  //     Critically: even though product_type is "OUTW" (a category code), the
+  //     mapper must NOT emit "Outerwear" as Product ID Type.
+  const noIdProduct: ShopifyProduct = {
+    id: "shopify-no-id-1",
+    title: "Test no id product",
+    vendor: "Test",
+    product_type: "OUTW",
+    images: [],
+    options: [{ name: "Size", values: ["M"] }],
+    variants: [
+      { id: 3, sku: "TST-3", price: "10.00", inventory_quantity: 1, option1: "M" },
+    ],
+    metafields: [{ namespace: "custom", key: "color", value: "Red", name: "Color" }],
+  };
+  const mappedNoId = mapShopifyToJomashop(noIdProduct, apparelLiveLikeSchema, "Apparel");
+  assert(
+    !("Product ID Type" in mappedNoId.properties),
+    `Case 39c: Product ID Type omitted when no UPC/EAN (got ${JSON.stringify(mappedNoId.properties)})`,
+  );
+  assert(
+    !("Product ID" in mappedNoId.properties),
+    `Case 39c: Product ID omitted when no UPC/EAN (got ${JSON.stringify(mappedNoId.properties)})`,
+  );
+  assert(
+    !("ASIN" in mappedNoId.properties),
+    `Case 39c: ASIN omitted when no ASIN metafield (got ${JSON.stringify(mappedNoId.properties)})`,
+  );
+  // Critical regression: ensure Product ID Type is NEVER "Outerwear" / category code.
+  for (const v of Object.values(mappedNoId.properties)) {
+    if (v === "Outerwear" || v === "OUTW") {
+      // It's fine for Apparel Type to be "Outerwear" — that's not this property.
+    }
+  }
+  // (d) ASIN supplied via metafield → Product ID Type/Product ID stay omitted,
+  //     ASIN emitted as a plain string.
+  const asinProduct: ShopifyProduct = {
+    ...noIdProduct,
+    id: "shopify-asin-1",
+    metafields: [
+      { namespace: "custom", key: "color", value: "Red", name: "Color" },
+      { namespace: "custom", key: "ASIN", value: "B07Z5R5GZK", name: "ASIN" },
+    ],
+  };
+  const mappedAsin = mapShopifyToJomashop(asinProduct, apparelLiveLikeSchema, "Apparel");
+  assert(
+    mappedAsin.properties.ASIN === "B07Z5R5GZK",
+    `Case 39d: ASIN === "B07Z5R5GZK" (got ${JSON.stringify(mappedAsin.properties.ASIN)})`,
+  );
+  assert(
+    !("Product ID Type" in mappedAsin.properties),
+    `Case 39d: Product ID Type still omitted without UPC/EAN (got ${JSON.stringify(mappedAsin.properties["Product ID Type"])})`,
+  );
+}
+
+// ---------- Case 40: Footwear synonym resolver maps codes to live options ---
+function runFootwearSynonymResolver() {
+  console.log("Case 40: Footwear synonym resolver — HEEL/SNEK/BOOT");
+  const footwearLiveSchemaWithType: SchemaPropertyDescriptor[] = [
+    { field: "Gender", label: "Gender", required: true, options: ["Men", "Women", "Unisex"] },
+    {
+      field: "Shoe Type",
+      label: "Shoe Type",
+      required: true,
+      type: "enum",
+      options: ["Sneakers", "Heels", "Boots", "Loafers", "Sandals", "Pumps", "Flats", "Slides"],
+    },
+    { field: "Shoe Size", label: "Shoe Size", required: true, type: "string" },
+    { field: "Shoe Size Type", label: "Shoe Size Type", required: true, options: ["US", "EU", "UK"] },
+    { field: "Color", label: "Color", required: true, type: "string" },
+    {
+      field: "Variation Size (Yes/No)",
+      label: "Variation Size (Yes/No)",
+      required: false,
+      options: ["Yes", "No"],
+      allow_omit: true,
+      omit_when_unknown_enum: true,
+    },
+  ];
+  // HEEL → "Heels"
+  const heelProduct: ShopifyProduct = {
+    id: "shopify-heel-1",
+    title: "Designer Pump",
+    vendor: "Designer",
+    product_type: "HEEL",
+    tags: ["Women"],
+    images: [],
+    options: [{ name: "Size", values: ["7"] }],
+    variants: [
+      { id: 1, sku: "DGN-HEEL-1", price: "300.00", inventory_quantity: 1, option1: "7" },
+    ],
+    metafields: [
+      { namespace: "custom", key: "color", value: "Black", name: "Color" },
+      { namespace: "custom", key: "size_scale", value: "US" },
+    ],
+  };
+  const mappedHeel = mapShopifyToJomashop(heelProduct, footwearLiveSchemaWithType, "Footwear");
+  assert(
+    mappedHeel.properties["Shoe Type"] === "Heels",
+    `Case 40 HEEL: Shoe Type === "Heels" (got ${JSON.stringify(mappedHeel.properties["Shoe Type"])})`,
+  );
+  assert(
+    !(mappedHeel.missing_required || []).includes("Shoe Type"),
+    `Case 40 HEEL: Shoe Type not blocked (got ${JSON.stringify(mappedHeel.missing_required)})`,
+  );
+  assert(
+    mappedHeel.properties["Variation Size (Yes/No)"] === "Yes",
+    `Case 40 HEEL: Variation Size (Yes/No) === "Yes" (got ${JSON.stringify(mappedHeel.properties["Variation Size (Yes/No)"])})`,
+  );
+  // SNEK → "Sneakers"
+  const snekProduct: ShopifyProduct = {
+    ...heelProduct,
+    id: "shopify-snek-1",
+    product_type: "SNEK",
+    title: "Designer Sneaker",
+  };
+  const mappedSnek = mapShopifyToJomashop(snekProduct, footwearLiveSchemaWithType, "Footwear");
+  assert(
+    mappedSnek.properties["Shoe Type"] === "Sneakers",
+    `Case 40 SNEK: Shoe Type === "Sneakers" (got ${JSON.stringify(mappedSnek.properties["Shoe Type"])})`,
+  );
+  // BOOT → "Boots"
+  const bootProduct: ShopifyProduct = {
+    ...heelProduct,
+    id: "shopify-boot-1",
+    product_type: "BOOT",
+    title: "Designer Boot",
+  };
+  const mappedBoot = mapShopifyToJomashop(bootProduct, footwearLiveSchemaWithType, "Footwear");
+  assert(
+    mappedBoot.properties["Shoe Type"] === "Boots",
+    `Case 40 BOOT: Shoe Type === "Boots" (got ${JSON.stringify(mappedBoot.properties["Shoe Type"])})`,
+  );
+}
+
+// ---------- Case 41: Handbags synonym resolver maps codes to live options ---
+function runHandbagsSynonymResolver() {
+  console.log("Case 41: Handbags synonym resolver — TOTE/CRBD/BPCK");
+  const handbagsLiveLikeSchema: SchemaPropertyDescriptor[] = [
+    { field: "Color", label: "Color", required: true, type: "string" },
+    { field: "Material", label: "Material", required: true, type: "string" },
+    {
+      field: "Handbag Type",
+      label: "Handbag Type",
+      required: true,
+      type: "enum",
+      options: ["Tote", "Crossbody", "Shoulder", "Clutch", "Backpack", "Top Handle", "Hobo"],
+    },
+    {
+      field: "Style",
+      label: "Style",
+      required: false,
+      type: "enum",
+      options: ["Tote", "Crossbody", "Shoulder", "Backpack"],
+      allow_omit: true,
+      omit_when_unknown_enum: true,
+    },
+  ];
+  // TOTE → "Tote"
+  const toteProduct: ShopifyProduct = {
+    id: "shopify-tote-1",
+    title: "Designer Tote Bag",
+    vendor: "Designer",
+    product_type: "TOTE",
+    tags: ["Women"],
+    images: [],
+    options: [{ name: "Color", values: ["Black"] }],
+    variants: [
+      { id: 1, sku: "DGN-TOTE-1", price: "1000.00", inventory_quantity: 1, option1: "Black" },
+    ],
+    metafields: [
+      { namespace: "custom", key: "color", value: "Black", name: "Color" },
+      { namespace: "custom", key: "material", value: "Leather", name: "Material" },
+    ],
+  };
+  const mappedTote = mapShopifyToJomashop(toteProduct, handbagsLiveLikeSchema, "Handbags");
+  assert(
+    mappedTote.properties["Handbag Type"] === "Tote",
+    `Case 41 TOTE: Handbag Type === "Tote" (got ${JSON.stringify(mappedTote.properties["Handbag Type"])})`,
+  );
+  // CRBD → "Crossbody"
+  const crbdProduct: ShopifyProduct = {
+    ...toteProduct,
+    id: "shopify-crbd-1",
+    product_type: "CRBD",
+  };
+  const mappedCrbd = mapShopifyToJomashop(crbdProduct, handbagsLiveLikeSchema, "Handbags");
+  assert(
+    mappedCrbd.properties["Handbag Type"] === "Crossbody",
+    `Case 41 CRBD: Handbag Type === "Crossbody" (got ${JSON.stringify(mappedCrbd.properties["Handbag Type"])})`,
+  );
+  // BPCK → "Backpack"
+  const bpckProduct: ShopifyProduct = {
+    ...toteProduct,
+    id: "shopify-bpck-1",
+    product_type: "BPCK",
+  };
+  const mappedBpck = mapShopifyToJomashop(bpckProduct, handbagsLiveLikeSchema, "Handbags");
+  assert(
+    mappedBpck.properties["Handbag Type"] === "Backpack",
+    `Case 41 BPCK: Handbag Type === "Backpack" (got ${JSON.stringify(mappedBpck.properties["Handbag Type"])})`,
+  );
+}
+
+// ---------- Case 42: operator override beats synonym resolver --------------
+function runOperatorOverrideBeatsSynonym() {
+  console.log("Case 42: operator override wins over synonym resolver");
+  const apparelSchema: SchemaPropertyDescriptor[] = [
+    {
+      field: "Article",
+      label: "Article",
+      required: true,
+      type: "enum",
+      options: ["Coats & Jackets", "Outerwear", "Jackets"],
+    },
+    { field: "Color", label: "Color", required: false, type: "string", allow_omit: true },
+  ];
+  const product: ShopifyProduct = {
+    id: "shopify-cg-outw-42",
+    title: "Canada Goose Parka",
+    vendor: "Canada Goose",
+    product_type: "OUTW",
+    images: [],
+    options: [{ name: "Size", values: ["M"] }],
+    variants: [{ id: 1, sku: "CG-1", price: "1.00", inventory_quantity: 1, option1: "M" }],
+    metafields: [{ namespace: "custom", key: "color", value: "Black", name: "Color" }],
+  };
+  // Synonym alone would pick "Coats & Jackets" first; operator-verified
+  // overrides take precedence (here: "Jackets").
+  const mapped = mapShopifyToJomashop(product, apparelSchema, "Apparel", {
+    resolveEnumOverride: makeTestEnumResolver({ "apparel|article|outw": "Jackets" }),
+  });
+  assert(
+    mapped.properties.Article === "Jackets",
+    `Case 42: operator override "Jackets" wins (got ${JSON.stringify(mapped.properties.Article)})`,
+  );
+}
+
+// ---------- Case 43: optional unresolved enum is omitted, not blocked ------
+function runOptionalUnresolvedOmitted() {
+  console.log("Case 43: optional unresolved enum is omitted, never blocks preflight");
+  const schema: SchemaPropertyDescriptor[] = [
+    {
+      field: "Article",
+      label: "Article",
+      required: false,
+      type: "enum",
+      options: ["Coats & Jackets", "Pants"],
+      allow_omit: true,
+      omit_when_unknown_enum: true,
+    },
+    { field: "Color", label: "Color", required: true, type: "string" },
+  ];
+  // A product whose category code doesn't map to any candidate Article — the
+  // synonym resolver returns null, the field is dropped (allow_omit), and the
+  // push is NOT blocked because Article was optional.
+  const product: ShopifyProduct = {
+    id: "shopify-mystery-1",
+    title: "Mystery Item",
+    vendor: "Designer",
+    product_type: "ZZZZ", // no synonyms
+    images: [],
+    options: [],
+    variants: [{ id: 1, sku: "MYS-1", price: "1.00", inventory_quantity: 1 }],
+    metafields: [{ namespace: "custom", key: "color", value: "Red", name: "Color" }],
+  };
+  const mapped = mapShopifyToJomashop(product, schema, "Apparel");
+  assert(
+    !("Article" in mapped.properties) || mapped.properties.Article === undefined,
+    `Case 43: optional Article dropped when synonym returns null (got ${JSON.stringify(mapped.properties.Article)})`,
+  );
+  assert(
+    !(mapped.missing_required || []).includes("Article"),
+    `Case 43: optional Article never appears in missing_required (got ${JSON.stringify(mapped.missing_required)})`,
+  );
+}
+
 runColorNavyCase();
 runDefinitionNameOnlyCase();
 runVariantSelectedOptionFallback();
@@ -2843,6 +3314,12 @@ runVerifiedMappingRespectsAcceptedOrOperatorVerified();
 runFootwearHandbagsRequiredEnumRegression();
 runV1SchemaNormalization();
 runV1ApparelArticleAcceptedOptions();
+runCanadaGooseOutwLiveSynonymResolver();
+runProductIdSourcedFromUpcOnly();
+runFootwearSynonymResolver();
+runHandbagsSynonymResolver();
+runOperatorOverrideBeatsSynonym();
+runOptionalUnresolvedOmitted();
 
 if (failures > 0) {
   console.error(`\n${failures} assertion(s) failed.`);
