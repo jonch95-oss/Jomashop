@@ -42,6 +42,15 @@ import {
   type SchemaPropertyDescriptor,
 } from "./mapping";
 import { getActiveShopifyConnection } from "./shopify";
+import {
+  MAX_IMPORT_ROWS,
+  rejectIfTooManyRows,
+  releaseLock,
+  withLockOr409,
+} from "./stability";
+import { logMemory } from "./memlog";
+
+const MAX_PRODUCT_FIELD_SESSIONS = 8;
 
 // ---------- Types ----------
 
@@ -1314,6 +1323,13 @@ function gcSessions(): void {
     if (s.createdAt < cutoff) stale.push(id);
   });
   for (const id of stale) SESSIONS.delete(id);
+  // Bounded session count: evict oldest (insertion-order) until we are at
+  // or below the cap. Maps preserve insertion order so this is a cheap LRU.
+  while (SESSIONS.size > MAX_PRODUCT_FIELD_SESSIONS) {
+    const oldest = SESSIONS.keys().next();
+    if (oldest.done) break;
+    SESSIONS.delete(oldest.value);
+  }
 }
 
 export function registerJomashopProductFieldExcelRoutes(app: Express): void {
@@ -1420,6 +1436,9 @@ export function registerJomashopProductFieldExcelRoutes(app: Express): void {
       if (!file) {
         return res.status(400).json({ ok: false, error: "Missing uploaded file." });
       }
+      // Serialize large XLSX imports — they can hold tens of MB of parsed
+      // rows in memory; running two concurrently doubles RSS.
+      if (!withLockOr409(res, "import.product-fields")) return;
       try {
         // forceWriteback accepted via multipart field (string "true"/"1"),
         // body field, or `?forceWriteback=1` query string. Multipart field
@@ -1432,10 +1451,14 @@ export function registerJomashopProductFieldExcelRoutes(app: Express): void {
           fwRaw === "1" ||
           (typeof fwRaw === "string" && fwRaw.toLowerCase() === "true") ||
           (typeof fwRaw === "string" && fwRaw.toLowerCase() === "yes");
+        logMemory("import.product-fields.start", { bytes: file.size });
         const agg = await aggregateProductFieldRows({ includeAll: true });
         const parsed = await parseProductFieldUpload(file.buffer, agg, {
           forceWriteback,
         });
+        if (rejectIfTooManyRows(res, parsed.rows.length, MAX_IMPORT_ROWS)) {
+          return;
+        }
         const sessionId = newSessionId();
         SESSIONS.set(sessionId, {
           id: sessionId,
@@ -1485,7 +1508,11 @@ export function registerJomashopProductFieldExcelRoutes(app: Express): void {
         });
       } catch (err) {
         const msg = (err as Error).message;
+        logMemory("import.product-fields.failed", { message: msg });
         res.status(400).json({ ok: false, error: `Could not parse XLSX: ${msg}` });
+      } finally {
+        releaseLock("import.product-fields");
+        logMemory("import.product-fields.done");
       }
     },
   );
@@ -1666,6 +1693,16 @@ export function registerJomashopProductFieldExcelRoutes(app: Express): void {
       note: shopDomain
         ? "Applied. Click Refresh from Shopify on the Products page to recompute readiness with the new metafields."
         : "Applied.",
+    });
+  });
+
+  // Diagnostic: report active session/lock state without exposing payloads.
+  app.get("/api/jomashop-product-fields/_status", (_req, res) => {
+    res.json({
+      ok: true,
+      sessionCount: SESSIONS.size,
+      sessionCap: MAX_PRODUCT_FIELD_SESSIONS,
+      ttlMs: SESSION_TTL_MS,
     });
   });
 }

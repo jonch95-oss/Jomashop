@@ -34,6 +34,12 @@ import {
 } from "./brand_mapping";
 import { normalizeCategoryCode, type MappedProduct } from "./mapping";
 import { getActiveShopifyConnection } from "./shopify";
+import {
+  MAX_IMPORT_ROWS,
+  rejectIfTooManyRows,
+} from "./stability";
+
+const MAX_AUDIT_SESSIONS = 8;
 
 // ---------- Types ----------
 
@@ -733,6 +739,11 @@ function gcSessions(): void {
     if (s.createdAt < cutoff) stale.push(id);
   });
   for (const id of stale) SESSIONS.delete(id);
+  while (SESSIONS.size > MAX_AUDIT_SESSIONS) {
+    const oldest = SESSIONS.keys().next();
+    if (oldest.done) break;
+    SESSIONS.delete(oldest.value);
+  }
 }
 
 // ---------- Route registration ----------
@@ -822,6 +833,9 @@ export function registerResolutionAuditRoutes(app: Express): void {
           audit.jomashopManufacturers.map((m) => m.name),
           audit.jomashopCategories.map((c) => c.name),
         );
+        if (rejectIfTooManyRows(res, brandRows.length + categoryRows.length, MAX_IMPORT_ROWS)) {
+          return;
+        }
         const validBrand = brandRows.filter((r) => r.errors.length === 0 && !r.is_clear);
         const validCategory = categoryRows.filter((r) => r.errors.length === 0 && !r.is_clear);
         const unknownBrand = validBrand.filter((r) => r.unknown_jomashop_brand);

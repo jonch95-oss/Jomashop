@@ -61,6 +61,7 @@ import { registerJomashopMappingExcelRoutes } from "./jomashop_mapping_excel";
 import { registerJomashopProductFieldExcelRoutes } from "./jomashop_product_field_excel";
 import { registerWebhookRoutes, registerShopifyWebhooks } from "./webhooks";
 import { logMemory } from "./memlog";
+import { releaseLock, withLockOr409 } from "./stability";
 
 // -------------------- helpers --------------------
 
@@ -1517,6 +1518,11 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.post("/api/sync/preview-products", async (req, res) => {
     const supplied = req.body?.products as ShopifyProduct[] | undefined;
     const forceRefresh = req.body?.forceRefresh === true || req.body?.useCache === false;
+    // Only the slow path (no supplied products + forceRefresh OR no cache
+    // hit) needs serialization. The cache fast-path below short-circuits
+    // before we'd reach the heavy code anyway, so we acquire the lock
+    // lazily right before calling buildPreview.
+    let heavyLockHeld = false;
     const rawLimit = req.body?.limit;
     const maxProducts =
       rawLimit === undefined || rawLimit === null || rawLimit === "" || rawLimit === "all"
@@ -1568,17 +1574,29 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
     }
 
-    logMemory("preview-products.start", { forceRefresh, maxProducts, pageSize });
-    const preview = await buildPreview({
-      suppliedProducts: supplied,
-      forceRefresh,
-      pageSize,
-      maxProducts,
-    });
-    logMemory("preview-products.built", {
-      mapped: preview.count,
-      dataSource: preview.dataSource,
-    });
+    // Heavy path: serialize concurrent refreshes so two simultaneous
+    // requests don't both pull the full Shopify catalog into memory.
+    if (!withLockOr409(res, "products.refresh")) return;
+    heavyLockHeld = true;
+    let preview;
+    try {
+      logMemory("preview-products.start", { forceRefresh, maxProducts, pageSize });
+      preview = await buildPreview({
+        suppliedProducts: supplied,
+        forceRefresh,
+        pageSize,
+        maxProducts,
+      });
+      logMemory("preview-products.built", {
+        mapped: preview.count,
+        dataSource: preview.dataSource,
+      });
+    } catch (err) {
+      releaseLock("products.refresh");
+      heavyLockHeld = false;
+      logMemory("preview-products.failed", { message: (err as Error)?.message });
+      return res.status(500).json({ ok: false, error: (err as Error).message });
+    }
 
     // Cache successful live previews so the next page load is instant.
     // Sample/empty previews are not cached so we don't pin demo data.
@@ -1653,6 +1671,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       lastRefreshedAt: Date.now(),
     });
     logMemory("preview-products.responded", { sent: sliced.length, totalCount });
+    if (heavyLockHeld) releaseLock("products.refresh");
   });
 
   // Read-only fast path: return a paginated slice of the cached preview
@@ -1771,17 +1790,27 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const responseLimit = clampLimit(req.body?.responseLimit ?? req.query.limit);
     const responseOffset = clampOffset(req.body?.responseOffset ?? req.query.offset);
 
-    logMemory("products-refresh.start", { maxProducts, pageSize });
-    const preview = await buildPreview({
-      suppliedProducts: undefined,
-      forceRefresh: true,
-      pageSize,
-      maxProducts,
-    });
-    logMemory("products-refresh.built", {
-      mapped: preview.count,
-      dataSource: preview.dataSource,
-    });
+    // Serialize full refreshes; two concurrent Shopify catalog pulls can
+    // double RSS and trigger the Render OOM (exit 134).
+    if (!withLockOr409(res, "products.refresh")) return;
+    let preview;
+    try {
+      logMemory("products-refresh.start", { maxProducts, pageSize });
+      preview = await buildPreview({
+        suppliedProducts: undefined,
+        forceRefresh: true,
+        pageSize,
+        maxProducts,
+      });
+      logMemory("products-refresh.built", {
+        mapped: preview.count,
+        dataSource: preview.dataSource,
+      });
+    } catch (err) {
+      releaseLock("products.refresh");
+      logMemory("products-refresh.failed", { message: (err as Error)?.message });
+      return res.status(500).json({ ok: false, error: (err as Error).message });
+    }
     if (preview.dataSource === "live" && preview.shopDomain) {
       try {
         const cachePayload = {
@@ -1847,6 +1876,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       lastRefreshedAt: Date.now(),
     });
     logMemory("products-refresh.responded", { sent: sliced.length, totalCount });
+    releaseLock("products.refresh");
   });
 
   // Direct live Shopify product fetch (debug / admin use). Returns the

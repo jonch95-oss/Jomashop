@@ -23,6 +23,12 @@ import {
 } from "./mapping";
 import { getActiveShopifyConnection } from "./shopify";
 import { getCategories } from "./jomashop";
+import {
+  MAX_IMPORT_ROWS,
+  rejectIfTooManyRows,
+} from "./stability";
+
+const MAX_CATEGORY_MAPPING_SESSIONS = 8;
 
 // ---------- Aggregation ----------
 
@@ -416,6 +422,11 @@ function gcSessions(): void {
     if (s.createdAt < cutoff) stale.push(id);
   });
   for (const id of stale) SESSIONS.delete(id);
+  while (SESSIONS.size > MAX_CATEGORY_MAPPING_SESSIONS) {
+    const oldest = SESSIONS.keys().next();
+    if (oldest.done) break;
+    SESSIONS.delete(oldest.value);
+  }
 }
 
 // ---------- Override application helpers ----------
@@ -548,6 +559,9 @@ export function registerCategoryMappingRoutes(app: Express): void {
           agg.jomashopCategories,
           productCountByCode,
         );
+        if (rejectIfTooManyRows(res, rows.length, MAX_IMPORT_ROWS)) {
+          return;
+        }
         const validRows = rows.filter((r) => r.errors.length === 0 && !r.is_clear);
         const errorRows = rows.filter((r) => r.errors.length > 0);
         const clearRows = rows.filter((r) => r.is_clear && r.errors.length === 0);

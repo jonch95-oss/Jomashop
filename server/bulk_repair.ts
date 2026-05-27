@@ -26,6 +26,12 @@ import {
 import { resolveCategorySchema, jomashopConfigured, jomashopRequest } from "./jomashop";
 import { getActiveShopifyConnection, streamShopifyProducts } from "./shopify";
 import { logMemory } from "./memlog";
+import {
+  MAX_IMPORT_ROWS,
+  rejectIfTooManyRows,
+} from "./stability";
+
+const MAX_BULK_REPAIR_SESSIONS = 8;
 
 // ---------- Editable column model ----------
 
@@ -472,6 +478,11 @@ function gcSessions(): void {
     if (s.createdAt < cutoff) stale.push(id);
   });
   for (const id of stale) SESSIONS.delete(id);
+  while (SESSIONS.size > MAX_BULK_REPAIR_SESSIONS) {
+    const oldest = SESSIONS.keys().next();
+    if (oldest.done) break;
+    SESSIONS.delete(oldest.value);
+  }
 }
 
 // ---------- Shopify apply (metafields + product update) ----------
@@ -791,6 +802,9 @@ export function registerBulkRepairRoutes(app: Express): void {
       }
       try {
         const { rows, headerErrors } = await parseUpload(file.buffer);
+        if (rejectIfTooManyRows(res, rows.length, MAX_IMPORT_ROWS)) {
+          return;
+        }
         const validRows = rows.filter((r) => r.errors.length === 0 && r.has_changes);
         const errorRows = rows.filter((r) => r.errors.length > 0);
         const noChangeRows = rows.filter((r) => r.errors.length === 0 && !r.has_changes);

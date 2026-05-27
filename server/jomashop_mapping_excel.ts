@@ -43,6 +43,15 @@ import {
 } from "./jomashop";
 import { normalizeI1CategorySchema } from "./mapping";
 import { getActiveShopifyConnection } from "./shopify";
+import {
+  MAX_IMPORT_ROWS,
+  rejectIfTooManyRows,
+  releaseLock,
+  withLockOr409,
+} from "./stability";
+import { logMemory } from "./memlog";
+
+const MAX_MAPPING_SESSIONS = 8;
 
 // ---------- Types ----------
 
@@ -790,6 +799,11 @@ function gcSessions(): void {
     if (s.createdAt < cutoff) stale.push(id);
   });
   for (const id of stale) SESSIONS.delete(id);
+  while (SESSIONS.size > MAX_MAPPING_SESSIONS) {
+    const oldest = SESSIONS.keys().next();
+    if (oldest.done) break;
+    SESSIONS.delete(oldest.value);
+  }
 }
 
 export function registerJomashopMappingExcelRoutes(app: Express): void {
@@ -868,9 +882,14 @@ export function registerJomashopMappingExcelRoutes(app: Express): void {
       if (!file) {
         return res.status(400).json({ ok: false, error: "Missing uploaded file." });
       }
+      if (!withLockOr409(res, "import.mapping")) return;
       try {
+        logMemory("import.mapping.start", { bytes: file.size });
         const agg = await aggregateUnresolvedMappings();
         const { rows, headerErrors } = await parseMappingUpload(file.buffer, agg);
+        if (rejectIfTooManyRows(res, rows.length, MAX_IMPORT_ROWS)) {
+          return;
+        }
         const sessionId = newSessionId();
         SESSIONS.set(sessionId, {
           id: sessionId,
@@ -911,7 +930,11 @@ export function registerJomashopMappingExcelRoutes(app: Express): void {
         });
       } catch (err) {
         const msg = (err as Error).message;
+        logMemory("import.mapping.failed", { message: msg });
         res.status(400).json({ ok: false, error: `Could not parse XLSX: ${msg}` });
+      } finally {
+        releaseLock("import.mapping");
+        logMemory("import.mapping.done");
       }
     },
   );
