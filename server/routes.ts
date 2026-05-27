@@ -17,11 +17,13 @@ import {
   resolveCategoryRecord,
   createManufacturer,
   clearI1Cache,
+  clearV1SchemaCache,
   getV1CategoryDescriptors,
 } from "./jomashop";
 import {
   FALLBACK_CATEGORY_SCHEMAS,
   SUPPORTED_CATEGORIES,
+  canonicalJomashopCategory,
   type SupportedCategory,
 } from "@shared/schema";
 import {
@@ -770,13 +772,77 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     return res.status(502).json({ source: "error", configured: true, error: result.error });
   });
 
+  // Debug: invalidate the in-memory v1 schema cache so the next resolve
+  // re-fetches /v1/categories/:name. Use this when Jomashop has published an
+  // updated category schema (new accepted enum options) and the app is still
+  // returning the stale list.
+  app.post("/api/jomashop/clear-schema-cache", async (_req, res) => {
+    clearV1SchemaCache();
+    res.json({ ok: true });
+  });
+
   app.get("/api/jomashop/categories/:name", async (req, res) => {
     const name = String(req.params.name);
     if (!SUPPORTED_CATEGORIES.includes(name as SupportedCategory)) {
       return res.status(400).json({ error: `Unsupported category. Use one of: ${SUPPORTED_CATEGORIES.join(", ")}` });
     }
-    const { source, schema } = await resolveCategorySchema(name as SupportedCategory);
-    res.json({ source, name, schema });
+    const canonical = canonicalJomashopCategory(name as SupportedCategory) as SupportedCategory;
+    const { source, schema } = await resolveCategorySchema(canonical);
+    res.json({ source, name, canonicalName: canonical, aliased: canonical !== name, schema });
+  });
+
+  // Debug: report which schema source the push path would use for a category.
+  // Returns the canonical (aliased) name, the resolved source (live-v1 /
+  // live-i1 / fallback), and a flag for whether the source matches the live
+  // /api/jomashop/category-enum-options/:name path. Lets operators verify
+  // mismatches without burning a push round-trip.
+  app.get("/api/jomashop/push-schema-source/:name", async (req, res) => {
+    const rawName = String(req.params.name);
+    const supported = SUPPORTED_CATEGORIES.includes(rawName as SupportedCategory);
+    if (!supported) {
+      return res.status(400).json({
+        ok: false,
+        error: `Unsupported category. Use one of: ${SUPPORTED_CATEGORIES.join(", ")}`,
+      });
+    }
+    const canonical = canonicalJomashopCategory(rawName as SupportedCategory) as SupportedCategory;
+    const v1 = await getV1CategoryDescriptors(canonical).catch((e: unknown) => ({
+      ok: false as const,
+      status: 0,
+      error: (e as Error).message,
+      fromCache: false,
+    }));
+    const i1Record = await resolveCategoryRecord(canonical).catch(() => null);
+    const i1Id =
+      i1Record && "configured" in i1Record && i1Record.configured && i1Record.exact
+        ? i1Record.exact.id
+        : null;
+    let i1Schema: SchemaPropertyDescriptor[] = [];
+    if (i1Id !== null) {
+      const propsResp = await getCategoryPropertiesI1(i1Id).catch(() => null);
+      if (propsResp && "ok" in propsResp && propsResp.ok && propsResp.data) {
+        i1Schema = normalizeI1CategorySchema(propsResp.data);
+      }
+    }
+    let pushSchemaSource: "live-v1" | "live-i1" | "fallback" = "fallback";
+    if (v1.ok && v1.descriptors.length > 0) pushSchemaSource = "live-v1";
+    else if (i1Schema.length > 0) pushSchemaSource = "live-i1";
+    res.json({
+      ok: true,
+      requested: rawName,
+      canonicalName: canonical,
+      aliased: canonical !== rawName,
+      pushSchemaSource,
+      v1: v1.ok
+        ? { ok: true, descriptorsCount: v1.descriptors.length, fromCache: v1.fromCache }
+        : { ok: false, status: v1.status, error: v1.error, fromCache: v1.fromCache },
+      i1: { categoryId: i1Id, schemaPropsCount: i1Schema.length },
+      note:
+        pushSchemaSource === "fallback"
+          ? "Push would use the bundled fallback schema for this category — required enum fields tagged options_unverified will block preflight until the live schema is loaded or an operator-verified mapping is added."
+          : "Push uses the live schema — same source as /api/jomashop/category-enum-options/" +
+            canonical,
+    });
   });
 
   // Admin/debug: list accepted enum options for every enum field of a
@@ -1149,7 +1215,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       // single mapping for "DRSH" → "Dress Shirts" flips every dress shirt to
       // ready without a full Shopify re-pagination.
       const override = lookupCategoryOverride(tmp.raw_category);
-      const cat = (override?.supportedCategory ?? tmp.category) as SupportedCategory;
+      // Schema cat: lift legacy aliases (Clothing→Apparel) to the canonical
+      // Jomashop name so the bundled fallback we trust AND the live v1 lookup
+      // both target what Jomashop actually publishes.
+      const cat = canonicalJomashopCategory(
+        (override?.supportedCategory ?? tmp.category) as SupportedCategory,
+      ) as SupportedCategory;
       // Determine the outbound category name early so we can resolve to a
       // live /i1 category id and fetch the EXACT schema. We try the
       // override → suggested → mapped category in that order.
@@ -1945,20 +2016,27 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     };
 
     // Resolve live (or fallback) schema for the inferred/forced category.
+    // Always lift to the canonical Jomashop name (Clothing→Apparel,
+    // Shoes→Footwear) for schema and enum lookups. The internal mapper still
+    // labels the product as the legacy name for backward compatibility, but
+    // the live /v1 endpoint and bundled fallback we trust must be canonical.
     const tmpMap = mapShopifyToJomashop(body.product, [], body.forcedCategory);
-    const { source, schema } = await resolveCategorySchema(tmpMap.category);
+    const schemaCategory = canonicalJomashopCategory(tmpMap.category) as SupportedCategory;
+    const { source, schema } = await resolveCategorySchema(schemaCategory);
     const schemaProps = (schema as { properties?: Array<any> } | undefined)?.properties;
     const props =
       schemaProps ||
-      FALLBACK_CATEGORY_SCHEMAS[tmpMap.category].map((f) => ({
-        field: f.field,
-        required: f.required,
-        type: f.type,
-        options: f.options,
-        allow_omit: f.allow_omit,
-        omit_when_unknown_enum: f.omit_when_unknown_enum,
-        options_unverified: f.options_unverified,
-      }));
+      (FALLBACK_CATEGORY_SCHEMAS[schemaCategory] ?? FALLBACK_CATEGORY_SCHEMAS[tmpMap.category]).map(
+        (f) => ({
+          field: f.field,
+          required: f.required,
+          type: f.type,
+          options: f.options,
+          allow_omit: f.allow_omit,
+          omit_when_unknown_enum: f.omit_when_unknown_enum,
+          options_unverified: f.options_unverified,
+        }),
+      );
 
     let mapped = mapShopifyToJomashop(body.product, props, body.forcedCategory, {
       resolveEnumOverride: enumResolver,
@@ -2026,14 +2104,37 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     // accepted values). Falls back to /i1/categories/:id by category id when
     // v1 is unavailable, and finally to the bundled exact-label schema.
     let liveSchemaSource: "live-i1" | "live-v1" | "fallback" = source === "live" ? "live-v1" : "fallback";
-    const bundledFallback = FALLBACK_CATEGORY_SCHEMAS[tmpMap.category];
+    // Prefer the canonical-name fallback (Apparel) over the legacy (Clothing)
+    // fallback — Article options on Apparel are verified, on Clothing they
+    // were tagged options_unverified.
+    const bundledFallback =
+      FALLBACK_CATEGORY_SCHEMAS[schemaCategory] ?? FALLBACK_CATEGORY_SCHEMAS[tmpMap.category];
     const bundledIsExact =
       Array.isArray(bundledFallback) &&
       bundledFallback.length > 0 &&
       bundledFallback.every((p) => /[A-Z]/.test(p.field) || /\s/.test(p.field));
     let v1SchemaUsed = false;
+    // The resolved Jomashop category name (from /i1/categories) may differ from
+    // both the legacy mapper name AND the static alias — e.g. operator mapped
+    // a Shopify product to category record "Apparel" via overrides. Try the
+    // override name first when present, then fall back to the static alias.
+    const v1CandidateNames = Array.from(
+      new Set(
+        [overrides.category, schemaCategory, tmpMap.category]
+          .filter((c): c is string => Boolean(c && String(c).trim())),
+      ),
+    );
     try {
-      const v1Resp = await getV1CategoryDescriptors(tmpMap.category);
+      let v1Resp: Awaited<ReturnType<typeof getV1CategoryDescriptors>> | null = null;
+      for (const cand of v1CandidateNames) {
+        const r = await getV1CategoryDescriptors(cand);
+        if (r.ok && r.descriptors.length > 0) {
+          v1Resp = r;
+          break;
+        }
+        if (!v1Resp) v1Resp = r;
+      }
+      if (!v1Resp) v1Resp = await getV1CategoryDescriptors(schemaCategory);
       if (v1Resp.ok && v1Resp.descriptors.length > 0) {
         const v1Exact = v1Resp.descriptors.some(
           (p) => p && typeof p.field === "string" && (/[A-Z]/.test(p.field) || /\s/.test(p.field)),
@@ -2073,6 +2174,11 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
     let { payload, variant, missingRequired, missingTopLevel, pushDebug } =
       buildJomashopProductPayload(mapped, body.variantSku, overrides);
+    // Expose the schema source on pushDebug so the UI / debug routes can
+    // distinguish "push used live Apparel schema" from "push fell back to
+    // bundled Clothing options" — the exact mismatch this fix addresses.
+    (pushDebug as any).schemaSource = liveSchemaSource;
+    (pushDebug as any).schemaCategoryName = schemaCategory;
 
     // If the chosen schema produced an unsafe (lowercase-only) payload but we
     // have a Title Case bundled fallback for this category, re-map against

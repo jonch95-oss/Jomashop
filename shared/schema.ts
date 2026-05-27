@@ -301,6 +301,40 @@ export const SUPPORTED_CATEGORIES = [
 ] as const;
 export type SupportedCategory = (typeof SUPPORTED_CATEGORIES)[number];
 
+// Maps legacy / Shopify-flavored category names to the canonical name Jomashop
+// uses in /v1/categories and /i1/categories. The live Jomashop API never had
+// "Clothing" — apparel lives under "Apparel" — so schema and enum lookups MUST
+// hit the canonical name even when the mapper internally still labels a
+// product as "Clothing" for backward compatibility.
+//
+// Why: /api/jomashop/category-enum-options/Apparel correctly returns the live
+// Article options (Coats & Jackets, etc.), but push/preflight was calling
+// getV1CategoryDescriptors("Clothing") which 404s and falls back to the
+// bundled Clothing schema where Article is options_unverified — triggering
+// "accepted option list ... has not been loaded" even when Apparel was live.
+export const CANONICAL_JOMASHOP_CATEGORY_ALIASES: Record<string, SupportedCategory> = {
+  clothing: "Apparel",
+  apparel: "Apparel",
+  rtw: "Apparel",
+  "ready-to-wear": "Apparel",
+  shoes: "Footwear",
+  footwear: "Footwear",
+};
+
+/**
+ * Return the canonical Jomashop category name for schema / enum-option
+ * lookups. Pass through unchanged when no alias exists so callers stay
+ * compatible with categories already on the canonical name (Handbags, etc.).
+ */
+export function canonicalJomashopCategory<T extends string>(
+  category: T | null | undefined,
+): T | SupportedCategory {
+  if (!category) return category as T;
+  const key = String(category).toLowerCase().trim();
+  const hit = CANONICAL_JOMASHOP_CATEGORY_ALIASES[key];
+  return (hit ?? category) as T | SupportedCategory;
+}
+
 export const INVENTORY_STATUSES = ["active", "out_of_stock", "inactive"] as const;
 export type InventoryStatus = (typeof INVENTORY_STATUSES)[number];
 

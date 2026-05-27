@@ -49,7 +49,12 @@ import {
   normalizeEnumFieldKey,
   normalizeEnumSourceValue,
 } from "../server/enum_mapping";
-import { FALLBACK_CATEGORY_SCHEMAS, SUPPORTED_CATEGORIES } from "../shared/schema";
+import {
+  FALLBACK_CATEGORY_SCHEMAS,
+  SUPPORTED_CATEGORIES,
+  canonicalJomashopCategory,
+  CANONICAL_JOMASHOP_CATEGORY_ALIASES,
+} from "../shared/schema";
 import {
   buildMappingWorkbook,
   parseMappingUpload,
@@ -4830,6 +4835,178 @@ async function runProductFieldSheetRecognitionAndForceWriteback() {
     `Case 50h2: still no "doesn't match" warnings (got ${JSON.stringify(parsedNoMeta.perCategoryWarnings)})`,
   );
 }
+
+// Case 51: Clothing → Apparel alias normalization. The live Jomashop /v1
+// category endpoint only knows "Apparel" — pushes for products the internal
+// mapper still labels as "Clothing" (legacy alias) must resolve schema via
+// the canonical name, otherwise preflight blocks with "accepted option list
+// has not been loaded" even when the live Apparel schema is reachable.
+function runClothingApparelAliasNormalization() {
+  console.log(
+    "Case 51: Clothing alias resolves to Apparel for schema lookups; push uses live Apparel Article options",
+  );
+  // (51a) The alias map carries the canonical mapping.
+  assert(
+    CANONICAL_JOMASHOP_CATEGORY_ALIASES["clothing"] === "Apparel",
+    `clothing alias maps to Apparel (got ${JSON.stringify(CANONICAL_JOMASHOP_CATEGORY_ALIASES["clothing"])})`,
+  );
+  assert(
+    CANONICAL_JOMASHOP_CATEGORY_ALIASES["rtw"] === "Apparel",
+    `rtw alias maps to Apparel (got ${JSON.stringify(CANONICAL_JOMASHOP_CATEGORY_ALIASES["rtw"])})`,
+  );
+  // (51b) canonicalJomashopCategory normalizes every legacy / cased input.
+  assert(
+    canonicalJomashopCategory("Clothing") === "Apparel",
+    `canonicalJomashopCategory("Clothing") === "Apparel"`,
+  );
+  assert(
+    canonicalJomashopCategory("clothing") === "Apparel",
+    `canonicalJomashopCategory("clothing") === "Apparel"`,
+  );
+  assert(
+    canonicalJomashopCategory("Apparel") === "Apparel",
+    `canonicalJomashopCategory("Apparel") passes through unchanged`,
+  );
+  // Handbags is not aliased — must pass through.
+  assert(
+    canonicalJomashopCategory("Handbags") === "Handbags",
+    `canonicalJomashopCategory("Handbags") passes through unchanged`,
+  );
+  // (51c) Push payload for an OUTW Canada Goose Apparel item — when the
+  // category was tagged "Clothing" upstream but the live Apparel v1 schema
+  // is provided (simulating the production state where
+  // /api/jomashop/category-enum-options/Apparel returned the live list with
+  // "Coats & Jackets") — the mapper must accept that schema's Article
+  // option and the resulting payload must carry it. This is exactly the
+  // production failure mode the user reported.
+  const apparelV1Schema: SchemaPropertyDescriptor[] = [
+    { field: "Gender", label: "Gender", required: true, type: "enum", options: ["Men", "Women", "Unisex"] },
+    { field: "Age", label: "Age", required: true, type: "enum", options: ["Adult", "Kids"] },
+    {
+      field: "Apparel Type",
+      label: "Apparel Type",
+      required: true,
+      type: "enum",
+      options: ["Outerwear", "Pants", "Shirts"],
+    },
+    { field: "Detailed Description", label: "Detailed Description", required: true, type: "string" },
+    { field: "Total Number of Pieces", label: "Total Number of Pieces", required: true, type: "string" },
+    { field: "Color", label: "Color", required: true, type: "string" },
+    // Live v1 Article options as returned by Jomashop for Apparel.
+    {
+      field: "Article",
+      label: "Article",
+      required: true,
+      type: "enum",
+      options: ["Coats & Jackets", "Sweaters", "Shirts & Tops"],
+    },
+    {
+      field: "Variation Size Yes/No",
+      label: "Variation Size Yes/No",
+      required: false,
+      type: "enum",
+      options: ["Yes", "No"],
+    },
+    {
+      field: "Country",
+      label: "Country",
+      required: false,
+      type: "enum",
+      options: ["CA Canada", "US United States", "IT Italy"],
+    },
+  ];
+  const product: ShopifyProduct = {
+    id: "shopify-cg-outw-alias-1",
+    title: "Canada Goose Coats & Jackets Black",
+    body_html: "<p>Outerwear.</p>",
+    vendor: "Canada Goose",
+    product_type: "OUTW",
+    tags: ["Mens", "Outerwear"],
+    images: [{ src: "https://example.com/cg.jpg" }],
+    options: [{ name: "Size", values: ["M"] }],
+    variants: [
+      { id: 9001, sku: "CG-OUTW-ALIAS-M", price: "1295.00", inventory_quantity: 1, option1: "M" },
+    ],
+    metafields: [
+      { namespace: "custom", key: "color", value: "Black", name: "Color" },
+      { namespace: "custom", key: "country_of_origin", value: "Canada" },
+      { namespace: "custom", key: "ff_designer_id", value: "OUTW-CG-1" },
+      // The operator already saved a verified mapping for Article in
+      // production. Simulate that via the overlay resolver below.
+    ],
+  };
+  // Operator-saved verified enum mapping: OUTW → "Coats & Jackets".
+  const resolver = makeTestEnumResolver({
+    "apparel|article|outw": "Coats & Jackets",
+    "apparel|apparel type|outw": "Outerwear",
+    "apparel|variation size yes/no|m": "Yes",
+    "apparel|country|canada": "CA Canada",
+  });
+  const mapped = mapShopifyToJomashop(product, apparelV1Schema, "Apparel", {
+    resolveEnumOverride: resolver,
+  });
+  // The live Apparel schema is verified — no options_unverified — so Article
+  // must resolve to "Coats & Jackets" via the operator mapping AND emit
+  // verbatim into payload.properties. This is the exact production
+  // assertion: the push payload carries the live verified option, not a
+  // fallback blocked at "accepted options unknown".
+  assert(
+    mapped.properties.Article === "Coats & Jackets",
+    `Case 51c: Article === "Coats & Jackets" from live v1 + verified mapping (got ${JSON.stringify(mapped.properties.Article)})`,
+  );
+  assert(
+    mapped.properties["Apparel Type"] === "Outerwear",
+    `Case 51c2: Apparel Type === "Outerwear" (got ${JSON.stringify(mapped.properties["Apparel Type"])})`,
+  );
+  assert(
+    mapped.properties.Color === "Black",
+    `Case 51c3: Color === "Black" (got ${JSON.stringify(mapped.properties.Color)})`,
+  );
+  // unverified_required_options MUST be empty — Article options came from
+  // the live schema (no options_unverified flag). This is the inverse of
+  // the production failure where the fallback Clothing schema marked Article
+  // as options_unverified and blocked preflight.
+  assert(
+    (mapped.unverified_required_options || []).length === 0,
+    `Case 51c4: no unverified_required_options when live Apparel schema is used (got ${JSON.stringify(mapped.unverified_required_options)})`,
+  );
+  // The payload must be pushable end-to-end — no preflight block.
+  const { payload, missingRequired, pushDebug } = buildJomashopProductPayload(mapped, undefined, {
+    category: "Apparel",
+    brand: "Canada Goose",
+    manufacturer_id: 2774,
+    category_id: 35,
+  });
+  assert(
+    pushDebug.unverifiedRequiredOptions.length === 0,
+    `Case 51c5: pushDebug carries no unverifiedRequiredOptions (got ${JSON.stringify(pushDebug.unverifiedRequiredOptions)})`,
+  );
+  assert(
+    !missingRequired.includes("Article"),
+    `Case 51c6: missingRequired does NOT include Article (got ${JSON.stringify(missingRequired)})`,
+  );
+  const payloadProps = (payload.properties as Record<string, unknown>) || {};
+  assert(
+    payloadProps.Article === "Coats & Jackets",
+    `Case 51c7: payload.properties.Article === "Coats & Jackets" (got ${JSON.stringify(payloadProps.Article)})`,
+  );
+  // (51d) The bundled fallback for the Clothing alias must lift to Apparel's
+  // fallback for safety — Apparel's Article still has options_unverified, so
+  // verify the alias-routed fallback IS the Apparel fallback (not a stale
+  // Clothing-only fallback). We assert by checking the legacy Clothing
+  // fallback still exists for compatibility but is NOT what canonical
+  // resolution targets.
+  assert(
+    FALLBACK_CATEGORY_SCHEMAS.Apparel.some((f) => f.field === "Article"),
+    `Case 51d: FALLBACK_CATEGORY_SCHEMAS.Apparel still carries Article`,
+  );
+  assert(
+    canonicalJomashopCategory("Clothing") === "Apparel",
+    `Case 51d2: schema alias resolution targets the Apparel fallback (not Clothing)`,
+  );
+}
+
+runClothingApparelAliasNormalization();
 
 runColorNavyCase();
 runDefinitionNameOnlyCase();

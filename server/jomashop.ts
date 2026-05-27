@@ -1,7 +1,11 @@
 // Jomashop Vendor API client. Handles JWT lifecycle (login, refresh, 401 retry).
 // Tokens live in-memory only; nothing is persisted to disk.
 
-import { FALLBACK_CATEGORY_SCHEMAS, type SupportedCategory } from "@shared/schema";
+import {
+  FALLBACK_CATEGORY_SCHEMAS,
+  canonicalJomashopCategory,
+  type SupportedCategory,
+} from "@shared/schema";
 import { normalizeV1CategorySchema, type SchemaPropertyDescriptor } from "./mapping";
 
 type JomashopConfig = {
@@ -222,8 +226,13 @@ export async function getV1CategoryDescriptors(
   | { ok: true; descriptors: SchemaPropertyDescriptor[]; raw: unknown; fromCache: boolean }
   | { ok: false; status: number; error: string; fromCache: boolean }
 > {
-  const key = String(category).trim();
-  if (!key) return { ok: false, status: 0, error: "Missing category name", fromCache: false };
+  const rawKey = String(category).trim();
+  if (!rawKey) return { ok: false, status: 0, error: "Missing category name", fromCache: false };
+  // Normalize legacy aliases (Clothing→Apparel, Shoes→Footwear). Jomashop's
+  // live v1 endpoint only knows canonical names; without this, push and
+  // preflight fall back to the bundled (unverified-options) schema even when
+  // the live Apparel schema is reachable.
+  const key = canonicalJomashopCategory(rawKey);
   if (!opts.refresh) {
     const cached = v1SchemaCache.get(key);
     if (cached && Date.now() - cached.fetchedAt < V1_SCHEMA_TTL_MS) {
@@ -251,12 +260,18 @@ export async function getV1CategoryDescriptors(
 // Only falls back when v1 is unreachable OR its payload doesn't carry
 // usable Title Case property labels.
 export async function resolveCategorySchema(category: SupportedCategory) {
-  const bundled = FALLBACK_CATEGORY_SCHEMAS[category];
+  // Always lift to the canonical Jomashop name (Clothing→Apparel) so the
+  // bundled fallback we compare against is the one whose Article options
+  // are NOT marked options_unverified, and so live v1 lookups hit the name
+  // Jomashop actually publishes.
+  const canonical = canonicalJomashopCategory(category) as SupportedCategory;
+  const bundled =
+    FALLBACK_CATEGORY_SCHEMAS[canonical] ?? FALLBACK_CATEGORY_SCHEMAS[category];
   const bundledIsExact =
     Array.isArray(bundled) &&
     bundled.length > 0 &&
     bundled.every((p) => /[A-Z]/.test(p.field) || /\s/.test(p.field));
-  const v1 = await getV1CategoryDescriptors(category);
+  const v1 = await getV1CategoryDescriptors(canonical);
   if (v1.ok && v1.descriptors.length > 0) {
     const liveHasExactLabels = v1.descriptors.some(
       (p) => typeof p.field === "string" && (/[A-Z]/.test(p.field) || /\s/.test(p.field)),
