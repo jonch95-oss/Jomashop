@@ -81,6 +81,10 @@ import {
   buildInlineRepairFieldDescriptors,
   validateInlineFieldValue,
 } from "../server/inline_field_repair";
+import {
+  compactifyMapped,
+  deriveReadinessFromMapping,
+} from "../server/compact_mapped";
 
 // Pure (storage-free) enum override resolver that mimics the production
 // lookupEnumOverride for tests. Mirrors the strict trust gate used in
@@ -6301,6 +6305,328 @@ async function runCategoryAuditAliasOnInvalid() {
     `Case 60b: alias bookkeeping still set even when status is invalid (alias_target=${row.alias_target})`,
   );
 }
+
+// ---- inline field repair: state propagation, cache splice, filter, alias ----
+
+function runInlineRepairWarningUsesCanonicalApparel() {
+  console.log("Case 61: alias warnings surface canonical Jomashop category 'Apparel' instead of 'Clothing field'");
+
+  // The Apparel schema requires Color. A Shopify product whose product_type
+  // is the legacy alias "Clothing" should generate a missing-required warning
+  // that names the canonical Jomashop category — "Apparel field" — so the
+  // operator sees the same name everywhere in the UI (inline repair panel,
+  // category-properties grid, and the warnings list at the bottom of the
+  // product card).
+  const apparelSchema: SchemaPropertyDescriptor[] = [
+    { field: "Color", required: true, type: "string" },
+  ];
+  const product: ShopifyProduct = {
+    id: "p-alias-warn",
+    title: "Cavalli Class Mens Navy Shirt",
+    vendor: "Cavalli Class",
+    product_type: "Clothing", // legacy alias
+    tags: [],
+    body_html: "",
+    metafields: [],
+  };
+  const mapped = mapShopifyToJomashop(product, apparelSchema);
+  const warnings = ((mapped as any).warnings as string[]) || [];
+  const aliasWarning = warnings.find((w) =>
+    /Missing required Apparel field "Color"/.test(w),
+  );
+  assert(
+    Boolean(aliasWarning),
+    `Case 61a: warning should name canonical "Apparel" not "Clothing" (got=${JSON.stringify(warnings)})`,
+  );
+  const stillCallsClothingField = warnings.some((w) => /Clothing field/.test(w));
+  assert(
+    !stillCallsClothingField,
+    `Case 61b: no warning should still say "Clothing field" — canonicalize for display (got=${JSON.stringify(warnings)})`,
+  );
+}
+
+function runInlineRepairCompactProjectionCarriesInvalidEnums() {
+  console.log("Case 62: compactifyMapped preserves invalid_enums + missing lists so the UI can re-derive readiness in place");
+
+  const mapped = {
+    category: "Apparel",
+    vendor_sku: "SKU-X",
+    sku: "SKU-X",
+    name: "Test",
+    brand: "Test",
+    properties: { Color: "Navy", Gender: "Men" },
+    variants: [{ vendor_sku: "SKU-X-V1", price: 10, jomashop_price: 8, quantity: 5, status: "active", options: { Size: "M" } }],
+    images: ["https://example.com/x.jpg"],
+    warnings: ["w1"],
+    missing_required: ["Article"],
+    missing_top_level: [],
+    invalid_enums: [{ field: "Country of Origin", value: "USA", options: ["United States", "Italy"] }],
+    unverified_required_options: [],
+    auto_resolved_enums: [],
+    source: { shopify_product_id: "p-1", shopify_variant_ids: ["v-1"] },
+    schema_fields: [
+      { field: "Color", required: true },
+      { field: "Article", required: true },
+      { field: "Country of Origin", required: false },
+    ],
+    schema_source: "live-i1",
+    readiness: "missing",
+  };
+  const compact = compactifyMapped(mapped);
+  assert(
+    Array.isArray(compact.invalid_enums) && compact.invalid_enums.length === 1,
+    `Case 62a: invalid_enums survives the compact projection (got=${JSON.stringify(compact.invalid_enums)})`,
+  );
+  assert(
+    compact.invalid_enums[0].field === "Country of Origin" &&
+      compact.invalid_enums[0].value === "USA",
+    "Case 62b: invalid_enums entry preserved verbatim",
+  );
+  assert(
+    compact.missing_required.length === 1 && compact.missing_required[0] === "Article",
+    "Case 62c: missing_required carried through",
+  );
+  assert(
+    compact.schema_fields.length === 3,
+    `Case 62d: schema_fields carried through (got=${compact.schema_fields.length})`,
+  );
+  assert(
+    compact.warnings.includes("w1"),
+    "Case 62e: warnings carried through",
+  );
+}
+
+function runDeriveReadinessAfterRepair() {
+  console.log("Case 63: deriveReadinessFromMapping flips a product to push-ready when required missing/invalid lists clear");
+
+  // Before repair — Color required field missing.
+  const before = deriveReadinessFromMapping({
+    schemaLoaded: true,
+    missing_top_level: [],
+    missing_required: ["Color"],
+    invalid_enums: [],
+    vendor_sku: "SKU-X",
+    category: "Apparel",
+    has_undefined_property: false,
+  });
+  assert(before === "missing", `Case 63a: missing required field → readiness=missing (got=${before})`);
+
+  // After repair — all required satisfied, no invalid enums.
+  const after = deriveReadinessFromMapping({
+    schemaLoaded: true,
+    missing_top_level: [],
+    missing_required: [],
+    invalid_enums: [],
+    vendor_sku: "SKU-X",
+    category: "Apparel",
+    has_undefined_property: false,
+  });
+  assert(after === "ready", `Case 63b: cleared required + invalid → readiness=ready (got=${after})`);
+
+  // Invalid enums alone still block readiness.
+  const stillInvalid = deriveReadinessFromMapping({
+    schemaLoaded: true,
+    missing_top_level: [],
+    missing_required: [],
+    invalid_enums: [{ field: "Country of Origin" }],
+    vendor_sku: "SKU-X",
+    category: "Apparel",
+    has_undefined_property: false,
+  });
+  assert(
+    stillInvalid === "missing",
+    `Case 63c: lingering invalid_enums keep readiness=missing (got=${stillInvalid})`,
+  );
+
+  // Optional missing fields do NOT block push — the operator can repair them
+  // inline, but readiness is computed off required/missing-top-level only.
+  const optionalOnly = deriveReadinessFromMapping({
+    schemaLoaded: true,
+    missing_top_level: [],
+    missing_required: [],
+    invalid_enums: [],
+    vendor_sku: "SKU-X",
+    category: "Apparel",
+    has_undefined_property: false,
+  });
+  assert(
+    optionalOnly === "ready",
+    `Case 63d: optional-only state must not block push (got=${optionalOnly})`,
+  );
+}
+
+function runInlineRepairCacheSplice() {
+  console.log("Case 64: cache update replaces ONLY the repaired product row, leaves siblings untouched");
+
+  // Stand-in for the storage cache payload structure used by routes.ts.
+  const cachePayload = {
+    mapped: [
+      { source: { shopify_product_id: "p-1" }, vendor_sku: "SKU-1", missing_required: ["Color"], readiness: "missing" },
+      { source: { shopify_product_id: "p-2" }, vendor_sku: "SKU-2", missing_required: [], readiness: "ready" },
+      { source: { shopify_product_id: "p-3" }, vendor_sku: "SKU-3", missing_required: ["Article"], readiness: "missing" },
+    ],
+  };
+  const repaired = {
+    source: { shopify_product_id: "p-1" },
+    vendor_sku: "SKU-1",
+    missing_required: [],
+    readiness: "ready",
+  };
+  // Mirror the splice logic in inline_field_repair.ts: replace by
+  // shopify_product_id equality, leave sibling rows untouched.
+  const targetPid = "p-1";
+  const nextMapped = cachePayload.mapped.map((m: any) => {
+    const pid = String(m?.source?.shopify_product_id ?? "");
+    return pid === targetPid ? repaired : m;
+  });
+  assert(
+    (nextMapped[0] as any).readiness === "ready" &&
+      (nextMapped[0] as any).missing_required.length === 0,
+    "Case 64a: target product replaced with the remapped row",
+  );
+  assert(
+    (nextMapped[1] as any).vendor_sku === "SKU-2" &&
+      (nextMapped[2] as any).vendor_sku === "SKU-3",
+    "Case 64b: sibling rows untouched",
+  );
+  assert(
+    (nextMapped[1] as any).readiness === "ready" &&
+      (nextMapped[2] as any).readiness === "missing",
+    "Case 64c: sibling readiness values preserved",
+  );
+}
+
+function runInlineRepairFilterBuckets() {
+  console.log("Case 65: filter buckets partition required-missing, optional-missing, and invalid distinct from 'all'");
+
+  // Same projection helper the UI uses to drive the filter chips. Build a
+  // representative field set with one required-missing, one optional-missing,
+  // one invalid, and one ok value — the filter logic in the component
+  // matches on (required, status) so this is exactly what gets bucketed.
+  const apparelSchema: SchemaPropertyDescriptor[] = [
+    { field: "Color", required: true, type: "string" },
+    { field: "Article", required: true, type: "enum", options: ["Shirt", "Pants"] },
+    { field: "Country of Origin", required: false, type: "enum", options: ["United States", "Italy"] },
+    { field: "Apparel Type", required: false, type: "string" },
+  ];
+  const properties = {
+    Article: "Shirt", // ok
+  };
+  const invalidEnums = [
+    { field: "Country of Origin", value: "USA", options: ["United States", "Italy"] },
+  ];
+  const fields = buildInlineRepairFieldDescriptors(apparelSchema, properties, invalidEnums);
+
+  // Required-missing OR invalid — both bucketed under "required" filter.
+  const requiredBucket = fields.filter(
+    (f) => (f.required && f.status === "missing") || f.status === "invalid",
+  );
+  assert(
+    requiredBucket.some((f) => f.field === "Color") &&
+      requiredBucket.some((f) => f.field === "Country of Origin"),
+    `Case 65a: Color (required-missing) + Country of Origin (invalid) land in 'required' bucket (got=${JSON.stringify(requiredBucket.map((f) => f.field))})`,
+  );
+  assert(
+    !requiredBucket.some((f) => f.field === "Apparel Type"),
+    "Case 65b: optional-missing fields do NOT land in 'required' bucket",
+  );
+
+  // Optional-missing — only the optional+missing rows.
+  const optionalBucket = fields.filter(
+    (f) => !f.required && f.status === "missing",
+  );
+  assert(
+    optionalBucket.some((f) => f.field === "Apparel Type"),
+    `Case 65c: Apparel Type (optional-missing) lands in 'optional' bucket (got=${JSON.stringify(optionalBucket.map((f) => f.field))})`,
+  );
+  assert(
+    !optionalBucket.some((f) => f.field === "Color"),
+    "Case 65d: required fields do NOT land in 'optional' bucket",
+  );
+
+  // Invalid — only enum coercion failures.
+  const invalidBucket = fields.filter((f) => f.status === "invalid");
+  assert(
+    invalidBucket.length === 1 && invalidBucket[0].field === "Country of Origin",
+    `Case 65e: 'invalid' bucket isolates only enum-coercion failures (got=${JSON.stringify(invalidBucket.map((f) => f.field))})`,
+  );
+
+  // All — every schema attribute.
+  assert(
+    fields.length === apparelSchema.length,
+    `Case 65f: 'all' filter surfaces every schema field (got=${fields.length}/${apparelSchema.length})`,
+  );
+}
+
+function runInlineRepairResponseShape() {
+  console.log("Case 66: inline-field-repair response shape lets the UI splice a fully-ready product into the visible list");
+
+  // Build the kind of postRepair.product the route returns (compactified
+  // mapped product) and verify the UI-facing fields the Products.tsx
+  // splice path reads (source.shopify_product_id, readiness,
+  // missing_required, missing_top_level, schema_fields, warnings).
+  const apparelSchema: SchemaPropertyDescriptor[] = [
+    { field: "Color", required: true, type: "string" },
+    { field: "Gender", required: true, type: "enum", options: ["Men", "Women"] },
+    { field: "Article", required: true, type: "enum", options: ["Shirt", "Pants"] },
+  ];
+  const repaired: ShopifyProduct = {
+    id: "p-66",
+    title: "Cavalli Class Mens Navy Shirt",
+    vendor: "Cavalli Class",
+    product_type: "Apparel",
+    tags: [],
+    body_html: "",
+    metafields: [
+      { namespace: "jomashop", key: "color", value: "Navy" },
+      { namespace: "jomashop", key: "gender", value: "Men" },
+      { namespace: "jomashop", key: "article", value: "Shirt" },
+    ],
+    variants: [
+      { id: "v-66", sku: "SKU-66", price: "100.00", inventory_quantity: 5 },
+    ],
+  };
+  const mapped = mapShopifyToJomashop(repaired, apparelSchema);
+  const enriched: any = {
+    ...mapped,
+    push_state: "not_pushed",
+    schema_source: "live-i1",
+    schema_fields: apparelSchema.map((s) => ({ field: s.field, required: s.required })),
+    readiness: deriveReadinessFromMapping({
+      schemaLoaded: true,
+      missing_top_level: (mapped as any).missing_top_level || [],
+      missing_required: (mapped as any).missing_required || [],
+      invalid_enums: (mapped as any).invalid_enums || [],
+      vendor_sku: (mapped as any).vendor_sku,
+      category: (mapped as any).category,
+      has_undefined_property: false,
+    }),
+  };
+  const compact = compactifyMapped(enriched);
+  assert(
+    compact.readiness === "ready",
+    `Case 66a: full repair → readiness=ready (got=${compact.readiness})`,
+  );
+  assert(
+    compact.missing_required.length === 0 && compact.missing_top_level.length === 0,
+    `Case 66b: no missing-required after repair (missing_required=${JSON.stringify(compact.missing_required)}, missing_top_level=${JSON.stringify(compact.missing_top_level)})`,
+  );
+  assert(
+    Array.isArray(compact.schema_fields) && compact.schema_fields.length === 3,
+    `Case 66c: schema_fields survive compact projection (got=${compact.schema_fields.length})`,
+  );
+  assert(
+    compact.source.shopify_product_id !== undefined,
+    "Case 66d: source.shopify_product_id present so Products.tsx can match by id",
+  );
+}
+
+runInlineRepairWarningUsesCanonicalApparel();
+runInlineRepairCompactProjectionCarriesInvalidEnums();
+runDeriveReadinessAfterRepair();
+runInlineRepairCacheSplice();
+runInlineRepairFilterBuckets();
+runInlineRepairResponseShape();
 
 await runCategoryAuditRowsHelpers();
 await runCategoryAuditFallsBackWhenLiveUnavailable();

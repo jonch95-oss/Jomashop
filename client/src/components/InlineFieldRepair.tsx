@@ -108,8 +108,14 @@ type SaveResult = {
     missing_top_level: string[];
     invalid_enums: Array<{ field: string; value: string; options: string[] }>;
     push_ready: boolean;
+    /** Full remapped compact product for the parent to splice into the
+     *  visible list — keeps the card in sync with the backend without
+     *  waiting for a full /api/products/refresh. */
+    product?: any;
   } | null;
 };
+
+type RepairFilter = "required" | "optional" | "invalid" | "all";
 
 export function InlineFieldRepair({
   productId,
@@ -146,29 +152,46 @@ export function InlineFieldRepair({
     return Array.isArray(schemaQ.data?.fields) ? schemaQ.data!.fields! : [];
   }, [schemaQ.data]);
 
-  // Default view: every field the schema flags as missing OR invalid — both
-  // required and recommended/optional. The parent-supplied `missingFields`
-  // augments the focus list (so the per-row "Missing: X, Y" badge always
-  // lights up the same rows in the panel), but optional fields with no
-  // current value are also included so operators can populate them inline
-  // without leaving the page.
+  // Active filter — defaults to Required + Invalid so the operator focuses
+  // on push-blocking fields first. They can expand to Optional or All any
+  // time without leaving the page.
+  const [filter, setFilter] = useState<RepairFilter>("required");
+
+  // Apply the selected filter to allFields. "required" surfaces required+
+  // missing AND invalid (anything that blocks push), "optional" surfaces
+  // recommended/optional fields that have no current value (editable but
+  // never blocking), "invalid" narrows to enum-coercion failures only,
+  // "all" shows every schema field so the operator can edit a populated
+  // value in place.
   const focusFields = useMemo(() => {
     const out = new Map<string, RepairFieldDescriptor>();
+    const isRequiredMissing = (f: RepairFieldDescriptor) =>
+      f.required === true && f.status === "missing";
+    const isInvalid = (f: RepairFieldDescriptor) => f.status === "invalid";
+    const isOptionalMissing = (f: RepairFieldDescriptor) =>
+      f.required !== true && f.status === "missing";
     for (const f of allFields) {
-      // Surface any field the server identified as in need of repair (missing
-      // required, missing optional that is displayed as missing, or invalid).
-      if (
-        f.status === "missing" ||
-        f.status === "invalid" ||
-        f.needsRepair === true
-      ) {
+      if (filter === "all") {
         out.set(f.field, f);
+        continue;
+      }
+      if (filter === "required" && (isRequiredMissing(f) || isInvalid(f))) {
+        out.set(f.field, f);
+        continue;
+      }
+      if (filter === "optional" && isOptionalMissing(f)) {
+        out.set(f.field, f);
+        continue;
+      }
+      if (filter === "invalid" && isInvalid(f)) {
+        out.set(f.field, f);
+        continue;
       }
     }
     // Parent-supplied missing fields (case-insensitive label match) get
-    // pulled in even when the server status disagrees — keeps the inline
-    // panel and the per-row "Missing: …" badge consistent.
-    if (missingSet.size > 0) {
+    // pulled in regardless of the filter — keeps the inline panel and the
+    // per-row "Missing: …" badge consistent.
+    if (missingSet.size > 0 && filter !== "invalid") {
       for (const f of allFields) {
         if (missingSet.has(f.field.toLowerCase().trim())) {
           out.set(f.field, f);
@@ -176,12 +199,28 @@ export function InlineFieldRepair({
       }
     }
     return Array.from(out.values());
-  }, [allFields, missingSet]);
+  }, [allFields, missingSet, filter]);
 
-  // Optional "Show all schema fields" expansion — useful when the operator
-  // wants to edit an already-populated field (e.g. fix a wrong Color).
-  const [showAll, setShowAll] = useState(false);
-  const visibleFields = showAll ? allFields : focusFields;
+  // Tallies for the filter chips so the operator can see at a glance how
+  // many fields fall into each bucket.
+  const filterCounts = useMemo(() => {
+    let requiredMissing = 0;
+    let invalid = 0;
+    let optionalMissing = 0;
+    for (const f of allFields) {
+      if (f.required === true && f.status === "missing") requiredMissing += 1;
+      if (f.status === "invalid") invalid += 1;
+      if (f.required !== true && f.status === "missing") optionalMissing += 1;
+    }
+    return {
+      required: requiredMissing + invalid,
+      optional: optionalMissing,
+      invalid,
+      all: allFields.length,
+    };
+  }, [allFields]);
+
+  const visibleFields = focusFields;
 
   // Reset working values whenever the schema changes (e.g. after a save +
   // refetch). Pre-populate with current values so editing-in-place works.
@@ -260,7 +299,10 @@ export function InlineFieldRepair({
       setLastResult(body);
       if (body.ok) {
         // Refetch the per-product schema so currentValue updates reflect the
-        // values we just wrote, then notify parent.
+        // values we just wrote, then notify parent. The parent uses the
+        // postRepair.product on the response to splice the remapped row
+        // into the visible list immediately — no waiting for a cache
+        // refresh round-trip.
         schemaQ.refetch();
         onSaved?.(body);
         if (opts.pushAfter && body.postRepair && body.postRepair.push_ready) {
@@ -300,26 +342,70 @@ export function InlineFieldRepair({
       </div>
     );
   }
+  const pushReadyAfterSave = lastResult?.ok && lastResult?.postRepair?.push_ready === true;
+
+  // Filter chip definitions — order matters: Required first because it is
+  // the default and the most actionable bucket.
+  const filterChips: Array<{ id: RepairFilter; label: string; count: number; title: string }> = [
+    {
+      id: "required",
+      label: "Required missing",
+      count: filterCounts.required,
+      title: "Required category attributes that are missing OR invalid — must be repaired before push.",
+    },
+    {
+      id: "optional",
+      label: "Optional missing",
+      count: filterCounts.optional,
+      title: "Recommended attributes with no current value — editable but never blocking.",
+    },
+    {
+      id: "invalid",
+      label: "Invalid",
+      count: filterCounts.invalid,
+      title: "Existing values that failed enum coercion against Jomashop's accepted-options list.",
+    },
+    {
+      id: "all",
+      label: "All fields",
+      count: filterCounts.all,
+      title: "Every schema attribute — use to edit an already-populated value.",
+    },
+  ];
+
   if (visibleFields.length === 0) {
     return (
-      <div className="flex items-center gap-2 text-xs text-emerald-700 dark:text-emerald-400">
-        <CheckCircle2 className="h-3.5 w-3.5" />
-        No missing or invalid fields — every category attribute has a valid value.
-        {!showAll && allFields.length > 0 && (
-          <button
-            type="button"
-            className="ml-2 underline hover:text-emerald-600"
-            onClick={() => setShowAll(true)}
-            data-testid={`button-show-all-fields-${productId}`}
-          >
-            Edit all {allFields.length} fields
-          </button>
-        )}
+      <div
+        className="space-y-2"
+        data-testid={`inline-repair-${productId}`}
+      >
+        <div className="flex items-center gap-2 text-xs text-emerald-700 dark:text-emerald-400">
+          <CheckCircle2 className="h-3.5 w-3.5" />
+          {filter === "required"
+            ? "No required or invalid fields remain — product is push-ready."
+            : "No fields in the selected filter."}
+        </div>
+        <div className="flex flex-wrap gap-1.5">
+          {filterChips.map((chip) => (
+            <button
+              key={chip.id}
+              type="button"
+              onClick={() => setFilter(chip.id)}
+              title={chip.title}
+              data-testid={`button-filter-${chip.id}-${productId}`}
+              className={`rounded-full border px-2.5 py-0.5 text-[10px] uppercase tracking-wider transition ${
+                filter === chip.id
+                  ? "border-foreground bg-foreground text-background"
+                  : "border-card-border bg-card/40 text-muted-foreground hover:bg-card"
+              }`}
+            >
+              {chip.label} {chip.count > 0 && <span className="ml-1 tabular-nums">{chip.count}</span>}
+            </button>
+          ))}
+        </div>
       </div>
     );
   }
-
-  const pushReadyAfterSave = lastResult?.ok && lastResult?.postRepair?.push_ready === true;
 
   return (
     <div className="space-y-3" data-testid={`inline-repair-${productId}`}>
@@ -342,25 +428,25 @@ export function InlineFieldRepair({
             Schema: <span className="text-foreground">{schema.schemaSource}</span>
           </span>
         </div>
-        {!showAll ? (
+      </div>
+
+      <div className="flex flex-wrap gap-1.5">
+        {filterChips.map((chip) => (
           <button
+            key={chip.id}
             type="button"
-            className="underline hover:text-foreground"
-            onClick={() => setShowAll(true)}
-            data-testid={`button-show-all-fields-${productId}`}
+            onClick={() => setFilter(chip.id)}
+            title={chip.title}
+            data-testid={`button-filter-${chip.id}-${productId}`}
+            className={`rounded-full border px-2.5 py-0.5 text-[10px] uppercase tracking-wider transition ${
+              filter === chip.id
+                ? "border-foreground bg-foreground text-background"
+                : "border-card-border bg-card/40 text-muted-foreground hover:bg-card"
+            }`}
           >
-            Show all {allFields.length} fields
+            {chip.label} {chip.count > 0 && <span className="ml-1 tabular-nums">{chip.count}</span>}
           </button>
-        ) : (
-          <button
-            type="button"
-            className="underline hover:text-foreground"
-            onClick={() => setShowAll(false)}
-            data-testid={`button-show-missing-only-${productId}`}
-          >
-            Show only missing
-          </button>
-        )}
+        ))}
       </div>
 
       <div className="grid grid-cols-1 gap-3 md:grid-cols-2">

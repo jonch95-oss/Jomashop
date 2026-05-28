@@ -18,6 +18,7 @@ import {
   writeMetafield,
 } from "./jomashop_product_field_excel";
 import { lookupEnumOverride } from "./enum_mapping";
+import { compactifyMapped, type CompactMappedProduct } from "./compact_mapped";
 
 /**
  * Inline per-product field repair: validate a single field value against the
@@ -520,13 +521,6 @@ export function registerInlineFieldRepairRoutes(app: Express): void {
 
     const allOk = results.every((r) => r.ok);
 
-    // Invalidate the product cache so the next refresh re-derives properties.
-    try {
-      storage.clearProductCache(conn.shopDomain);
-    } catch {
-      // non-fatal
-    }
-
     // After writeback, recompute the mapping for this product so the caller
     // can immediately tell whether it is now push-ready, without paying for a
     // full /api/products/refresh round-trip. Best-effort: failures here are
@@ -537,8 +531,15 @@ export function registerInlineFieldRepairRoutes(app: Express): void {
           missing_top_level: string[];
           invalid_enums: Array<{ field: string; value: string; options: string[] }>;
           push_ready: boolean;
+          /** Full compact mapped product after re-running the mapper with the
+           *  fresh metafield values. Returned so the Products page can splice
+           *  this row into its in-memory list without waiting for a full
+           *  /api/products/refresh — fields disappear, category-properties
+           *  grid + warnings update, and the Push button enables immediately. */
+          product?: CompactMappedProduct;
         }
       | null = null;
+    let remappedCompact: CompactMappedProduct | null = null;
     try {
       // Re-fetch the now-updated product so the metafields read includes the
       // values we just wrote, then re-map against the live schema.
@@ -572,21 +573,151 @@ export function registerInlineFieldRepairRoutes(app: Express): void {
         const missingTopLevel = Array.isArray((mapped as any).missing_top_level)
           ? ((mapped as any).missing_top_level as string[]).filter((n) => n && n !== "undefined")
           : [];
-        const invalidEnums = Array.isArray((mapped as any).invalid_enums)
+        const remappedInvalidEnums = Array.isArray((mapped as any).invalid_enums)
           ? ((mapped as any).invalid_enums as Array<{ field: string; value: string; options: string[] }>)
           : [];
+        // Schema source detection: matches the buildPreview heuristic — if
+        // the property descriptors carry exact-case labels (any uppercase
+        // letter or whitespace in the field name) we treat the schema as
+        // live; otherwise it came from the bundled fallback set.
+        const schemaSource: "live-i1" | "live-v1" | "fallback" | "none" =
+          descriptors.some(
+            (d: any) =>
+              d && typeof d.field === "string" && (/[A-Z]/.test(d.field) || /\s/.test(d.field)),
+          )
+            ? "live-i1"
+            : descriptors.length > 0
+              ? "fallback"
+              : "none";
+        const schemaLoaded = descriptors.some(
+          (d: any) =>
+            d && typeof d.field === "string" && d.field.trim() !== "" && d.field !== "undefined",
+        );
+        const hasUndefinedProp = Object.entries(
+          ((mapped as any).properties ?? {}) as Record<string, unknown>,
+        ).some(
+          ([k, v]) =>
+            !k ||
+            k === "undefined" ||
+            v === undefined ||
+            (typeof v === "string" && (v as string).trim().toLowerCase() === "undefined"),
+        );
+        // Pull the latest push-status row so the compact projection keeps any
+        // prior pushed/rejected metadata (the UI uses these to label the row).
+        const pushStatus = (() => {
+          try {
+            const all = storage.listPushStatuses(conn.shopDomain);
+            return all.find(
+              (ps) =>
+                ps.shopifySku &&
+                ps.shopifySku === ((mapped as any).vendor_sku as string),
+            );
+          } catch {
+            return undefined;
+          }
+        })();
+        const enriched: any = {
+          ...mapped,
+          push_state: pushStatus?.state ?? "not_pushed",
+          jomashop_sku: pushStatus?.jomashopSku ?? null,
+          last_push_error: pushStatus?.lastError ?? null,
+          last_pushed_at: pushStatus?.lastPushedAt ?? null,
+          last_invalid_params: (() => {
+            if (!pushStatus?.lastInvalidParams) return null;
+            try {
+              const parsed = JSON.parse(pushStatus.lastInvalidParams);
+              return Array.isArray(parsed) ? parsed.map(String) : null;
+            } catch {
+              return null;
+            }
+          })(),
+          last_rejected_category: pushStatus?.lastRejectedCategory ?? null,
+          last_rejected_brand: pushStatus?.lastRejectedBrand ?? null,
+          schema_source: schemaSource,
+          schema_fields: descriptors
+            .filter(
+              (d: any) =>
+                d && typeof d.field === "string" && d.field.trim() !== "" && d.field !== "undefined",
+            )
+            .map((d: any) => ({ field: String(d.field), required: Boolean(d.required) })),
+          readiness: (() => {
+            // Don't override an existing rejection — the operator still needs
+            // to acknowledge that the next push will use new fields.
+            if ((mapped as any).is_sample) return "sample";
+            if (!schemaLoaded) return "needs-category-verification";
+            if ((mapped as any).ambiguous_category) return "needs-category-verification";
+            if (
+              missingTopLevel.length > 0 ||
+              missingRequired.length > 0 ||
+              remappedInvalidEnums.length > 0 ||
+              hasUndefinedProp
+            ) {
+              return "missing";
+            }
+            return "ready";
+          })(),
+        };
+        remappedCompact = compactifyMapped(enriched);
         postRepair = {
           missing_required: missingRequired,
           missing_top_level: missingTopLevel,
-          invalid_enums: invalidEnums,
+          invalid_enums: remappedInvalidEnums,
           push_ready:
             missingRequired.length === 0 &&
             missingTopLevel.length === 0 &&
-            invalidEnums.length === 0,
+            remappedInvalidEnums.length === 0,
+          product: remappedCompact,
         };
       }
     } catch {
       // Best-effort — caller can call /api/products/refresh manually.
+    }
+
+    // Update the cache in place — replace the matching mapped row with the
+    // freshly remapped one — so a page refresh shows the repaired state
+    // without paying for a full /api/products/refresh. If we have no
+    // remapped row (live fetch failed) we fall back to clearing the cache so
+    // the next refresh re-derives.
+    try {
+      if (remappedCompact) {
+        const existing = storage.getProductCache(conn.shopDomain);
+        if (existing) {
+          let payload: any;
+          try { payload = JSON.parse(existing.payloadJson); } catch { payload = null; }
+          if (payload && Array.isArray(payload.mapped)) {
+            const targetPid = String(body.productId);
+            let replaced = false;
+            payload.mapped = payload.mapped.map((m: any) => {
+              const pid = String(m?.source?.shopify_product_id ?? "");
+              if (pid === targetPid) {
+                replaced = true;
+                return remappedCompact;
+              }
+              return m;
+            });
+            if (replaced) {
+              storage.upsertProductCache({
+                shopDomain: conn.shopDomain,
+                fetchedCount: existing.fetchedCount,
+                pageCount: existing.pageCount,
+                hasMore: existing.hasMore,
+                payloadJson: JSON.stringify(payload),
+                fetchedAt: Date.now(),
+              });
+            } else {
+              // Product wasn't in the cache slice — clear so next refresh
+              // picks up the new values rather than serving stale rows.
+              storage.clearProductCache(conn.shopDomain);
+            }
+          } else {
+            storage.clearProductCache(conn.shopDomain);
+          }
+        }
+      } else {
+        storage.clearProductCache(conn.shopDomain);
+      }
+    } catch {
+      // non-fatal — the writeback already succeeded.
     }
 
     storage.appendLog({

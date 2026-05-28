@@ -991,10 +991,34 @@ export default function Products() {
                             <InlineFieldRepair
                               productId={String(p.source.shopify_product_id)}
                               missingFields={missing}
-                              onSaved={() => {
-                                // Invalidate cache + push-status queries so the
-                                // list view re-derives readiness with the new
-                                // metafield values on the next refetch.
+                              onSaved={(result) => {
+                                // The backend returns the remapped product on
+                                // postRepair.product. Splice it directly into
+                                // the visible list so the card re-renders with
+                                // the freshly-derived properties, warnings,
+                                // missing_required, readiness, etc. — without
+                                // waiting for a full /api/products/refresh.
+                                const remapped = result?.postRepair?.product as
+                                  | MappedProduct
+                                  | undefined;
+                                if (remapped) {
+                                  setData((prev) => {
+                                    if (!prev || !Array.isArray(prev.mapped)) return prev;
+                                    const targetPid = String(
+                                      p.source.shopify_product_id,
+                                    );
+                                    const nextMapped = prev.mapped.map((row) => {
+                                      const pid = String(
+                                        row?.source?.shopify_product_id ?? "",
+                                      );
+                                      return pid === targetPid ? remapped : row;
+                                    });
+                                    return { ...prev, mapped: nextMapped };
+                                  });
+                                }
+                                // Invalidate cache + push-status queries so a
+                                // subsequent page refresh re-derives readiness
+                                // with the new metafield values.
                                 queryClient.invalidateQueries({
                                   queryKey: ["/api/products/cache"],
                                 });

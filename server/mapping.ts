@@ -4,6 +4,7 @@
 import {
   FALLBACK_CATEGORY_SCHEMAS,
   SUPPORTED_CATEGORIES,
+  canonicalJomashopCategory,
   type SupportedCategory,
 } from "@shared/schema";
 import { resolveCategorySynonym } from "./synonym_resolver";
@@ -1766,6 +1767,12 @@ export function mapShopifyToJomashop(
   },
 ): MappedProduct {
   const category = forcedCategory || inferCategory(product) || "Clothing";
+  // Display name for human-facing warnings/messages. Legacy alias categories
+  // (e.g. "Clothing") are surfaced as their canonical Jomashop name
+  // ("Apparel") so the warning list, inline repair panel, and product card
+  // never disagree about what category a row is mapped to. The internal
+  // `category` variable stays unchanged so existing code paths keep working.
+  const categoryLabel = canonicalJomashopCategory(category) as string;
   const warnings: string[] = [];
 
   const sizeOpt = resolveOption(product, ["size"]);
@@ -1845,7 +1852,7 @@ export function mapShopifyToJomashop(
     for (const label of built.missingRequired) {
       missingRequiredProps.push(label);
       warnings.push(
-        `Missing required ${category} field "${label}" — add via metafield, product option, or vendor field.`,
+        `Missing required ${categoryLabel} field "${label}" — add via metafield, product option, or vendor field.`,
       );
     }
     invalidEnums = built.invalidEnums;
@@ -1854,17 +1861,17 @@ export function mapShopifyToJomashop(
     autoResolvedEnums = built.autoResolvedEnums;
     for (const r of autoResolvedEnums) {
       warnings.push(
-        `Auto-resolved ${category} field "${r.field}" to "${r.chosen}" from source code "${r.sourceCode}" — ${r.reason}. Add a verified enum mapping to override.`,
+        `Auto-resolved ${categoryLabel} field "${r.field}" to "${r.chosen}" from source code "${r.sourceCode}" — ${r.reason}. Add a verified enum mapping to override.`,
       );
     }
     for (const inv of invalidEnums) {
       warnings.push(
-        `Value "${inv.value}" for ${category} field "${inv.field}" is not in Jomashop's accepted list (${inv.options.slice(0, 8).join(", ")}${inv.options.length > 8 ? "…" : ""}). Add a mapping or correct the source metafield.`,
+        `Value "${inv.value}" for ${categoryLabel} field "${inv.field}" is not in Jomashop's accepted list (${inv.options.slice(0, 8).join(", ")}${inv.options.length > 8 ? "…" : ""}). Add a mapping or correct the source metafield.`,
       );
     }
     for (const u of unverifiedRequiredOptions) {
       warnings.push(
-        `Required ${category} field "${u.field}" has no confirmed Jomashop option list. Load the live category schema (or supply a mapping) before pushing — sending a guess will trigger "${u.field} is not included in the list".`,
+        `Required ${categoryLabel} field "${u.field}" has no confirmed Jomashop option list. Load the live category schema (or supply a mapping) before pushing — sending a guess will trigger "${u.field} is not included in the list".`,
       );
     }
   } else for (const prop of schemaProperties) {
@@ -2017,7 +2024,7 @@ export function mapShopifyToJomashop(
     }
 
     if (!value && prop.required) {
-      warnings.push(`Missing required ${category} field "${prop.field}" — add via metafield, product option, or vendor field.`);
+      warnings.push(`Missing required ${categoryLabel} field "${prop.field}" — add via metafield, product option, or vendor field.`);
       properties[prop.field] = null;
       missingRequiredProps.push(prop.field);
     } else {
