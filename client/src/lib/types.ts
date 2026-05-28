@@ -51,6 +51,11 @@ export type MappedProduct = {
   missing_required?: string[];
   /** Required top-level field names that are missing (e.g. ["sku", "manufacturer_number"]). */
   missing_top_level?: string[];
+  /** Schema enum fields whose Shopify value failed coercion against the live
+   *  accepted-options list. Each entry includes the offending source value
+   *  and the accepted list. The UI uses this to surface "invalid" attribute
+   *  rows in the inline repair panel even when the field isn't missing. */
+  invalid_enums?: Array<{ field: string; value: string; options: string[] }>;
   /** Required enum fields whose accepted Jomashop options aren't verified
    *  and no enum override resolved them. Each entry includes the canonical
    *  source value the mapper tried, if any. UI uses this to render

@@ -22,6 +22,7 @@ import { CategoryMappingCard } from "@/components/CategoryMapping";
 import { BrandMappingCard } from "@/components/BrandMapping";
 import { ResolutionAuditCard } from "@/components/ResolutionAudit";
 import { InlineFieldRepair } from "@/components/InlineFieldRepair";
+import { canonicalJomashopCategory } from "@shared/schema";
 import type { MappedProduct } from "@/lib/types";
 
 type OverrideFields = {
@@ -959,7 +960,22 @@ export default function Products() {
                       p.source.shopify_product_id !== null &&
                       (missing.length > 0 ||
                         (Array.isArray(p.unverified_required_options) &&
-                          p.unverified_required_options.length > 0)) && (
+                          p.unverified_required_options.length > 0) ||
+                        (Array.isArray(p.invalid_enums) && p.invalid_enums.length > 0) ||
+                        // Also surface the inline repair panel when there are
+                        // recommended/optional category attributes that are
+                        // currently missing — operators can fill them inline
+                        // without having to leave the page or run the bulk
+                        // Excel workflow.
+                        Object.entries(p.properties).some(([k, v]) => {
+                          if (!k || k === "undefined") return false;
+                          if (v === null || v === undefined) return true;
+                          if (typeof v === "string") {
+                            const s = v.trim().toLowerCase();
+                            if (s === "" || s === "undefined") return true;
+                          }
+                          return false;
+                        })) && (
                         <details
                           className="border-b border-card-border bg-amber-500/[0.04] p-4"
                           data-testid={`details-inline-repair-${p.vendor_sku}`}
@@ -1031,20 +1047,47 @@ export default function Products() {
                               >
                                 {p.suggested_category || p.category}
                               </code>
-                            ) : (
-                              <span
-                                className="font-mono text-amber-600 dark:text-amber-400"
-                                data-testid={`text-jomashop-category-needs-verify-${p.vendor_sku}`}
-                              >
-                                {p.ambiguous_category
-                                  ? "needs verification (ambiguous code)"
-                                  : p.jomashop_resolution?.i1_available
-                                    ? `not found in /i1/categories: ${p.jomashop_resolution.outbound_category || p.category}`
-                                    : p.readiness === "needs-category-verification"
-                                      ? "needs verification (no schema loaded)"
-                                      : "needs verification"}
-                              </span>
-                            )}
+                            ) : (() => {
+                              // When the live category schema loaded under a
+                              // canonical alias (e.g. "Clothing" → "Apparel"
+                              // resolves the live Apparel schema), don't show
+                              // the confusing "not found in /i1/categories:
+                              // Clothing" message — display the canonical
+                              // name instead so the operator can see the
+                              // alias is doing its job.
+                              const canonical = canonicalJomashopCategory(p.category) as string;
+                              const aliased = canonical !== p.category;
+                              const schemaIsLive =
+                                p.schema_source === "live-i1" || p.schema_source === "live-v1";
+                              if (aliased && schemaIsLive) {
+                                return (
+                                  <code
+                                    className="font-mono text-emerald-600 dark:text-emerald-400"
+                                    data-testid={`text-jomashop-category-alias-${p.vendor_sku}`}
+                                    title={`Shopify code "${p.category}" maps to canonical Jomashop category "${canonical}" — live schema loaded.`}
+                                  >
+                                    {canonical}{" "}
+                                    <span className="text-[10px] text-muted-foreground">
+                                      (alias of {p.category})
+                                    </span>
+                                  </code>
+                                );
+                              }
+                              return (
+                                <span
+                                  className="font-mono text-amber-600 dark:text-amber-400"
+                                  data-testid={`text-jomashop-category-needs-verify-${p.vendor_sku}`}
+                                >
+                                  {p.ambiguous_category
+                                    ? "needs verification (ambiguous code)"
+                                    : p.jomashop_resolution?.i1_available
+                                      ? `not found in /i1/categories: ${p.jomashop_resolution.outbound_category || p.category}`
+                                      : p.readiness === "needs-category-verification"
+                                        ? "needs verification (no schema loaded)"
+                                        : "needs verification"}
+                                </span>
+                              );
+                            })()}
                           </div>
                           {p.jomashop_resolution && p.jomashop_resolution.i1_available && (
                             <div>

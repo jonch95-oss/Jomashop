@@ -58,6 +58,17 @@ type RepairFieldDescriptor = {
   isVariantTargeted: boolean;
   metafieldTarget: string;
   currentValue: string;
+  /** When status === "invalid", the offending value the mapper saw. The UI
+   *  pre-populates the input with this so the operator can correct it. */
+  invalidValue?: string;
+  /** "ok"   — current value satisfies the schema.
+   *  "missing" — no value present (or "undefined" placeholder).
+   *  "invalid" — value present but failed enum coercion / schema validation. */
+  status?: "ok" | "missing" | "invalid";
+  /** True when this field MUST be repaired before push (required+missing or
+   *  invalid). The UI uses this as the default focus list when the parent
+   *  doesn't pass an explicit `missingFields`. */
+  needsRepair?: boolean;
 };
 
 type SchemaResponse = {
@@ -67,6 +78,12 @@ type SchemaResponse = {
   shopDomain?: string | null;
   fromCache?: boolean;
   category?: string;
+  /** The raw Shopify category code/string before canonical aliasing. The UI
+   *  uses this together with `categoryAliased` to display
+   *  "Apparel (was: Clothing)" instead of "not found in /i1/categories" when
+   *  the alias resolves cleanly. */
+  sourceCategory?: string;
+  categoryAliased?: boolean;
   schemaSource?: "live-v1" | "live-i1" | "fallback" | "unknown";
   fields?: RepairFieldDescriptor[];
 };
@@ -129,17 +146,36 @@ export function InlineFieldRepair({
     return Array.isArray(schemaQ.data?.fields) ? schemaQ.data!.fields! : [];
   }, [schemaQ.data]);
 
-  // Default view: only the fields flagged missing by the parent. If the
-  // parent didn't pass any (or the list is empty), show all required fields
-  // that are currently blank so the operator can still discover what needs
-  // filling without leaving the page.
+  // Default view: every field the schema flags as missing OR invalid — both
+  // required and recommended/optional. The parent-supplied `missingFields`
+  // augments the focus list (so the per-row "Missing: X, Y" badge always
+  // lights up the same rows in the panel), but optional fields with no
+  // current value are also included so operators can populate them inline
+  // without leaving the page.
   const focusFields = useMemo(() => {
-    if (missingSet.size > 0) {
-      return allFields.filter((f) => missingSet.has(f.field.toLowerCase().trim()));
+    const out = new Map<string, RepairFieldDescriptor>();
+    for (const f of allFields) {
+      // Surface any field the server identified as in need of repair (missing
+      // required, missing optional that is displayed as missing, or invalid).
+      if (
+        f.status === "missing" ||
+        f.status === "invalid" ||
+        f.needsRepair === true
+      ) {
+        out.set(f.field, f);
+      }
     }
-    return allFields.filter(
-      (f) => f.required && (f.currentValue === "" || f.currentValue === "undefined"),
-    );
+    // Parent-supplied missing fields (case-insensitive label match) get
+    // pulled in even when the server status disagrees — keeps the inline
+    // panel and the per-row "Missing: …" badge consistent.
+    if (missingSet.size > 0) {
+      for (const f of allFields) {
+        if (missingSet.has(f.field.toLowerCase().trim())) {
+          out.set(f.field, f);
+        }
+      }
+    }
+    return Array.from(out.values());
   }, [allFields, missingSet]);
 
   // Optional "Show all schema fields" expansion — useful when the operator
@@ -149,11 +185,16 @@ export function InlineFieldRepair({
 
   // Reset working values whenever the schema changes (e.g. after a save +
   // refetch). Pre-populate with current values so editing-in-place works.
+  // For invalid-enum fields the mapper drops the source value (it failed
+  // coercion) — but the server echoes the offending value back as
+  // `invalidValue` so the input/select can render it for the operator to
+  // correct without having to re-enter the original.
   useEffect(() => {
     if (!Array.isArray(allFields) || allFields.length === 0) return;
     const next: Record<string, string> = {};
     for (const f of allFields) {
-      next[f.field] = f.currentValue ?? "";
+      const cur = f.currentValue ?? "";
+      next[f.field] = cur || (f.status === "invalid" ? (f.invalidValue ?? "") : "");
     }
     setValues((prev) => {
       // Preserve any in-progress edits the operator hasn't saved yet.
@@ -263,7 +304,7 @@ export function InlineFieldRepair({
     return (
       <div className="flex items-center gap-2 text-xs text-emerald-700 dark:text-emerald-400">
         <CheckCircle2 className="h-3.5 w-3.5" />
-        No missing required fields surfaced for repair.
+        No missing or invalid fields — every category attribute has a valid value.
         {!showAll && allFields.length > 0 && (
           <button
             type="button"
@@ -286,6 +327,15 @@ export function InlineFieldRepair({
         <div className="flex items-center gap-2">
           <span>
             Category: <span className="text-foreground">{schema.category}</span>
+            {schema.categoryAliased && schema.sourceCategory && (
+              <span
+                className="ml-1 text-[10px] text-muted-foreground"
+                title={`Shopify code "${schema.sourceCategory}" is mapped to the canonical Jomashop category "${schema.category}".`}
+                data-testid={`text-category-aliased-${productId}`}
+              >
+                (alias of {schema.sourceCategory})
+              </span>
+            )}
           </span>
           <span>·</span>
           <span>
@@ -328,9 +378,46 @@ export function InlineFieldRepair({
                 <Label className="text-[11px] uppercase tracking-wider">
                   {f.field}
                 </Label>
-                {f.required && (
-                  <Badge variant="outline" className="bg-red-500/10 text-[9px] uppercase text-red-600 dark:text-red-400">
+                {f.required ? (
+                  <Badge
+                    variant="outline"
+                    className="bg-red-500/10 text-[9px] uppercase text-red-600 dark:text-red-400"
+                    title="Required by the Jomashop category schema — must be set before push."
+                    data-testid={`badge-required-${productId}-${f.field}`}
+                  >
                     required
+                  </Badge>
+                ) : (
+                  <Badge
+                    variant="outline"
+                    className="bg-muted/20 text-[9px] uppercase text-muted-foreground"
+                    title="Optional / recommended — editable but does not block push."
+                    data-testid={`badge-optional-${productId}-${f.field}`}
+                  >
+                    optional
+                  </Badge>
+                )}
+                {f.status === "invalid" && (
+                  <Badge
+                    variant="outline"
+                    className="bg-amber-500/15 text-[9px] uppercase text-amber-700 dark:text-amber-400"
+                    title={
+                      f.invalidValue
+                        ? `Current Shopify value "${f.invalidValue}" failed schema validation.`
+                        : "Current value failed schema validation."
+                    }
+                    data-testid={`badge-invalid-${productId}-${f.field}`}
+                  >
+                    invalid
+                  </Badge>
+                )}
+                {f.status === "missing" && !f.required && (
+                  <Badge
+                    variant="outline"
+                    className="text-[9px] uppercase text-muted-foreground"
+                    data-testid={`badge-missing-${productId}-${f.field}`}
+                  >
+                    missing
                   </Badge>
                 )}
                 {f.isVariantTargeted && (

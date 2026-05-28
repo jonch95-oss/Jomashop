@@ -158,6 +158,98 @@ async function findProductById(productId: string): Promise<{
   return { product: null, shopDomain: null, fromCache: false, category: null };
 }
 
+/** Per-field descriptor returned by GET /api/jomashop/inline-field-repair/:id. */
+export type InlineRepairFieldDescriptor = {
+  field: string;
+  required: boolean;
+  type: string;
+  options: string[];
+  options_unverified: boolean;
+  multiple: boolean;
+  min_value: number | undefined;
+  max_value: number | undefined;
+  only_integer: boolean;
+  min_length: number | undefined;
+  max_length: number | undefined;
+  isVariantTargeted: boolean;
+  metafieldTarget: string;
+  currentValue: string;
+  invalidValue: string;
+  status: "ok" | "missing" | "invalid";
+  needsRepair: boolean;
+};
+
+/**
+ * Pure helper that projects a mapped product + live schema into the
+ * per-field descriptor list returned to the UI. Pulled out of the route
+ * handler so the test suite can exercise the missing/invalid/optional
+ * surfacing logic directly without spinning up Express or hitting Shopify.
+ *
+ *  - mappedProperties: the `properties` map returned by mapShopifyToJomashop
+ *    after running with the live schema (post enum-coercion).
+ *  - invalidEnums: the `invalid_enums` list from the same map result.
+ *  - schemaFields: the live schema descriptors for the canonical category.
+ */
+export function buildInlineRepairFieldDescriptors(
+  schemaFields: SchemaPropertyDescriptor[],
+  mappedProperties: Record<string, unknown>,
+  invalidEnums: Array<{ field: string; value: string; options: string[] }>,
+): InlineRepairFieldDescriptor[] {
+  const invalidByField = new Map<string, { value: string; options: string[] }>();
+  for (const ie of invalidEnums || []) {
+    if (ie && typeof ie.field === "string") {
+      invalidByField.set(ie.field, {
+        value: String(ie.value ?? ""),
+        options: Array.isArray(ie.options) ? ie.options : [],
+      });
+    }
+  }
+  return schemaFields
+    .filter(
+      (f) => f && typeof f.field === "string" && f.field.trim() !== "" && f.field !== "undefined",
+    )
+    .map((f) => {
+      const metaTarget = deriveMetafieldTargetForProductField(f.field);
+      const currentValue = (() => {
+        const direct = (mappedProperties as any)[f.field];
+        if (direct !== undefined && direct !== null) return String(direct);
+        const wanted = f.field.toLowerCase().trim();
+        for (const [k, v] of Object.entries(mappedProperties)) {
+          if (String(k).toLowerCase().trim() === wanted) {
+            return v === null || v === undefined ? "" : String(v);
+          }
+        }
+        return "";
+      })();
+      const invalid = invalidByField.get(f.field);
+      const isInvalid = invalid !== undefined;
+      const invalidValue = invalid ? invalid.value : "";
+      const isMissing =
+        currentValue.trim() === "" || currentValue.trim().toLowerCase() === "undefined";
+      const status: "ok" | "missing" | "invalid" =
+        isInvalid ? "invalid" : isMissing ? "missing" : "ok";
+      return {
+        field: f.field,
+        required: f.required === true,
+        type: f.type ?? "string",
+        options: Array.isArray(f.options) ? f.options : [],
+        options_unverified: f.options_unverified === true,
+        multiple: f.multiple === true,
+        min_value: f.min_value,
+        max_value: f.max_value,
+        only_integer: f.only_integer === true,
+        min_length: f.min_length,
+        max_length: f.max_length,
+        isVariantTargeted: fieldIsVariantTargeted(f.field),
+        metafieldTarget: `${metaTarget.namespace}.${metaTarget.key}`,
+        currentValue,
+        invalidValue,
+        status,
+        needsRepair: isInvalid || (f.required === true && isMissing),
+      };
+    });
+}
+
 export function registerInlineFieldRepairRoutes(app: Express): void {
   /**
    * GET /api/jomashop/inline-field-repair/:productId
@@ -176,14 +268,16 @@ export function registerInlineFieldRepairRoutes(app: Express): void {
     try {
       const located = await findProductById(productId);
       let category = located.category || "";
+      // First-pass map with no schema to get the resolved category. We then
+      // load the live schema for that canonical category and re-map with the
+      // full descriptors so the returned per-field status reflects what the
+      // mapper actually emits (missing_required, invalid_enums, ...).
       let mappedProperties: Record<string, unknown> = {};
+      let invalidEnums: Array<{ field: string; value: string; options: string[] }> = [];
       let variantOptionsByVariantId: Record<string, Record<string, string>> = {};
       if (located.product) {
         const tmp = mapShopifyToJomashop(located.product, []);
         category = tmp.category;
-        if (tmp.properties && typeof tmp.properties === "object") {
-          mappedProperties = tmp.properties as Record<string, unknown>;
-        }
         for (const v of located.product.variants || []) {
           const id = String((v as any).id ?? "");
           if (!id) continue;
@@ -207,42 +301,44 @@ export function registerInlineFieldRepairRoutes(app: Express): void {
       const fields = live.fields.filter(
         (f) => f && typeof f.field === "string" && f.field.trim() !== "" && f.field !== "undefined",
       );
+      // Re-map with the live schema so the per-field status surfaced to the
+      // UI matches the mapper's own missing_required / invalid_enums output —
+      // this lets the inline panel render optional fields that are currently
+      // missing AND invalid-enum fields with their offending values without
+      // requiring the parent to also do the bookkeeping.
+      if (located.product) {
+        const mappedFull = mapShopifyToJomashop(
+          located.product,
+          fields,
+          undefined,
+          {
+            resolveEnumOverride: (cat, field, sourceValue, acceptedOptions) => {
+              const hit = lookupEnumOverride(cat, field, sourceValue, acceptedOptions);
+              return hit ? hit.jomashopOption : null;
+            },
+          },
+        );
+        if (mappedFull.properties && typeof mappedFull.properties === "object") {
+          mappedProperties = mappedFull.properties as Record<string, unknown>;
+        }
+        invalidEnums = Array.isArray((mappedFull as any).invalid_enums)
+          ? ((mappedFull as any).invalid_enums as Array<{ field: string; value: string; options: string[] }>)
+          : [];
+      }
       return res.json({
         ok: true,
         productId,
         shopDomain: located.shopDomain,
         fromCache: located.fromCache,
+        // Canonical Jomashop category — surfaced explicitly so the UI shows
+        // "Apparel" when the Shopify product type was the legacy alias
+        // "Clothing", instead of confusing the operator with a "not found
+        // in /i1/categories: Clothing" warning.
         category: canonical,
+        sourceCategory: category,
+        categoryAliased: canonical !== category,
         schemaSource: live.source,
-        fields: fields.map((f) => ({
-          field: f.field,
-          required: f.required,
-          type: f.type ?? "string",
-          options: Array.isArray(f.options) ? f.options : [],
-          options_unverified: f.options_unverified === true,
-          multiple: f.multiple === true,
-          min_value: f.min_value,
-          max_value: f.max_value,
-          only_integer: f.only_integer === true,
-          min_length: f.min_length,
-          max_length: f.max_length,
-          isVariantTargeted: fieldIsVariantTargeted(f.field),
-          metafieldTarget: (() => {
-            const t = deriveMetafieldTargetForProductField(f.field);
-            return `${t.namespace}.${t.key}`;
-          })(),
-          currentValue: (() => {
-            const direct = (mappedProperties as any)[f.field];
-            if (direct !== undefined && direct !== null) return String(direct);
-            const wanted = f.field.toLowerCase().trim();
-            for (const [k, v] of Object.entries(mappedProperties)) {
-              if (String(k).toLowerCase().trim() === wanted) {
-                return v === null || v === undefined ? "" : String(v);
-              }
-            }
-            return "";
-          })(),
-        })),
+        fields: buildInlineRepairFieldDescriptors(fields, mappedProperties, invalidEnums),
         variantOptionsByVariantId,
       });
     } catch (err) {

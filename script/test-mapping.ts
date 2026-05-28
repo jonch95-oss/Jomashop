@@ -77,7 +77,10 @@ import {
   resolveSheetCategory,
   type ProductFieldExportResult,
 } from "../server/jomashop_product_field_excel";
-import { validateInlineFieldValue } from "../server/inline_field_repair";
+import {
+  buildInlineRepairFieldDescriptors,
+  validateInlineFieldValue,
+} from "../server/inline_field_repair";
 
 // Pure (storage-free) enum override resolver that mimics the production
 // lookupEnumOverride for tests. Mirrors the strict trust gate used in
@@ -5894,9 +5897,205 @@ function runInlineFieldRepairPostSaveReadiness() {
   );
 }
 
+function runInlineFieldRepairAllAttributeProjection() {
+  console.log("Case 56: inline repair surfaces missing + invalid + ok across required and optional fields");
+
+  // Schema mirrors the Jomashop Apparel category shape: a mix of required and
+  // recommended/optional fields with both enum and string types. The
+  // projection helper should classify each field correctly so the UI can
+  // surface missing-optional and invalid-enum rows for inline repair, not
+  // only missing-required.
+  const apparelSchema: SchemaPropertyDescriptor[] = [
+    { field: "Color", required: true, type: "string" },
+    { field: "Gender", required: true, type: "enum", options: ["Men", "Women", "Unisex"] },
+    { field: "Article", required: true, type: "enum", options: ["Shirt", "Pants", "Coats & Jackets"] },
+    { field: "Parent SKU", required: false, type: "string" },
+    { field: "Product ID Type", required: false, type: "enum", options: ["UPC", "EAN", "ISBN"] },
+    { field: "Product ID", required: false, type: "string" },
+    { field: "Fabric Material", required: false, type: "string" },
+    { field: "Fabric Material 2", required: false, type: "string" },
+    { field: "Country of Origin", required: false, type: "enum", options: ["United States", "Italy", "China"] },
+    { field: "Product Net Weight", required: false, type: "number" },
+    { field: "ASIN", required: false, type: "string" },
+    { field: "Additional Info", required: false, type: "string" },
+    { field: "Collection", required: false, type: "string" },
+    { field: "Apparel Type", required: false, type: "enum", options: ["Tops", "Bottoms", "Outerwear"] },
+    { field: "Age", required: false, type: "enum", options: ["Adults", "Kids"] },
+    { field: "Apparel Size Type", required: false, type: "enum", options: ["US", "EU"] },
+    { field: "Apparel Size", required: false, type: "string" },
+    { field: "Variation Size (Yes/No)", required: false, type: "enum", options: ["Yes", "No"] },
+  ];
+
+  // Properties post-mapping: Color and Gender populated; Article populated;
+  // Country of Origin attempted from a non-accepted source value and got
+  // dropped (surfaces as invalid_enum). All remaining optional fields are
+  // missing — the UI must still be able to surface them for inline repair.
+  const properties: Record<string, unknown> = {
+    Color: "Navy",
+    Gender: "Men",
+    Article: "Shirt",
+  };
+  const invalidEnums: Array<{ field: string; value: string; options: string[] }> = [
+    { field: "Country of Origin", value: "USA", options: ["United States", "Italy", "China"] },
+  ];
+
+  const fields = buildInlineRepairFieldDescriptors(apparelSchema, properties, invalidEnums);
+  const byName = new Map(fields.map((f) => [f.field, f]));
+
+  // (a) Optional/recommended missing fields surface with status="missing".
+  for (const name of [
+    "Parent SKU",
+    "Product ID Type",
+    "Product ID",
+    "Fabric Material",
+    "Fabric Material 2",
+    "ASIN",
+    "Additional Info",
+    "Collection",
+    "Apparel Type",
+    "Age",
+    "Apparel Size Type",
+    "Apparel Size",
+    "Variation Size (Yes/No)",
+    "Product Net Weight",
+  ]) {
+    const f = byName.get(name);
+    assert(
+      f !== undefined && f.status === "missing",
+      `Case 56a: optional/recommended "${name}" surfaces with status=missing (got ${f?.status})`,
+    );
+    assert(
+      f !== undefined && f.required === false,
+      `Case 56a: optional field "${name}" is marked required=false`,
+    );
+    // Required field bookkeeping: optional missing rows must NOT block the
+    // push (needsRepair=false), but invalid rows SHOULD (test below).
+    assert(
+      f !== undefined && f.needsRepair === false,
+      `Case 56a: optional missing field "${name}" does not block push (needsRepair=false)`,
+    );
+  }
+
+  // (b) Invalid enum field exposes the offending source value so the UI can
+  //     pre-populate the input/select; status="invalid" and needsRepair=true.
+  const coo = byName.get("Country of Origin");
+  assert(
+    coo !== undefined && coo.status === "invalid" && coo.invalidValue === "USA",
+    `Case 56b: invalid enum "Country of Origin" surfaces with invalid status + invalidValue="USA" (got status=${coo?.status} invalidValue="${coo?.invalidValue}")`,
+  );
+  assert(
+    coo !== undefined && Array.isArray(coo.options) && coo.options.includes("United States"),
+    `Case 56b: invalid enum "Country of Origin" carries the live accepted-options list for dropdown rendering`,
+  );
+
+  // (c) Required missing field still surfaces correctly (regression on the
+  //     existing missing-required path) and blocks push.
+  const missingSchema: SchemaPropertyDescriptor[] = [
+    { field: "Color", required: true, type: "string" },
+    { field: "Gender", required: true, type: "enum", options: ["Men", "Women"] },
+    { field: "Parent SKU", required: false, type: "string" },
+  ];
+  const missingProps = { Gender: "Men" };
+  const missingFields = buildInlineRepairFieldDescriptors(missingSchema, missingProps, []);
+  const colorRow = missingFields.find((f) => f.field === "Color");
+  assert(
+    colorRow !== undefined && colorRow.status === "missing" && colorRow.needsRepair === true,
+    `Case 56c: required missing field surfaces with needsRepair=true (got needsRepair=${colorRow?.needsRepair})`,
+  );
+
+  // (d) Enum optional fields carry the live data.values options in the
+  //     returned descriptor — used by the UI to render dropdowns instead of
+  //     a free-text input. Spot-check Product ID Type and Variation Size.
+  const productIdType = byName.get("Product ID Type");
+  assert(
+    productIdType !== undefined &&
+      productIdType.type === "enum" &&
+      productIdType.options.length === 3 &&
+      productIdType.options.includes("UPC"),
+    `Case 56d: optional enum "Product ID Type" carries dropdown options from live data.values`,
+  );
+  const variationSize = byName.get("Variation Size (Yes/No)");
+  assert(
+    variationSize !== undefined &&
+      variationSize.type === "enum" &&
+      variationSize.options.length === 2,
+    `Case 56d: optional enum "Variation Size (Yes/No)" carries dropdown options`,
+  );
+
+  // (e) Per-row metafield writeback target is computed and propagated. This
+  //     is what the UI shows under each input as "Target: jomashop.x" so the
+  //     operator can confirm where the value will land before saving.
+  for (const [name, expectedKey] of [
+    ["Parent SKU", "parent_sku"],
+    ["Product ID Type", "product_id_type"],
+    ["Product ID", "product_id"],
+    ["Country of Origin", "country_of_origin"],
+    ["Fabric Material", "fabric_material"],
+    ["Fabric Material 2", "fabric_material_2"],
+    ["ASIN", "asin"],
+    ["Additional Info", "additional_info"],
+    ["Variation Size (Yes/No)", "variation_size_yes_no"],
+  ] as const) {
+    const f = byName.get(name);
+    assert(
+      f !== undefined && f.metafieldTarget === `jomashop.${expectedKey}`,
+      `Case 56e: "${name}" writes to jomashop.${expectedKey} (got ${f?.metafieldTarget})`,
+    );
+  }
+  // Variant-scoped fields keep their isVariantTargeted=true so the writeback
+  // path uses the variant gid. Apparel Size is the canonical example.
+  const sizeRow = byName.get("Apparel Size");
+  assert(
+    sizeRow !== undefined && sizeRow.isVariantTargeted === true,
+    `Case 56e: "Apparel Size" is flagged variant-scoped`,
+  );
+  // Apparel Size Type (size system) is product-wide.
+  const sizeTypeRow = byName.get("Apparel Size Type");
+  assert(
+    sizeTypeRow !== undefined && sizeTypeRow.isVariantTargeted === false,
+    `Case 56e: "Apparel Size Type" is product-scoped`,
+  );
+}
+
+function runCanonicalApparelAliasFromClothing() {
+  console.log("Case 57: canonical Jomashop category aliases Clothing → Apparel");
+
+  // canonicalJomashopCategory is the single source of truth for the alias.
+  // The UI consults it to decide whether to render "Apparel (alias of
+  // Clothing)" instead of the confusing "not found in /i1/categories:
+  // Clothing" line that appears when /i1 has no Clothing record but does
+  // have Apparel.
+  assert(
+    canonicalJomashopCategory("Clothing") === "Apparel",
+    `Case 57a: "Clothing" canonicalizes to "Apparel"`,
+  );
+  assert(
+    canonicalJomashopCategory("clothing") === "Apparel",
+    `Case 57a: lowercase "clothing" canonicalizes to "Apparel"`,
+  );
+  assert(
+    canonicalJomashopCategory("Apparel") === "Apparel",
+    `Case 57b: "Apparel" passes through unchanged`,
+  );
+  assert(
+    canonicalJomashopCategory("Handbags") === "Handbags",
+    `Case 57b: categories without an alias pass through unchanged`,
+  );
+  // The alias table itself should map every legacy apparel-flavored code to
+  // "Apparel" so the live /i1/Apparel schema is always reachable.
+  assert(
+    CANONICAL_JOMASHOP_CATEGORY_ALIASES.clothing === "Apparel" &&
+      CANONICAL_JOMASHOP_CATEGORY_ALIASES.apparel === "Apparel" &&
+      CANONICAL_JOMASHOP_CATEGORY_ALIASES.rtw === "Apparel",
+    `Case 57c: alias table routes clothing/apparel/rtw → Apparel`,
+  );
+}
+
 runInlineFieldRepairValidation();
 runInlineFieldRepairMetafieldTargets();
 runInlineFieldRepairPostSaveReadiness();
+runInlineFieldRepairAllAttributeProjection();
+runCanonicalApparelAliasFromClothing();
 runResolvedRecordsRequiredForReadiness();
 runBuiltInBrandSeeds();
 await runResolutionAuditHelpers();
