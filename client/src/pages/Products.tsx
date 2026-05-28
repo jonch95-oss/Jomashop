@@ -123,6 +123,18 @@ function pushStateOf(p: MappedProduct): "pushed" | "rejected" | "failed" | "not_
   return (p.push_state as any) || "not_pushed";
 }
 
+/** Final Jomashop category as resolved (or suggested) for filtering/grouping. */
+function finalJomashopCategoryOf(p: MappedProduct): string {
+  const resolved = p.jomashop_resolution?.category_record?.name;
+  if (resolved && resolved.trim() !== "") return resolved;
+  if (p.suggested_category && p.suggested_category.trim() !== "") return p.suggested_category;
+  return p.category || "";
+}
+
+function brandOf(p: MappedProduct): string {
+  return (p.brand || "").trim();
+}
+
 function isReady(p: MappedProduct): boolean {
   // Server-side readiness is the single source of truth. UI just reflects it.
   return p.readiness === "ready";
@@ -187,6 +199,8 @@ export default function Products() {
   const [pushTarget, setPushTarget] = useState<PushTarget | null>(null);
   const [pushResult, setPushResult] = useState<PushResult | null>(null);
   const [filter, setFilter] = useState<ProductFilter>("all");
+  const [brandFilter, setBrandFilter] = useState<string>("");
+  const [jomashopCategoryFilter, setJomashopCategoryFilter] = useState<string>("");
   const [query, setQuery] = useState("");
   const [page, setPage] = useState(0);
   const [overrides, setOverrides] = useState<OverrideFields>({
@@ -195,6 +209,8 @@ export default function Products() {
     sku: "",
     manufacturer_number: "",
   });
+  const [bulkPushing, setBulkPushing] = useState(false);
+  const [bulkProgress, setBulkProgress] = useState<{ done: number; total: number; ok: number; failed: number } | null>(null);
 
   // On mount: try to render from cache (instant). Only refresh from Shopify
   // when the user clicks "Refresh from Shopify". We pass ?limit=all so the
@@ -354,6 +370,56 @@ export default function Products() {
     },
   });
 
+  // Bulk push the currently-filtered products. Scope is exactly what's
+  // visible after brand/category/status/search filters — so operators can
+  // narrow with the filter chips, eyeball the list, then push the whole
+  // visible set. Walks the existing single-push endpoint sequentially so
+  // we don't introduce a new server route and the per-product behaviour
+  // (overrides defaulted from mapping, schema verification, inventory
+  // sync) stays identical to a row-level push.
+  async function runBulkPush() {
+    if (bulkPushing) return;
+    const targets = filteredProducts.filter((p) => !isPushBlocked(p));
+    if (targets.length === 0) return;
+    if (typeof window !== "undefined") {
+      const scopeParts: string[] = [];
+      if (brandFilter) scopeParts.push(`brand="${brandFilter}"`);
+      if (jomashopCategoryFilter) scopeParts.push(`Jomashop category="${jomashopCategoryFilter}"`);
+      const scopeLabel = scopeParts.length > 0 ? ` (${scopeParts.join(", ")})` : "";
+      if (!window.confirm(`Push ${targets.length} product(s) to Jomashop${scopeLabel}?`)) return;
+    }
+    setBulkPushing(true);
+    setBulkProgress({ done: 0, total: targets.length, ok: 0, failed: 0 });
+    let ok = 0;
+    let failed = 0;
+    for (let i = 0; i < targets.length; i += 1) {
+      const p = targets[i];
+      try {
+        const res = await apiRequest("POST", "/api/jomashop/push-product", {
+          confirm: true,
+          pushInventory: true,
+          product: shopifyProductFromMapped(p),
+          overrides: {
+            category: (p.suggested_category || p.category || "").trim(),
+            brand: (p.brand || "").trim(),
+            sku: (p.sku || p.vendor_sku || "").trim(),
+            manufacturer_number: (p.manufacturer_number || p.sku || p.vendor_sku || "").trim(),
+          },
+        });
+        const body = await res.json().catch(() => ({ ok: false }));
+        if (body && body.ok) ok += 1;
+        else failed += 1;
+      } catch {
+        failed += 1;
+      }
+      setBulkProgress({ done: i + 1, total: targets.length, ok, failed });
+    }
+    setBulkPushing(false);
+    queryClient.invalidateQueries({ queryKey: ["/api/products/cache"] });
+    queryClient.refetchQueries({ queryKey: ["/api/products/cache"] });
+    queryClient.invalidateQueries({ queryKey: ["/api/push-statuses"] });
+  }
+
   function openPushModal(productIndex: number, mapped: MappedProduct, variantSku?: string) {
     setPushResult(null);
     setPushTarget({ productIndex, variantSku, mapped });
@@ -381,8 +447,43 @@ export default function Products() {
     !push.isPending &&
     !targetIsSample;
 
-  const filterCounts = useMemo(() => {
+  // Unique brand + final Jomashop category lists derived from the loaded
+  // catalog. Used to populate the new filter dropdowns.
+  const brandOptions = useMemo<string[]>(() => {
+    const set = new Set<string>();
+    for (const p of data?.mapped ?? []) {
+      const b = brandOf(p);
+      if (b) set.add(b);
+    }
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [data]);
+
+  const jomashopCategoryOptions = useMemo<string[]>(() => {
+    const set = new Set<string>();
+    for (const p of data?.mapped ?? []) {
+      const c = finalJomashopCategoryOf(p);
+      if (c) set.add(c);
+    }
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [data]);
+
+  // Apply only the brand + final Jomashop category scope. The status-filter
+  // counts are then derived from this scoped subset so they stay consistent
+  // with what the user actually sees.
+  const scopedProducts = useMemo<MappedProduct[]>(() => {
     const mapped = data?.mapped ?? [];
+    const b = brandFilter.trim().toLowerCase();
+    const c = jomashopCategoryFilter.trim().toLowerCase();
+    if (b === "" && c === "") return mapped;
+    return mapped.filter((p) => {
+      if (b !== "" && brandOf(p).toLowerCase() !== b) return false;
+      if (c !== "" && finalJomashopCategoryOf(p).toLowerCase() !== c) return false;
+      return true;
+    });
+  }, [data, brandFilter, jomashopCategoryFilter]);
+
+  const filterCounts = useMemo(() => {
+    const mapped = scopedProducts;
     const counts = {
       all: mapped.length,
       ready: 0,
@@ -407,12 +508,12 @@ export default function Products() {
       if (!p.is_sample && categoryUnresolved(p)) counts.unresolved_category += 1;
     }
     return counts;
-  }, [data]);
+  }, [scopedProducts]);
 
   // Memoize the filter+search results so each keystroke doesn't re-walk the
   // whole list when there are thousands of products.
   const filteredProducts = useMemo<MappedProduct[]>(() => {
-    const mapped = data?.mapped ?? [];
+    const mapped = scopedProducts;
     const q = query.trim().toLowerCase();
     return mapped.filter((p) => {
       if (q !== "") {
@@ -442,12 +543,12 @@ export default function Products() {
       if (filter === "sample") return p.is_sample === true;
       return true;
     });
-  }, [data, filter, query]);
+  }, [scopedProducts, filter, query]);
 
   // Reset to page 0 whenever filter or search changes.
   useEffect(() => {
     setPage(0);
-  }, [filter, query, data]);
+  }, [filter, query, data, brandFilter, jomashopCategoryFilter]);
 
   const pageCount = Math.max(1, Math.ceil(filteredProducts.length / PAGE_SIZE));
   const pageProducts = useMemo(
@@ -592,6 +693,56 @@ export default function Products() {
                   />
                 </div>
               </div>
+              <div className="min-w-[180px]">
+                <Label className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                  Brand
+                </Label>
+                <select
+                  data-testid="select-filter-brand"
+                  value={brandFilter}
+                  onChange={(e) => setBrandFilter(e.target.value)}
+                  className="mt-1 flex h-8 w-full rounded-md border border-input bg-background px-2 text-xs"
+                >
+                  <option value="">All brands</option>
+                  {brandOptions.map((b) => (
+                    <option key={b} value={b}>
+                      {b}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="min-w-[180px]">
+                <Label className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                  Final Jomashop category
+                </Label>
+                <select
+                  data-testid="select-filter-jomashop-category"
+                  value={jomashopCategoryFilter}
+                  onChange={(e) => setJomashopCategoryFilter(e.target.value)}
+                  className="mt-1 flex h-8 w-full rounded-md border border-input bg-background px-2 text-xs"
+                >
+                  <option value="">All categories</option>
+                  {jomashopCategoryOptions.map((c) => (
+                    <option key={c} value={c}>
+                      {c}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              {(brandFilter || jomashopCategoryFilter) && (
+                <Button
+                  data-testid="button-clear-brand-category-filters"
+                  variant="ghost"
+                  size="sm"
+                  className="h-8 text-[11px]"
+                  onClick={() => {
+                    setBrandFilter("");
+                    setJomashopCategoryFilter("");
+                  }}
+                >
+                  Clear
+                </Button>
+              )}
               <div className="text-[11px] text-muted-foreground" data-testid="text-filtered-count">
                 {(() => {
                   // `filterCounts.all` reflects what's loaded in the
@@ -608,6 +759,54 @@ export default function Products() {
                   return `${shown} match${shown === 1 ? "" : "es"} of ${loaded} total`;
                 })()}
               </div>
+            </div>
+
+            <div
+              data-testid="bulk-push-controls"
+              className="mt-2 flex flex-wrap items-center gap-2 rounded border border-dashed border-border bg-card/30 p-2 text-xs"
+            >
+              <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                Bulk push
+              </span>
+              {(() => {
+                const eligible = filteredProducts.filter((p) => !isPushBlocked(p)).length;
+                return (
+                  <span className="text-[11px] text-muted-foreground" data-testid="text-bulk-push-scope">
+                    {eligible} of {filteredProducts.length} filtered product(s) ready to push
+                  </span>
+                );
+              })()}
+              <Button
+                data-testid="button-bulk-push-filtered"
+                size="sm"
+                variant="default"
+                className="ml-auto h-7 text-[11px]"
+                onClick={() => runBulkPush()}
+                disabled={
+                  bulkPushing ||
+                  filteredProducts.filter((p) => !isPushBlocked(p)).length === 0
+                }
+                title="Push every ready product matching the current brand, category, status, and search filters."
+              >
+                {bulkPushing ? (
+                  <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Send className="mr-2 h-3.5 w-3.5" />
+                )}
+                {bulkPushing && bulkProgress
+                  ? `Pushing ${bulkProgress.done}/${bulkProgress.total}…`
+                  : `Push filtered (${filteredProducts.filter((p) => !isPushBlocked(p)).length})`}
+              </Button>
+              {bulkProgress && !bulkPushing && (
+                <span
+                  data-testid="text-bulk-push-result"
+                  className={`text-[11px] ${
+                    bulkProgress.failed === 0 ? "text-emerald-500" : "text-amber-500"
+                  }`}
+                >
+                  Bulk push: {bulkProgress.ok} ok / {bulkProgress.failed} failed
+                </span>
+              )}
             </div>
 
             <div
