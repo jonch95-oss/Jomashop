@@ -474,6 +474,13 @@ export function registerInlineFieldRepairRoutes(app: Express): void {
     for (const d of descriptors || []) {
       if (d && typeof d.field === "string") descriptorByField.set(d.field, d);
     }
+    descriptorByField.set("Commercial Discount", {
+      field: "Commercial Discount",
+      required: true,
+      type: "number",
+      min_value: 0,
+      max_value: 100,
+    } as SchemaPropertyDescriptor);
 
     // First pass — collect validation errors so we never write a partial set
     // of values when validation fails on a sibling field.
@@ -707,7 +714,10 @@ export function registerInlineFieldRepairRoutes(app: Express): void {
           missing_required: missingRequired,
           missing_top_level: missingTopLevel,
           invalid_enums: remappedInvalidEnums,
-          push_ready: enriched.readiness === "ready",
+          push_ready:
+            missingRequired.length === 0 &&
+            missingTopLevel.length === 0 &&
+            remappedInvalidEnums.length === 0,
           product: remappedCompact,
         };
       }
@@ -720,8 +730,6 @@ export function registerInlineFieldRepairRoutes(app: Express): void {
     // without paying for a full /api/products/refresh. If we have no
     // remapped row (live fetch failed) we fall back to clearing the cache so
     // the next refresh re-derives.
-    let cacheUpdated = false;
-    let cacheCleared = false;
     try {
       if (remappedCompact) {
         const existing = storage.getProductCache(conn.shopDomain);
@@ -748,21 +756,17 @@ export function registerInlineFieldRepairRoutes(app: Express): void {
                 payloadJson: JSON.stringify(payload),
                 fetchedAt: Date.now(),
               });
-              cacheUpdated = true;
             } else {
               // Product wasn't in the cache slice — clear so next refresh
               // picks up the new values rather than serving stale rows.
               storage.clearProductCache(conn.shopDomain);
-              cacheCleared = true;
             }
           } else {
             storage.clearProductCache(conn.shopDomain);
-            cacheCleared = true;
           }
         }
       } else {
         storage.clearProductCache(conn.shopDomain);
-        cacheCleared = true;
       }
     } catch {
       // non-fatal — the writeback already succeeded.
@@ -791,13 +795,10 @@ export function registerInlineFieldRepairRoutes(app: Express): void {
       category: canonical,
       shopDomain: conn.shopDomain,
       results,
-      cacheInvalidatedFor: cacheCleared ? conn.shopDomain : null,
-      cacheUpdatedFor: cacheUpdated ? conn.shopDomain : null,
+      cacheInvalidatedFor: conn.shopDomain,
       postRepair,
       note: allOk
-        ? cacheUpdated
-          ? "Applied. The cached product row was updated; missing fields and push-ready state should refresh on the product card."
-          : "Applied. The product cache was cleared; click Refresh from Shopify to recompute readiness across the catalog."
+        ? "Applied. The product cache was invalidated; click Refresh from Shopify to recompute readiness across the catalog."
         : "Some metafield writes failed. See results for details.",
     });
   });

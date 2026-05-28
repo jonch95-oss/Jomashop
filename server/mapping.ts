@@ -102,6 +102,8 @@ export type MappedProduct = {
    *  (key / label / definition name) that resolveMsrp found. */
   msrp_metafield_key: string | null;
   commercial_discount: number;
+  commercial_discount_source: "metafield" | "missing" | "invalid";
+  commercial_discount_missing: boolean;
   jomashop_price: number | null;
   images: string[];
   properties: Record<string, string | number | boolean | null>;
@@ -523,6 +525,7 @@ export function findParentSkuSource(
 }
 
 const DISCOUNT_KEY_CANDIDATES = [
+  "jomashop.commercial_discount",
   "custom.commercial_discount",
   "commercial_discount",
   "commercialDiscount",
@@ -2066,15 +2069,6 @@ export function mapShopifyToJomashop(
           if (!value && sizeOpt && firstVariant) {
             value = (firstVariant[sizeOpt] as string | null) || undefined;
           }
-          if (!value && sizeOpt) {
-            for (const v of product.variants || []) {
-              const candidate = (v as unknown as Record<string, unknown>)[sizeOpt];
-              if (typeof candidate === "string" && candidate.trim() !== "") {
-                value = candidate.trim();
-                break;
-              }
-            }
-          }
           break;
         case "size_system": {
           const raw =
@@ -2176,9 +2170,22 @@ export function mapShopifyToJomashop(
   // Commercial discount: Jomashop price = Shopify price * (1 - discount).
   const discountRaw = readCommercialDiscountRaw(product);
   const commercialDiscount = normalizeCommercialDiscount(discountRaw);
+  const discountRawTrimmed = discountRaw === undefined ? "" : String(discountRaw).trim();
+  const commercialDiscountMissing = discountRawTrimmed === "" || commercialDiscount <= 0;
+  const commercialDiscountSource: "metafield" | "missing" | "invalid" =
+    discountRawTrimmed === ""
+      ? "missing"
+      : commercialDiscount <= 0
+        ? "invalid"
+        : "metafield";
   if (discountRaw !== undefined && commercialDiscount === 0 && String(discountRaw).trim() !== "" && String(discountRaw).trim() !== "0") {
     warnings.push(
       `Commercial Discount value "${discountRaw}" could not be parsed — treating as 0%.`,
+    );
+  }
+  if (commercialDiscountMissing) {
+    warnings.push(
+      "Missing Commercial Discount — add jomashop.commercial_discount in Shopify before pushing to Jomashop.",
     );
   }
 
@@ -2241,6 +2248,9 @@ export function mapShopifyToJomashop(
   if (!manufacturerNumber || String(manufacturerNumber).trim() === "") {
     missingTopLevelFields.push("manufacturer_number");
   }
+  if (commercialDiscountMissing) {
+    missingTopLevelFields.push("commercial_discount");
+  }
 
   const ambiguousCategory = isAmbiguousCategoryCode(rawCategory);
   if (ambiguousCategory) {
@@ -2298,6 +2308,8 @@ export function mapShopifyToJomashop(
     msrp_source: msrpResolution.source,
     msrp_metafield_key: msrpResolution.metafieldKey,
     commercial_discount: commercialDiscount,
+    commercial_discount_source: commercialDiscountSource,
+    commercial_discount_missing: commercialDiscountMissing,
     jomashop_price: computeJomashopPrice(shopifyPrice, commercialDiscount),
     images: (product.images || []).map((i) => i.src).filter(Boolean),
     properties,

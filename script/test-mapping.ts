@@ -6582,6 +6582,7 @@ function runInlineRepairResponseShape() {
       { namespace: "jomashop", key: "color", value: "Navy" },
       { namespace: "jomashop", key: "gender", value: "Men" },
       { namespace: "jomashop", key: "article", value: "Shirt" },
+      { namespace: "jomashop", key: "commercial_discount", value: "40" },
     ],
     variants: [
       { id: "v-66", sku: "SKU-66", price: "100.00", inventory_quantity: 5 },

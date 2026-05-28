@@ -60,24 +60,24 @@ export type EditableField = (typeof EDITABLE_FIELDS)[number];
 // Shopify metafield namespace+key each editable field maps to. The Shopify
 // Admin metafieldsSet mutation upserts by (ownerId, namespace, key) so we
 // pick a single canonical namespace per field. Existing metafields under
-// "luxe" continue to work via the read path; new writes consolidate under
-// "custom".
+// "luxe"/"custom" continue to work via the read path; new writes consolidate
+// under "jomashop" so Shopify remains the source of truth for Jomashop data.
 const METAFIELD_TARGET: Record<EditableField, { namespace: string; key: string; type: string } | null> = {
   brand: null, // top-level: written via product update (vendor), not metafield
   category: null, // top-level: written via product update (productType)
-  color: { namespace: "custom", key: "color", type: "single_line_text_field" },
-  material: { namespace: "custom", key: "material", type: "single_line_text_field" },
-  gender: { namespace: "custom", key: "gender", type: "single_line_text_field" },
-  size: { namespace: "custom", key: "size", type: "single_line_text_field" },
-  size_system: { namespace: "custom", key: "size_system", type: "single_line_text_field" },
-  country_of_origin: { namespace: "custom", key: "country_of_origin", type: "single_line_text_field" },
-  manufacturer_number: { namespace: "custom", key: "ff_designer_id", type: "single_line_text_field" },
-  ff_sku: { namespace: "custom", key: "ff_sku", type: "single_line_text_field" },
-  ff_designer_id: { namespace: "custom", key: "ff_designer_id", type: "single_line_text_field" },
-  upc: { namespace: "custom", key: "upc", type: "single_line_text_field" },
-  composition: { namespace: "custom", key: "composition", type: "single_line_text_field" },
-  collection: { namespace: "custom", key: "collection", type: "single_line_text_field" },
-  season: { namespace: "custom", key: "season", type: "single_line_text_field" },
+  color: { namespace: "jomashop", key: "color", type: "single_line_text_field" },
+  material: { namespace: "jomashop", key: "material", type: "single_line_text_field" },
+  gender: { namespace: "jomashop", key: "gender", type: "single_line_text_field" },
+  size: { namespace: "jomashop", key: "size", type: "single_line_text_field" },
+  size_system: { namespace: "jomashop", key: "size_system", type: "single_line_text_field" },
+  country_of_origin: { namespace: "jomashop", key: "country_of_origin", type: "single_line_text_field" },
+  manufacturer_number: { namespace: "jomashop", key: "ff_designer_id", type: "single_line_text_field" },
+  ff_sku: { namespace: "jomashop", key: "ff_sku", type: "single_line_text_field" },
+  ff_designer_id: { namespace: "jomashop", key: "ff_designer_id", type: "single_line_text_field" },
+  upc: { namespace: "jomashop", key: "upc", type: "single_line_text_field" },
+  composition: { namespace: "jomashop", key: "composition", type: "single_line_text_field" },
+  collection: { namespace: "jomashop", key: "collection", type: "single_line_text_field" },
+  season: { namespace: "jomashop", key: "season", type: "single_line_text_field" },
 };
 
 const IDENTIFIER_COLUMNS = [

@@ -84,6 +84,8 @@ export type MappedProduct = {
   /** When msrp_source === "metafield", the matched metafield key/label. */
   msrp_metafield_key?: string | null;
   commercial_discount: number;
+  commercial_discount_source?: "metafield" | "missing" | "invalid" | string;
+  commercial_discount_missing?: boolean;
   jomashop_price: number | null;
   images: string[];
   properties: Record<string, string | number | boolean | null>;
