@@ -29,9 +29,12 @@ import { logMemory } from "./memlog";
 import {
   MAX_IMPORT_ROWS,
   rejectIfTooManyRows,
+  releaseLock,
+  withLockOr409,
 } from "./stability";
 
 const MAX_BULK_REPAIR_SESSIONS = 8;
+const MAX_MISSING_EXPORT_ROWS = 12000;
 
 // ---------- Editable column model ----------
 
@@ -181,17 +184,27 @@ function exportRowFromMapped(
   };
 }
 
-async function buildMissingExportRows(): Promise<{
+async function buildMissingExportRows(opts: {
+  categoryFilter?: string;
+  brandFilter?: string;
+  rowLimit?: number;
+} = {}): Promise<{
   rows: ExportRow[];
   shopDomain: string | null;
   fetchedCount: number;
   pageCount: number;
   hasMore: boolean;
+  truncated: boolean;
 }> {
   const conn = getActiveShopifyConnection();
   if (!conn) {
-    return { rows: [], shopDomain: null, fetchedCount: 0, pageCount: 0, hasMore: false };
+    return { rows: [], shopDomain: null, fetchedCount: 0, pageCount: 0, hasMore: false, truncated: false };
   }
+  const categoryFilter = (opts.categoryFilter ?? "").trim().toLowerCase();
+  const brandFilter = (opts.brandFilter ?? "").trim().toLowerCase();
+  const rowLimit = typeof opts.rowLimit === "number" && opts.rowLimit > 0
+    ? opts.rowLimit
+    : MAX_MISSING_EXPORT_ROWS;
 
   // Resolve schemas for the legacy three-category bucket bulk repair was
   // built around (live preferred). Done once up-front so each streamed page
@@ -212,14 +225,25 @@ async function buildMissingExportRows(): Promise<{
   // thousands of products.
   const rows: ExportRow[] = [];
   let fetchedCount = 0;
-  logMemory("bulk-repair.export.start", { shopDomain: conn.shopDomain });
+  let truncated = false;
+  logMemory("bulk-repair.export.start", { shopDomain: conn.shopDomain, categoryFilter, brandFilter, rowLimit });
   const stream = await streamShopifyProducts((pageProducts, pageIndex) => {
     for (const product of pageProducts) {
       fetchedCount += 1;
+      if (rows.length > rowLimit) {
+        truncated = true;
+        return false;
+      }
       if (isSampleProduct(product)) continue;
       const tmp = mapShopifyToJomashop(product, []);
       const props = schemas[tmp.category] ?? [];
       const mapped = mapShopifyToJomashop(product, props);
+      if (categoryFilter && String(mapped.category || "").toLowerCase() !== categoryFilter) {
+        continue;
+      }
+      if (brandFilter && String(mapped.brand || "").toLowerCase() !== brandFilter) {
+        continue;
+      }
       const missing = [
         ...(mapped.missing_top_level ?? []),
         ...(mapped.missing_required ?? []),
@@ -227,9 +251,17 @@ async function buildMissingExportRows(): Promise<{
       if (missing.length === 0) continue;
       if (mapped.variants.length === 0) {
         rows.push(exportRowFromMapped(conn.shopDomain, mapped, null));
+        if (rows.length > rowLimit) {
+          truncated = true;
+          return false;
+        }
       } else {
         for (const v of mapped.variants) {
           rows.push(exportRowFromMapped(conn.shopDomain, mapped, v.vendor_sku));
+          if (rows.length > rowLimit) {
+            truncated = true;
+            return false;
+          }
         }
       }
     }
@@ -239,15 +271,16 @@ async function buildMissingExportRows(): Promise<{
   }, { pageSize: 100 });
 
   if (!stream.ok) {
-    return { rows: [], shopDomain: conn.shopDomain, fetchedCount: 0, pageCount: 0, hasMore: false };
+    return { rows: [], shopDomain: conn.shopDomain, fetchedCount: 0, pageCount: 0, hasMore: false, truncated: false };
   }
-  logMemory("bulk-repair.export.done", { rows: rows.length, fetchedCount: stream.totalFetched });
+  logMemory("bulk-repair.export.done", { rows: rows.length, fetchedCount: stream.totalFetched, truncated });
   return {
     rows,
     shopDomain: conn.shopDomain,
     fetchedCount: stream.totalFetched,
     pageCount: stream.pageCount,
     hasMore: stream.hasMore,
+    truncated,
   };
 }
 
@@ -749,13 +782,32 @@ export function registerBulkRepairRoutes(app: Express): void {
   });
 
   // ---------- Export ----------
-  app.get("/api/products/missing/export.xlsx", async (_req, res) => {
+  app.get("/api/products/missing/export.xlsx", async (req, res) => {
+    const categoryFilter = typeof req.query.category === "string" ? req.query.category.trim() : "";
+    const brandFilter = typeof req.query.brand === "string" ? req.query.brand.trim() : "";
+    if (!withLockOr409(res, "bulkRepair.export")) return;
     try {
-      const { rows, shopDomain, fetchedCount, pageCount } = await buildMissingExportRows();
+      const { rows, shopDomain, fetchedCount, pageCount, truncated } = await buildMissingExportRows({
+        categoryFilter,
+        brandFilter,
+        rowLimit: MAX_MISSING_EXPORT_ROWS,
+      });
       if (!shopDomain) {
         return res.status(503).json({
           ok: false,
           error: "No connected Shopify store with an access token. Complete OAuth install first.",
+        });
+      }
+      if (rows.length > MAX_MISSING_EXPORT_ROWS || truncated) {
+        return res.status(413).json({
+          ok: false,
+          error:
+            `Missing-field export would exceed ${MAX_MISSING_EXPORT_ROWS} rows. ` +
+            `Filter by Jomashop category (?category=Shoes|Handbags|Clothing) or brand (?brand=...) and retry.`,
+          rowCount: rows.length,
+          maxExportRows: MAX_MISSING_EXPORT_ROWS,
+          categoryFilter: categoryFilter || null,
+          brandFilter: brandFilter || null,
         });
       }
       const buf = await buildWorkbook(rows);
@@ -771,10 +823,12 @@ export function registerBulkRepairRoutes(app: Express): void {
       res.setHeader("X-Export-Shop", shopDomain);
       res.setHeader("X-Export-Products-Fetched", String(fetchedCount));
       res.setHeader("X-Export-Pages", String(pageCount));
+      if (categoryFilter) res.setHeader("X-Export-Category", categoryFilter);
+      if (brandFilter) res.setHeader("X-Export-Brand", brandFilter);
       storage.appendLog({
         level: "info",
         message: `Exported ${rows.length} missing-field row(s) from ${shopDomain}`,
-        detailsJson: JSON.stringify({ fetchedCount, pageCount }),
+        detailsJson: JSON.stringify({ fetchedCount, pageCount, categoryFilter: categoryFilter || null, brandFilter: brandFilter || null }),
         createdAt: Date.now(),
       });
       res.end(buf);
@@ -787,6 +841,8 @@ export function registerBulkRepairRoutes(app: Express): void {
         createdAt: Date.now(),
       });
       res.status(500).json({ ok: false, error: msg });
+    } finally {
+      releaseLock("bulkRepair.export");
     }
   });
 
@@ -800,7 +856,9 @@ export function registerBulkRepairRoutes(app: Express): void {
       if (!file) {
         return res.status(400).json({ ok: false, error: "Missing uploaded file." });
       }
+      if (!withLockOr409(res, "import.bulk-repair")) return;
       try {
+        logMemory("import.bulk-repair.start", { bytes: file.size });
         const { rows, headerErrors } = await parseUpload(file.buffer);
         if (rejectIfTooManyRows(res, rows.length, MAX_IMPORT_ROWS)) {
           return;
@@ -870,7 +928,10 @@ export function registerBulkRepairRoutes(app: Express): void {
         });
       } catch (err) {
         const msg = (err as Error).message;
+        logMemory("import.bulk-repair.failed", { message: msg });
         res.status(400).json({ ok: false, error: `Could not parse XLSX: ${msg}` });
+      } finally {
+        releaseLock("import.bulk-repair");
       }
     },
   );

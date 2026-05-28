@@ -2066,6 +2066,15 @@ export function mapShopifyToJomashop(
           if (!value && sizeOpt && firstVariant) {
             value = (firstVariant[sizeOpt] as string | null) || undefined;
           }
+          if (!value && sizeOpt) {
+            for (const v of product.variants || []) {
+              const candidate = (v as unknown as Record<string, unknown>)[sizeOpt];
+              if (typeof candidate === "string" && candidate.trim() !== "") {
+                value = candidate.trim();
+                break;
+              }
+            }
+          }
           break;
         case "size_system": {
           const raw =

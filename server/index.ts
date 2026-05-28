@@ -144,8 +144,14 @@ app.use((req, res, next) => {
       return;
     }
 
-    const status = err?.status || err?.statusCode || 500;
-    const message = err?.message || "Internal Server Error";
+    const isBodyTooLarge =
+      err?.type === "entity.too.large" ||
+      err?.status === 413 ||
+      err?.statusCode === 413;
+    const status = isBodyTooLarge ? 413 : err?.status || err?.statusCode || 500;
+    const message = isBodyTooLarge
+      ? "Request body exceeds the server limit. Reduce the payload size and retry."
+      : err?.message || "Internal Server Error";
 
     // Always respond with JSON for API paths so frontend code doesn't
     // accidentally render an HTML error page into its JSON state.

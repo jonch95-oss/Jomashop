@@ -59,11 +59,14 @@ import {
 } from "./enum_mapping";
 import { registerResolutionAuditRoutes } from "./resolution_audit";
 import { registerJomashopMappingExcelRoutes } from "./jomashop_mapping_excel";
-import { registerJomashopProductFieldExcelRoutes } from "./jomashop_product_field_excel";
+import {
+  productFieldSessionStats,
+  registerJomashopProductFieldExcelRoutes,
+} from "./jomashop_product_field_excel";
 import { registerInlineFieldRepairRoutes } from "./inline_field_repair";
 import { pushInventoryUpdate, registerWebhookRoutes, registerShopifyWebhooks } from "./webhooks";
-import { logMemory } from "./memlog";
-import { releaseLock, withLockOr409 } from "./stability";
+import { heapMb, logMemory, rssMb } from "./memlog";
+import { lockStatus, releaseLock, withLockOr409 } from "./stability";
 import { compactifyMapped, type CompactMappedProduct } from "./compact_mapped";
 
 // -------------------- helpers --------------------
@@ -302,11 +305,6 @@ function verifyShopifyHmac(query: Record<string, string | string[] | undefined>)
 export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
   refreshCredentialStatus();
 
-  // ---------- Health ----------
-  app.get("/api/health", (_req, res) => {
-    res.json({ ok: true, time: new Date().toISOString() });
-  });
-
   // ---------- Config status (never exposes raw secrets) ----------
   app.get("/api/config/status", (req, res) => {
     refreshCredentialStatus();
@@ -336,6 +334,53 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         sessionActive: Boolean(currentToken()),
       },
       credentialStatuses: storage.listCredentialStatuses(),
+    });
+  });
+
+  // ---------- Diagnostics (admin-token protected; health stays public/lightweight) ----------
+  app.get("/api/diagnostics/status", (_req, res) => {
+    const stores = storage.listStores();
+    const connectedStore = stores.find((s) => s.oauthStatus === "connected");
+    const cache = connectedStore ? storage.getProductCache(connectedStore.shopDomain) : undefined;
+    const locks = [
+      "products.refresh",
+      "productFieldExport",
+      "productFieldSummary",
+      "import.product-fields",
+      "bulkRepair.export",
+      "import.bulk-repair",
+    ];
+    res.json({
+      ok: true,
+      time: new Date().toISOString(),
+      env: process.env.NODE_ENV || "development",
+      memory: {
+        rssMb: rssMb(),
+        heapMb: heapMb(),
+      },
+      locks: locks.map((name) => ({ name, ...lockStatus(name) })),
+      sessions: {
+        productFields: productFieldSessionStats(),
+      },
+      shopify: {
+        activeConnection: Boolean(getActiveShopifyConnection()),
+        connectedStore: connectedStore?.shopDomain ?? null,
+        storeCount: stores.length,
+      },
+      cache: cache
+        ? {
+            shopDomain: connectedStore?.shopDomain ?? null,
+            fetchedCount: cache.fetchedCount,
+            pageCount: cache.pageCount,
+            hasMore: cache.hasMore,
+            fetchedAt: cache.fetchedAt,
+            payloadBytes: Buffer.byteLength(cache.payloadJson, "utf8"),
+          }
+        : null,
+      jomashop: {
+        configured: jomashopConfigured(),
+        sessionActive: Boolean(currentToken()),
+      },
     });
   });
 
@@ -1451,6 +1496,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     // requests don't both pull the full Shopify catalog into memory.
     if (!withLockOr409(res, "products.refresh")) return;
     heavyLockHeld = true;
+    try {
     let preview;
     try {
       logMemory("preview-products.start", { forceRefresh, maxProducts, pageSize });
@@ -1544,7 +1590,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       lastRefreshedAt: Date.now(),
     });
     logMemory("preview-products.responded", { sent: sliced.length, totalCount });
-    if (heavyLockHeld) releaseLock("products.refresh");
+    } finally {
+      if (heavyLockHeld) releaseLock("products.refresh");
+    }
   });
 
   // Read-only fast path: return a paginated slice of the cached preview

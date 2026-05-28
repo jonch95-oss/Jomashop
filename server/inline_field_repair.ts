@@ -707,10 +707,7 @@ export function registerInlineFieldRepairRoutes(app: Express): void {
           missing_required: missingRequired,
           missing_top_level: missingTopLevel,
           invalid_enums: remappedInvalidEnums,
-          push_ready:
-            missingRequired.length === 0 &&
-            missingTopLevel.length === 0 &&
-            remappedInvalidEnums.length === 0,
+          push_ready: enriched.readiness === "ready",
           product: remappedCompact,
         };
       }
@@ -723,6 +720,8 @@ export function registerInlineFieldRepairRoutes(app: Express): void {
     // without paying for a full /api/products/refresh. If we have no
     // remapped row (live fetch failed) we fall back to clearing the cache so
     // the next refresh re-derives.
+    let cacheUpdated = false;
+    let cacheCleared = false;
     try {
       if (remappedCompact) {
         const existing = storage.getProductCache(conn.shopDomain);
@@ -749,17 +748,21 @@ export function registerInlineFieldRepairRoutes(app: Express): void {
                 payloadJson: JSON.stringify(payload),
                 fetchedAt: Date.now(),
               });
+              cacheUpdated = true;
             } else {
               // Product wasn't in the cache slice — clear so next refresh
               // picks up the new values rather than serving stale rows.
               storage.clearProductCache(conn.shopDomain);
+              cacheCleared = true;
             }
           } else {
             storage.clearProductCache(conn.shopDomain);
+            cacheCleared = true;
           }
         }
       } else {
         storage.clearProductCache(conn.shopDomain);
+        cacheCleared = true;
       }
     } catch {
       // non-fatal — the writeback already succeeded.
@@ -788,10 +791,13 @@ export function registerInlineFieldRepairRoutes(app: Express): void {
       category: canonical,
       shopDomain: conn.shopDomain,
       results,
-      cacheInvalidatedFor: conn.shopDomain,
+      cacheInvalidatedFor: cacheCleared ? conn.shopDomain : null,
+      cacheUpdatedFor: cacheUpdated ? conn.shopDomain : null,
       postRepair,
       note: allOk
-        ? "Applied. The product cache was invalidated; click Refresh from Shopify to recompute readiness across the catalog."
+        ? cacheUpdated
+          ? "Applied. The cached product row was updated; missing fields and push-ready state should refresh on the product card."
+          : "Applied. The product cache was cleared; click Refresh from Shopify to recompute readiness across the catalog."
         : "Some metafield writes failed. See results for details.",
     });
   });
