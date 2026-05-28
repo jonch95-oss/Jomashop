@@ -56,7 +56,7 @@ export default function Inventory() {
     <>
       <PageHeader
         title="Inventory"
-        description="Pushed-SKU inventory reconciliation. Only products already live on Jomashop are eligible; zero quantity sends status=out_of_stock via PUT /v1/inventory/:sku."
+        description="Pushed-SKU inventory reconciliation. Zero total Shopify quantity sends Jomashop out_of_stock and drafts the Shopify product; adding quantity back reactivates it."
         actions={
           <div className="flex flex-wrap gap-2">
             <Button
@@ -77,7 +77,7 @@ export default function Inventory() {
       />
 
       <div className="mb-4 rounded-md border border-border bg-card/40 px-4 py-2.5 text-xs text-muted-foreground">
-        {q.data.note} Inventory updates use Jomashop's documented fields: quantity, price, map_price, and status.
+        {q.data.note} Inventory updates use Jomashop's documented fields: quantity, price, map_price, and status. Shopify visibility follows stock automatically for pushed products.
       </div>
 
       {syncResult && (

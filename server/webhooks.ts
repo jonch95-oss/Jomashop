@@ -75,6 +75,119 @@ function inventoryStatusFor(qty: number | undefined | null): "active" | "out_of_
   return "active";
 }
 
+function numericShopifyId(raw: unknown): string | null {
+  if (raw === null || raw === undefined) return null;
+  const m = String(raw).match(/(\d+)$/);
+  return m ? m[1] : null;
+}
+
+async function syncShopifyProductVisibilityForInventory(opts: {
+  shopDomain: string | null;
+  shopifyProductId: string | number | null | undefined;
+  fallbackQuantity: number | null;
+}): Promise<{ ok: boolean; desiredStatus?: "ACTIVE" | "DRAFT"; currentStatus?: string; totalQuantity?: number; message: string; error?: string }> {
+  const productId = numericShopifyId(opts.shopifyProductId);
+  if (!productId) {
+    return { ok: false, message: "No Shopify product id on pushed SKU; visibility unchanged." };
+  }
+  const conn = getActiveShopifyConnection();
+  if (!conn) {
+    return { ok: false, message: "No Shopify connection; visibility unchanged." };
+  }
+  if (opts.shopDomain && conn.shopDomain !== opts.shopDomain) {
+    return { ok: false, message: `Active Shopify connection is ${conn.shopDomain}, not ${opts.shopDomain}; visibility unchanged.` };
+  }
+
+  let totalQuantity = opts.fallbackQuantity ?? 0;
+  let currentStatus = "";
+  try {
+    const productResp = await fetch(
+      `https://${conn.shopDomain}/admin/api/2024-10/products/${encodeURIComponent(productId)}.json?fields=id,status,variants`,
+      { headers: { "X-Shopify-Access-Token": conn.accessToken } },
+    );
+    if (productResp.ok) {
+      const body = (await productResp.json()) as {
+        product?: { status?: string; variants?: Array<{ inventory_quantity?: number | null }> };
+      };
+      currentStatus = String(body.product?.status || "");
+      const variants = Array.isArray(body.product?.variants) ? body.product!.variants! : [];
+      if (variants.length > 0) {
+        totalQuantity = variants.reduce((sum, v) => {
+          const q = typeof v.inventory_quantity === "number" ? v.inventory_quantity : 0;
+          return sum + q;
+        }, 0);
+      }
+    }
+  } catch {
+    // Fall back to the webhook/manual-sync quantity for a best-effort status.
+  }
+
+  const desiredStatus: "ACTIVE" | "DRAFT" = totalQuantity > 0 ? "ACTIVE" : "DRAFT";
+  const normalizedCurrent = currentStatus.toUpperCase();
+  if (normalizedCurrent === desiredStatus) {
+    return {
+      ok: true,
+      desiredStatus,
+      currentStatus,
+      totalQuantity,
+      message: `Shopify product already ${desiredStatus.toLowerCase()} (total qty=${totalQuantity}).`,
+    };
+  }
+  if (normalizedCurrent === "ARCHIVED") {
+    return {
+      ok: false,
+      desiredStatus,
+      currentStatus,
+      totalQuantity,
+      message: "Shopify product is archived; visibility unchanged.",
+    };
+  }
+
+  const gid = `gid://shopify/Product/${productId}`;
+  const mutation = `
+    mutation UpdateProductStatus($input: ProductInput!) {
+      productUpdate(input: $input) {
+        product { id status }
+        userErrors { field message }
+      }
+    }
+  `;
+  try {
+    const resp = await fetch(`https://${conn.shopDomain}/admin/api/2024-10/graphql.json`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": conn.accessToken,
+      },
+      body: JSON.stringify({ query: mutation, variables: { input: { id: gid, status: desiredStatus } } }),
+    });
+    const body = (await resp.json().catch(() => null)) as
+      | { errors?: Array<{ message: string }>; data?: { productUpdate?: { userErrors?: Array<{ message: string }>; product?: { status?: string } } } }
+      | null;
+    const userErrors = body?.data?.productUpdate?.userErrors ?? [];
+    if (!resp.ok || (body?.errors && body.errors.length > 0) || userErrors.length > 0) {
+      const error =
+        body?.errors?.map((e) => e.message).join("; ") ||
+        userErrors.map((e) => e.message).join("; ") ||
+        `Shopify productUpdate failed (${resp.status})`;
+      return { ok: false, desiredStatus, currentStatus, totalQuantity, message: error, error };
+    }
+    return {
+      ok: true,
+      desiredStatus,
+      currentStatus: body?.data?.productUpdate?.product?.status ?? desiredStatus,
+      totalQuantity,
+      message:
+        desiredStatus === "DRAFT"
+          ? `Shopify product drafted because total quantity is ${totalQuantity}.`
+          : `Shopify product reactivated because total quantity is ${totalQuantity}.`,
+    };
+  } catch (err) {
+    const error = (err as Error).message;
+    return { ok: false, desiredStatus, currentStatus, totalQuantity, message: error, error };
+  }
+}
+
 export async function pushInventoryUpdate(opts: {
   shopifySku: string;
   quantity: number | null;
@@ -94,22 +207,28 @@ export async function pushInventoryUpdate(opts: {
       message: `SKU ${shopifySku} has not been pushed to Jomashop yet — skipping inventory update`,
     };
   }
-  if (!jomashopConfigured()) {
-    return {
-      status: "skipped",
-      message: "Jomashop credentials not configured — cannot apply inventory webhook",
-    };
-  }
   const stored = lookup.lastPayloadJson
     ? (JSON.parse(lookup.lastPayloadJson) as PushStatusPayload)
     : null;
   const variantSnapshot = stored?.variants?.find((v) => v.vendor_sku === shopifySku);
+  const qty = quantity ?? variantSnapshot?.quantity ?? 0;
+  const visibility = await syncShopifyProductVisibilityForInventory({
+    shopDomain: lookup.shopDomain,
+    shopifyProductId: lookup.shopifyProductId,
+    fallbackQuantity: qty,
+  });
+  if (!jomashopConfigured()) {
+    return {
+      status: "skipped",
+      message: "Jomashop credentials not configured — cannot apply inventory webhook",
+      details: { shopifyVisibility: visibility },
+    };
+  }
   const price =
     variantSnapshot?.jomashop_price ??
     variantSnapshot?.price ??
     stored?.price ??
     null;
-  const qty = quantity ?? variantSnapshot?.quantity ?? 0;
   const status = inventoryStatusFor(qty);
   const body: Record<string, unknown> = { status, quantity: qty };
   if (price !== null && price !== undefined && Number.isFinite(Number(price))) {
@@ -147,9 +266,9 @@ export async function pushInventoryUpdate(opts: {
   return {
     status: resp.ok ? "applied" : "rejected",
     message: resp.ok
-      ? `PUT /v1/inventory/${targetSku} ok (qty=${qty}, status=${status})`
+      ? `PUT /v1/inventory/${targetSku} ok (qty=${qty}, status=${status}); ${visibility.message}`
       : `PUT /v1/inventory/${targetSku} failed (${resp.status}): ${resp.error ?? "unknown"}`,
-    details: { topic, body, response: resp.data ?? resp.error },
+    details: { topic, body, response: resp.data ?? resp.error, shopifyVisibility: visibility },
   };
 }
 
