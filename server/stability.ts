@@ -3,8 +3,8 @@
 // here is intentionally tiny and dependency-free so the hardening surface is
 // easy to audit and so importing it is cheap.
 
-import type { Response } from "express";
-import { logMemory } from "./memlog";
+import type { Request, Response, NextFunction } from "express";
+import { logMemory, rssMb, heapMb } from "./memlog";
 
 // ---------- Process-level handlers ----------
 
@@ -90,6 +90,14 @@ export function lockStatus(name: string): { held: boolean; ageMs: number } {
   const existing = LOCKS.get(name);
   if (!existing) return { held: false, ageMs: 0 };
   return { held: true, ageMs: Date.now() - existing.acquiredAt };
+}
+
+export function snapshotLocks(): Array<{ name: string; ageMs: number }> {
+  const now = Date.now();
+  return Array.from(LOCKS.values()).map((l) => ({
+    name: l.label,
+    ageMs: now - l.acquiredAt,
+  }));
 }
 
 /**
@@ -258,4 +266,92 @@ export async function withMemorySnapshot<T>(
     logMemory(`${label}.failed`, { ...extra, message: (err as Error)?.message });
     throw err;
   }
+}
+
+// ---------- Memory pressure guard ----------
+
+// Render starter instances run with ~512 MB RSS budget; once we cross
+// ~440 MB the kernel OOM-killer is a single allocation away. The guard
+// short-circuits heavy endpoints with a 503 before they can push the
+// process over the cliff, so the worker stays up and the health probe
+// keeps passing instead of producing "connection refused" alerts.
+const DEFAULT_RSS_SOFT_MB = Number(process.env.RSS_SOFT_LIMIT_MB || 450);
+const DEFAULT_HEAP_SOFT_MB = Number(process.env.HEAP_SOFT_LIMIT_MB || 380);
+
+export function memoryPressure(): {
+  rssMb: number;
+  heapMb: number;
+  softRssMb: number;
+  softHeapMb: number;
+  exceeded: boolean;
+} {
+  const rss = rssMb();
+  const heap = heapMb();
+  const softRss = Number.isFinite(DEFAULT_RSS_SOFT_MB) ? DEFAULT_RSS_SOFT_MB : 450;
+  const softHeap = Number.isFinite(DEFAULT_HEAP_SOFT_MB) ? DEFAULT_HEAP_SOFT_MB : 380;
+  const exceeded = (rss >= 0 && rss >= softRss) || (heap >= 0 && heap >= softHeap);
+  return { rssMb: rss, heapMb: heap, softRssMb: softRss, softHeapMb: softHeap, exceeded };
+}
+
+/**
+ * One-liner guard for heavy endpoints. Returns true if the request should
+ * proceed; otherwise it has already written a 503 JSON response and the
+ * caller must return immediately.
+ *
+ *     if (!allowHeavyRequestOr503(res, "products.refresh")) return;
+ */
+export function allowHeavyRequestOr503(res: Response, label: string): boolean {
+  const pressure = memoryPressure();
+  if (!pressure.exceeded) return true;
+  logMemory(`${label}.rejected.memoryPressure`, {
+    rssMb: pressure.rssMb,
+    heapMb: pressure.heapMb,
+  });
+  res.status(503).json({
+    ok: false,
+    error:
+      `Server is under memory pressure (rss=${pressure.rssMb}MB / soft cap ${pressure.softRssMb}MB; ` +
+      `heap=${pressure.heapMb}MB / soft cap ${pressure.softHeapMb}MB). ` +
+      `Heavy endpoints are temporarily throttled — retry in a minute, or upgrade the Render instance.`,
+    code: "MEMORY_PRESSURE",
+    rssMb: pressure.rssMb,
+    heapMb: pressure.heapMb,
+  });
+  return false;
+}
+
+/**
+ * Express middleware variant of allowHeavyRequestOr503. Mount in front of
+ * any sub-router whose handlers can run unbounded work (XLSX export, full
+ * Shopify refresh). The /api/health endpoint MUST be registered BEFORE
+ * this middleware so the platform probe still passes when RSS is hot.
+ */
+export function memoryGuardMiddleware(label: string) {
+  return function memoryGuard(_req: Request, res: Response, next: NextFunction): void {
+    if (!allowHeavyRequestOr503(res, label)) return;
+    next();
+  };
+}
+
+// ---------- Safe JSON responder ----------
+
+/**
+ * Catch all paths through a route handler and emit a JSON 500 instead of
+ * letting an unhandled rejection propagate to the default Express error
+ * pipeline (which historically returned HTML and confused the SPA). Use
+ * this at the top of heavy endpoints whose business logic is async.
+ */
+export function safeRoute(
+  handler: (req: Request, res: Response, next: NextFunction) => Promise<unknown> | unknown,
+) {
+  return async function wrapped(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      await handler(req, res, next);
+    } catch (err) {
+      const message = (err as Error)?.message || "Internal server error";
+      logMemory("safeRoute.caught", { path: req.path, message });
+      if (res.headersSent) return;
+      res.status(500).json({ ok: false, error: message });
+    }
+  };
 }

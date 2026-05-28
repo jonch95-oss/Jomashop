@@ -48,10 +48,15 @@ import {
   rejectIfTooManyRows,
   releaseLock,
   withLockOr409,
+  allowHeavyRequestOr503,
 } from "./stability";
 import { logMemory } from "./memlog";
 
 const MAX_MAPPING_SESSIONS = 8;
+// Hard cap on rows in the unresolved-mapping XLSX export. Workbook build
+// is dominated by ExcelJS object allocations, so the safe ceiling on a
+// Render starter is in the low thousands.
+const MAX_MAPPING_EXPORT_ROWS = 10000;
 
 // ---------- Types ----------
 
@@ -893,9 +898,13 @@ export function registerJomashopMappingExcelRoutes(app: Express): void {
     }
   });
 
-  // GET: XLSX export.
+  // GET: XLSX export. Hardened with memory guard + lock + row cap +
+  // RSS/heap snapshots, matching /api/jomashop-product-fields/export.xlsx.
   app.get("/api/jomashop-mapping/export.xlsx", async (_req, res) => {
+    if (!allowHeavyRequestOr503(res, "mappingExport")) return;
+    if (!withLockOr409(res, "mappingExport")) return;
     try {
+      logMemory("mappingExport.start");
       const agg = await aggregateUnresolvedMappings();
       if (!agg.shopDomain) {
         return res.status(503).json({
@@ -910,7 +919,32 @@ export function registerJomashopMappingExcelRoutes(app: Express): void {
             "No unresolved Jomashop mappings found in the cached preview. If you expect rows here, click Refresh from Shopify on the Products page first.",
         });
       }
+      if (agg.rows.length > MAX_MAPPING_EXPORT_ROWS) {
+        const byCategory: Record<string, number> = {};
+        for (const r of agg.rows) {
+          const key = (r as { jomashopCategory?: string }).jomashopCategory || "(unknown)";
+          byCategory[key] = (byCategory[key] ?? 0) + 1;
+        }
+        return res.status(413).json({
+          ok: false,
+          error:
+            `Mapping export would produce ${agg.rows.length} rows (cap is ${MAX_MAPPING_EXPORT_ROWS}). ` +
+            `Resolve a subset of categories first via /api/category-mapping or enum overrides, ` +
+            `then retry.`,
+          rowCount: agg.rows.length,
+          maxExportRows: MAX_MAPPING_EXPORT_ROWS,
+          availableCategories: Object.entries(byCategory).map(([category, count]) => ({
+            category,
+            rows: count,
+          })),
+        });
+      }
+      logMemory("mappingExport.aggregated", { rows: agg.rows.length });
       const buf = await buildMappingWorkbook(agg);
+      logMemory("mappingExport.workbookBuilt", {
+        rows: agg.rows.length,
+        bytes: buf.length,
+      });
       const filename = `jomashop-mapping-${agg.shopDomain.replace(/\.myshopify\.com$/, "")}-${new Date()
         .toISOString()
         .slice(0, 10)}.xlsx`;
@@ -931,15 +965,21 @@ export function registerJomashopMappingExcelRoutes(app: Express): void {
         createdAt: Date.now(),
       });
       res.end(buf);
+      logMemory("mappingExport.responded", { bytes: buf.length });
     } catch (err) {
       const msg = (err as Error).message;
+      logMemory("mappingExport.failed", { message: msg });
       storage.appendLog({
         level: "error",
         message: `Jomashop mapping XLSX export failed: ${msg}`,
         detailsJson: null,
         createdAt: Date.now(),
       });
-      res.status(500).json({ ok: false, error: msg });
+      if (!res.headersSent) {
+        res.status(500).json({ ok: false, error: msg });
+      }
+    } finally {
+      releaseLock("mappingExport");
     }
   });
 

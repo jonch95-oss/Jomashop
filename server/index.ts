@@ -4,10 +4,16 @@ import type { Request } from 'express';
 import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
 import { createServer } from "node:http";
-import { logMemory } from "./memlog";
-import { installProcessHandlers, handleMulterError } from "./stability";
+import { logMemory, rssMb, heapMb } from "./memlog";
+import {
+  installProcessHandlers,
+  handleMulterError,
+  snapshotLocks,
+  memoryPressure,
+} from "./stability";
 
 installProcessHandlers();
+const PROCESS_STARTED_AT = Date.now();
 
 const app = express();
 const httpServer = createServer(app);
@@ -15,15 +21,54 @@ const httpServer = createServer(app);
 // Render (and any other PaaS) probes /api/health to decide whether the
 // container is healthy. Register the health route BEFORE any body parsers,
 // auth middleware, or async route setup so the probe always succeeds even
-// during startup or while heavy registrations are still pending. This is
-// what fixes the "dial tcp ...:5000: connect: connection refused" alerts —
-// the previous build returned a 503 here because the admin-token gate ran
-// first and Express's app.use("/api", mw) had stripped the "/api" prefix,
-// causing the `req.path === "/api/health"` exemption to never match.
+// during startup or while heavy registrations are still pending. The
+// handler MUST stay synchronous and allocation-light: no storage calls,
+// no JSON.stringify of large payloads, no awaits. If the worker is so
+// loaded it can't satisfy this, the OOM-killer is one allocation away
+// and we want Render to see "unhealthy" and recycle the container.
 app.get("/api/health", (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
   res.json({ ok: true, time: new Date().toISOString() });
 });
 app.head("/api/health", (_req, res) => res.status(200).end());
+
+// Diagnostics endpoint — read-only summary of process state. Useful both
+// for the operator UI ("is the server hot right now?") and for Render's
+// post-incident debugging. Like /api/health it must NEVER throw and must
+// stay lightweight (no DB calls, just process.memoryUsage + the in-memory
+// lock map). Mounted before the admin-token gate intentionally so we can
+// curl it during an outage even without a valid token.
+app.get("/api/diagnostics/status", (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  let pressure;
+  try {
+    pressure = memoryPressure();
+  } catch {
+    pressure = { rssMb: -1, heapMb: -1, softRssMb: -1, softHeapMb: -1, exceeded: false };
+  }
+  let locks: Array<{ name: string; ageMs: number }> = [];
+  try {
+    locks = snapshotLocks();
+  } catch {
+    // best-effort
+  }
+  res.json({
+    ok: true,
+    uptimeSeconds: Math.round((Date.now() - PROCESS_STARTED_AT) / 1000),
+    pid: process.pid,
+    nodeVersion: process.version,
+    env: process.env.NODE_ENV ?? "development",
+    memory: {
+      rssMb: rssMb(),
+      heapMb: heapMb(),
+      softRssMb: pressure.softRssMb,
+      softHeapMb: pressure.softHeapMb,
+      pressureExceeded: pressure.exceeded,
+    },
+    locks,
+    time: new Date().toISOString(),
+  });
+});
 
 declare module "http" {
   interface IncomingMessage {
@@ -49,8 +94,16 @@ function requireAdminToken(req: Request, res: Response, next: NextFunction) {
   // Express strips the mount path when this is attached via app.use("/api", ...),
   // so req.path is e.g. "/health" not "/api/health". Match both for safety
   // (this middleware is also called from /api/health directly above as a
-  // belt-and-braces guard).
-  if (req.path === "/api/health" || req.path === "/health") return next();
+  // belt-and-braces guard). Diagnostics is also unauthenticated so the
+  // operator can inspect the worker during an outage.
+  if (
+    req.path === "/api/health" ||
+    req.path === "/health" ||
+    req.path === "/api/diagnostics/status" ||
+    req.path === "/diagnostics/status"
+  ) {
+    return next();
+  }
 
   const token = process.env.ADMIN_TOKEN?.trim();
   if (!token) {

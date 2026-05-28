@@ -63,7 +63,12 @@ import { registerJomashopProductFieldExcelRoutes } from "./jomashop_product_fiel
 import { registerInlineFieldRepairRoutes } from "./inline_field_repair";
 import { pushInventoryUpdate, registerWebhookRoutes, registerShopifyWebhooks } from "./webhooks";
 import { logMemory } from "./memlog";
-import { releaseLock, withLockOr409 } from "./stability";
+import {
+  releaseLock,
+  withLockOr409,
+  allowHeavyRequestOr503,
+  safeRoute,
+} from "./stability";
 import { compactifyMapped, type CompactMappedProduct } from "./compact_mapped";
 
 // -------------------- helpers --------------------
@@ -75,12 +80,13 @@ import { compactifyMapped, type CompactMappedProduct } from "./compact_mapped";
 // list, debug echo) is moved behind /api/products/full/:id so a list view
 // only ever ships the compact projection.
 const DEFAULT_LIST_LIMIT = 200;
-// Raised from 500 → 5000 so ?limit=all on /api/products/cache returns the
-// full cached catalog for shops with thousands of products. The cache stores
-// "compact" rows (no debug payloads, no image arrays), so a 3000+ product
-// store fits comfortably in a single JSON response. Operators on multi-
-// thousand stores can still keep the default 200/page if they prefer.
-const MAX_LIST_LIMIT = 5000;
+// Capped at 2000 so a single ?limit=all response can never serialize the
+// full 5000+ product catalog in one shot — that path is what triggered
+// Render's "dial tcp ...:5000: connect: connection refused" alerts, since
+// the worker would queue a multi-megabyte JSON.stringify and the kernel
+// OOM-killer would land before the response was framed. Operators who
+// need the full catalog should page through ?offset=&limit=.
+const MAX_LIST_LIMIT = 2000;
 
 function clampLimit(raw: unknown, fallback = DEFAULT_LIST_LIMIT, max = MAX_LIST_LIMIT): number {
   if (raw === undefined || raw === null || raw === "") return fallback;
@@ -1389,6 +1395,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   }
 
   app.post("/api/sync/preview-products", async (req, res) => {
+    // Cheap memory-pressure check up front — if RSS is already hot the
+    // full Shopify catalog pull below WILL push us over the OOM ceiling.
+    // Better to fail closed with a 503 than crash the worker mid-flight.
+    if (!allowHeavyRequestOr503(res, "preview-products")) return;
     const supplied = req.body?.products as ShopifyProduct[] | undefined;
     const forceRefresh = req.body?.forceRefresh === true || req.body?.useCache === false;
     // Only the slow path (no supplied products + forceRefresh OR no cache
@@ -1600,9 +1610,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // per-product data in the cache. This is the dedicated endpoint for the
   // expandable debug panel in the UI; the list view never includes this
   // payload.
-  app.get("/api/products/full/:id", async (req, res) => {
+  app.get("/api/products/full/:id", safeRoute(async (req, res) => {
     const productId = String(req.params.id);
     if (!productId) return res.status(400).json({ ok: false, error: "Missing product id" });
+    if (!allowHeavyRequestOr503(res, "products-full")) return;
     const conn = getActiveShopifyConnection();
     if (!conn) {
       return res.status(503).json({ ok: false, error: "No connected Shopify store with an access token." });
@@ -1646,11 +1657,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       product: found,
       mapped,
     });
-  });
+  }));
 
   // Force a full Shopify pagination + cache overwrite. The Products page
   // wires this to the "Refresh from Shopify" button.
   app.post("/api/products/refresh", async (req, res) => {
+    if (!allowHeavyRequestOr503(res, "products-refresh")) return;
     const rawLimit = req.body?.limit;
     const maxProducts =
       rawLimit === undefined || rawLimit === null || rawLimit === "" || rawLimit === "all"
@@ -1765,7 +1777,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // Pass ?limit=all (clamped to MAX_LIST_LIMIT) to receive a larger slice;
   // there is no longer a way to ship the full uncapped catalog as one
   // response — use /api/products/cache or /api/products/full/:id instead.
-  app.get("/api/shopify/products", async (req, res) => {
+  app.get("/api/shopify/products", safeRoute(async (req, res) => {
+    if (!allowHeavyRequestOr503(res, "shopify-products")) return;
     const limit = clampLimit(req.query.limit);
     const pageSize = Math.min(
       Math.max(parseInt(String(req.query.pageSize ?? "100"), 10) || 100, 1),
@@ -1797,7 +1810,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       products: result.products,
       note: `Capped at ${limit} products. Use /api/products/cache for paginated mapped views or /api/products/full/:id for single-product detail.`,
     });
-  });
+  }));
 
   app.get("/api/sync/inventory-preview", (_req, res) => {
     const sample = SAMPLE_SHOPIFY_PRODUCTS.flatMap((p) =>

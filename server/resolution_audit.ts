@@ -37,7 +37,11 @@ import { getActiveShopifyConnection } from "./shopify";
 import {
   MAX_IMPORT_ROWS,
   rejectIfTooManyRows,
+  withLockOr409,
+  releaseLock,
+  allowHeavyRequestOr503,
 } from "./stability";
+import { logMemory } from "./memlog";
 
 const MAX_AUDIT_SESSIONS = 8;
 
@@ -766,9 +770,14 @@ export function registerResolutionAuditRoutes(app: Express): void {
   app.get("/api/jomashop/resolution-audit", auditHandler);
   app.post("/api/jomashop/resolution-audit", auditHandler);
 
-  // Download XLSX export of the current audit.
+  // Download XLSX export of the current audit. Hardened with memory guard,
+  // lock, and RSS/heap snapshots so concurrent operators clicking Download
+  // can't OOM the worker.
   app.get("/api/jomashop/resolution-audit/export.xlsx", async (_req, res) => {
+    if (!allowHeavyRequestOr503(res, "resolutionAuditExport")) return;
+    if (!withLockOr409(res, "resolutionAuditExport")) return;
     try {
+      logMemory("resolutionAuditExport.start");
       const audit = await runResolutionAudit();
       if (!audit.shopDomain) {
         return res.status(503).json({
@@ -784,7 +793,12 @@ export function registerResolutionAuditRoutes(app: Express): void {
             "Audit is empty — no cached Shopify products. Click 'Refresh from Shopify' on the Products page, then re-run the audit.",
         });
       }
+      logMemory("resolutionAuditExport.aggregated", {
+        brandRows: audit.brandRows.length,
+        categoryRows: audit.categoryRows.length,
+      });
       const buf = await buildResolutionAuditWorkbook(audit);
+      logMemory("resolutionAuditExport.workbookBuilt", { bytes: buf.length });
       const stem = audit.shopDomain.replace(/\.myshopify\.com$/, "");
       const filename = `resolution-audit-${stem}-${new Date()
         .toISOString()
@@ -804,15 +818,21 @@ export function registerResolutionAuditRoutes(app: Express): void {
         createdAt: Date.now(),
       });
       res.end(buf);
+      logMemory("resolutionAuditExport.responded", { bytes: buf.length });
     } catch (err) {
       const msg = (err as Error).message;
+      logMemory("resolutionAuditExport.failed", { message: msg });
       storage.appendLog({
         level: "error",
         message: `Brand/category audit XLSX export failed: ${msg}`,
         detailsJson: null,
         createdAt: Date.now(),
       });
-      res.status(500).json({ ok: false, error: msg });
+      if (!res.headersSent) {
+        res.status(500).json({ ok: false, error: msg });
+      }
+    } finally {
+      releaseLock("resolutionAuditExport");
     }
   });
 
