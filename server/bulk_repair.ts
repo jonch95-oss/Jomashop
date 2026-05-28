@@ -29,7 +29,16 @@ import { logMemory } from "./memlog";
 import {
   MAX_IMPORT_ROWS,
   rejectIfTooManyRows,
+  withLockOr409,
+  releaseLock,
+  allowHeavyRequestOr503,
 } from "./stability";
+
+// Hard cap on rows in the "missing required" export. Beyond this the file
+// would routinely OOM a Render starter instance during workbook build —
+// fail fast with a 413 and a category breakdown so the operator can split
+// the export.
+const MAX_MISSING_EXPORT_ROWS = 8000;
 
 const MAX_BULK_REPAIR_SESSIONS = 8;
 
@@ -749,8 +758,21 @@ export function registerBulkRepairRoutes(app: Express): void {
   });
 
   // ---------- Export ----------
+  // Hardened against Render OOM:
+  //   - rejects with 503 when the process is already under memory pressure
+  //     (the guard short-circuits before we allocate the row array);
+  //   - serializes concurrent exports with the `missingExport` lock so two
+  //     operators clicking Download at once can't double RSS;
+  //   - rejects with 413 + category breakdown when the row count would
+  //     exceed MAX_MISSING_EXPORT_ROWS, asking the operator to use the
+  //     per-category Jomashop product-field export instead;
+  //   - emits RSS/heap snapshots at start / aggregated / workbook-built so
+  //     a post-mortem can pinpoint where the worker died.
   app.get("/api/products/missing/export.xlsx", async (_req, res) => {
+    if (!allowHeavyRequestOr503(res, "missingExport")) return;
+    if (!withLockOr409(res, "missingExport")) return;
     try {
+      logMemory("missingExport.start");
       const { rows, shopDomain, fetchedCount, pageCount } = await buildMissingExportRows();
       if (!shopDomain) {
         return res.status(503).json({
@@ -758,7 +780,31 @@ export function registerBulkRepairRoutes(app: Express): void {
           error: "No connected Shopify store with an access token. Complete OAuth install first.",
         });
       }
+      logMemory("missingExport.aggregated", { rows: rows.length });
+      if (rows.length > MAX_MISSING_EXPORT_ROWS) {
+        // Group by category for the operator-facing 413 so they can decide
+        // which slice to pull first via the per-category endpoint.
+        const byCategory: Record<string, number> = {};
+        for (const r of rows) {
+          const key = (r as { jomashop_category?: string }).jomashop_category || "(unknown)";
+          byCategory[key] = (byCategory[key] ?? 0) + 1;
+        }
+        return res.status(413).json({
+          ok: false,
+          error:
+            `Missing-field export would produce ${rows.length} rows (cap is ${MAX_MISSING_EXPORT_ROWS}). ` +
+            `Use /api/jomashop-product-fields/export.xlsx?category=<Category> to split, or fix Shopify ` +
+            `metafields per category before retrying.`,
+          rowCount: rows.length,
+          maxExportRows: MAX_MISSING_EXPORT_ROWS,
+          availableCategories: Object.entries(byCategory).map(([category, count]) => ({
+            category,
+            rows: count,
+          })),
+        });
+      }
       const buf = await buildWorkbook(rows);
+      logMemory("missingExport.workbookBuilt", { rows: rows.length, bytes: buf.length });
       const filename = `missing-fields-${shopDomain.replace(/\.myshopify\.com$/, "")}-${new Date()
         .toISOString()
         .slice(0, 10)}.xlsx`;
@@ -778,15 +824,21 @@ export function registerBulkRepairRoutes(app: Express): void {
         createdAt: Date.now(),
       });
       res.end(buf);
+      logMemory("missingExport.responded", { bytes: buf.length });
     } catch (err) {
       const msg = (err as Error).message;
+      logMemory("missingExport.failed", { message: msg });
       storage.appendLog({
         level: "error",
         message: `Missing-field XLSX export failed: ${msg}`,
         detailsJson: null,
         createdAt: Date.now(),
       });
-      res.status(500).json({ ok: false, error: msg });
+      if (!res.headersSent) {
+        res.status(500).json({ ok: false, error: msg });
+      }
+    } finally {
+      releaseLock("missingExport");
     }
   });
 

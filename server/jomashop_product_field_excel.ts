@@ -49,6 +49,7 @@ import {
   rejectIfTooManyRows,
   releaseLock,
   withLockOr409,
+  allowHeavyRequestOr503,
 } from "./stability";
 import { logMemory } from "./memlog";
 
@@ -1506,6 +1507,23 @@ export function registerJomashopProductFieldExcelRoutes(app: Express): void {
   app.get("/api/jomashop-product-fields/export.xlsx", async (req, res) => {
     const includeAll = String(req.query.all ?? "") === "1" || String(req.query.all ?? "") === "true";
     const categoryFilter = typeof req.query.category === "string" ? req.query.category.trim() : "";
+    // Reject early under memory pressure so the operator gets a clean 503
+    // instead of the worker crashing mid-aggregation.
+    if (!allowHeavyRequestOr503(res, "productFieldExport")) return;
+    // Require an explicit category filter for unfiltered "all rows" exports
+    // (?all=1 without ?category=...). The full-catalog export is the route
+    // most likely to OOM a Render starter; force the operator to pick a
+    // single category and stream them one at a time.
+    if (includeAll && !categoryFilter) {
+      return res.status(413).json({
+        ok: false,
+        error:
+          "Full-catalog product-field exports require a category filter to stay under " +
+          "the Render memory ceiling. Re-run with ?category=<JomashopCategory>, or drop " +
+          "?all=1 to limit the export to unready rows only.",
+        code: "CATEGORY_FILTER_REQUIRED",
+      });
+    }
     if (!withLockOr409(res, "productFieldExport")) return;
     try {
       logMemory("productFieldExport.start", { includeAll, categoryFilter });

@@ -92,8 +92,14 @@ const sqlite = openDatabase();
 
 export const db = drizzle(sqlite);
 
-// Auto-create tables (lightweight, dev-friendly; for production use drizzle-kit push)
-sqlite.exec(`
+// Auto-create tables (lightweight, dev-friendly; for production use drizzle-kit push).
+// Wrap in a guard so a corrupt sqlite file or an unexpected DDL conflict on
+// an ephemeral disk (SQLITE_IOERR / SQLITE_CORRUPT) does NOT kill the
+// process at module load. If DDL fails we fall back to an in-memory db
+// and log loudly — the HTTP server still listens so the operator can fix
+// the disk via /api/diagnostics/status and the dashboard stays reachable.
+function ensureSchema(handle: Database.Database): void {
+  handle.exec(`
   CREATE TABLE IF NOT EXISTS stores (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     shop_domain TEXT NOT NULL UNIQUE,
@@ -227,6 +233,18 @@ sqlite.exec(`
     received_at INTEGER NOT NULL
   );
 `);
+}
+
+try {
+  ensureSchema(sqlite);
+} catch (err) {
+  // eslint-disable-next-line no-console
+  console.error(
+    `[storage] schema bootstrap failed on ${DATA_DB_PATH} (${(err as Error)?.message}). ` +
+      `Server will keep listening; storage calls may fail until the underlying ` +
+      `disk error is resolved. Check /api/diagnostics/status.`,
+  );
+}
 
 // Lightweight migration: add access_token_enc to stores if it's missing
 // (table may exist from a pre-token-storage build).
