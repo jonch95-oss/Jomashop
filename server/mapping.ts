@@ -753,6 +753,12 @@ export type CanonicalProductFields = {
    *  single non-empty size), "No" when it does not. Never the literal size
    *  value (e.g. "4") — Jomashop's Variation Size enum is a Yes/No flag. */
   variation_size_yes_no?: string;
+  /** "Yes" when the product carries a color variant (multiple colors OR a
+   *  single non-empty color option), "No" when it does not. NEVER the
+   *  literal color value (e.g. "Green") — Jomashop's Variation Color
+   *  (Yes/No) enum rejects free-text color strings. Distinct from `color`
+   *  which carries the value itself. */
+  variation_color_yes_no?: string;
   /** Parent SKU — the upstream "group" SKU shared across all size/colour
    *  variants of a product. Sourced strictly from explicit Shopify
    *  metafields (parent_sku / Parent SKU / ff_parent_sku / parentSku across
@@ -860,32 +866,56 @@ export function buildCanonicalProductFields(p: ShopifyProduct): CanonicalProduct
     p.vendor ||
     undefined;
 
-  const color =
-    readMetafieldAny(p, [
-      "Color",
-      "color",
-      "Colour",
-      "colour",
-      "primary_color",
-      "Primary Color",
-      "ff_color",
-      "FF Color",
-      "custom.color",
-      "luxe.color",
-      "ff.color",
-      "global.color",
-      "custom.colour",
-      "luxe.colour",
-      "custom.primary_color",
-      "luxe.primary_color",
-      "custom.ff_color",
-      "luxe.ff_color",
-    ]) ||
-    (colorOpt && firstVariant ? ((firstVariant[colorOpt] as string | null) || undefined) : undefined);
+  const colorMetafield = readMetafieldAny(p, [
+    "Color",
+    "color",
+    "Colour",
+    "colour",
+    "primary_color",
+    "Primary Color",
+    "ff_color",
+    "FF Color",
+    "custom.color",
+    "luxe.color",
+    "ff.color",
+    "global.color",
+    "custom.colour",
+    "luxe.colour",
+    "custom.primary_color",
+    "luxe.primary_color",
+    "custom.ff_color",
+    "luxe.ff_color",
+  ]);
+  const colorFromFirstVariant =
+    colorOpt && firstVariant ? ((firstVariant[colorOpt] as string | null) || undefined) : undefined;
+  const colorFromAnyVariant = (() => {
+    if (!colorOpt) return undefined;
+    for (const v of p.variants || []) {
+      const val = (v as unknown as Record<string, unknown>)[colorOpt] as string | null | undefined;
+      if (typeof val === "string" && val.trim() !== "") return val.trim();
+    }
+    return undefined;
+  })();
+  const color = colorMetafield || colorFromFirstVariant || colorFromAnyVariant;
 
-  const size =
-    readMetafieldAny(p, ["Size", "size", "custom.size", "luxe.size"]) ||
-    (sizeOpt && firstVariant ? ((firstVariant[sizeOpt] as string | null) || undefined) : undefined);
+  // Size precedence: explicit Size metafield → first variant's size option →
+  // ANY variant's size option (some shops leave the first variant
+  // out-of-stock with a blank option, while later variants carry real
+  // values). Falling back to any non-empty option keeps the canonical bag
+  // populated so schema mapping doesn't emit "Shoe Size missing" for a
+  // catalog row that clearly carries sizes 34, 35, 36 ... on its variants.
+  const sizeMetafield = readMetafieldAny(p, ["Size", "size", "custom.size", "luxe.size"]);
+  const sizeFromFirstVariant =
+    sizeOpt && firstVariant ? ((firstVariant[sizeOpt] as string | null) || undefined) : undefined;
+  const sizeFromAnyVariant = (() => {
+    if (!sizeOpt) return undefined;
+    for (const v of p.variants || []) {
+      const val = (v as unknown as Record<string, unknown>)[sizeOpt] as string | null | undefined;
+      if (typeof val === "string" && val.trim() !== "") return val.trim();
+    }
+    return undefined;
+  })();
+  const size = sizeMetafield || sizeFromFirstVariant || sizeFromAnyVariant;
 
   const rawSizeSystem = readMetafieldAny(p, [
     "size_system",
@@ -1025,6 +1055,26 @@ export function buildCanonicalProductFields(p: ShopifyProduct): CanonicalProduct
     variation_size_yes_no = "No";
   }
 
+  // Variation Color (Yes/No) — mirrors Variation Size. "Yes" when there's a
+  // Color/Colour option with any non-empty value across variants, "No" when
+  // not. NEVER the literal color value (e.g. "Green"); Jomashop's
+  // Variation Color (Yes/No) enum is a boolean flag and rejects free-text
+  // color strings.
+  let variation_color_yes_no: string | undefined;
+  if (colorOpt) {
+    const hasNonEmptyColor = (p.variants || []).some((v) => {
+      const val = (v as unknown as Record<string, unknown>)[colorOpt] as string | null | undefined;
+      return typeof val === "string" && val.trim() !== "";
+    });
+    variation_color_yes_no = hasNonEmptyColor ? "Yes" : "No";
+  } else if (color) {
+    // No "Color" option but a color value resolved from a metafield — count
+    // as having a color variation (single-color SKU still gets Yes).
+    variation_color_yes_no = "Yes";
+  } else {
+    variation_color_yes_no = "No";
+  }
+
   // Parent SKU: pulled strictly from explicit parent-sku metafields. Never
   // derived from the variant SKU, variant size, manufacturer number, brand,
   // or product handle — those are not parent SKUs by definition and silently
@@ -1060,6 +1110,7 @@ export function buildCanonicalProductFields(p: ShopifyProduct): CanonicalProduct
     product_id,
     asin,
     variation_size_yes_no,
+    variation_color_yes_no,
     parent_sku: parent_sku || undefined,
   };
 }
@@ -1140,6 +1191,20 @@ function pickCanonicalField(prop: SchemaPropertyDescriptor): keyof CanonicalProd
     return "parent_sku";
   if (has("variationsize") || has("variantsize") || has("sizevariation") || has("sizeyesno"))
     return "variation_size_yes_no";
+  // Variation Color (Yes/No) MUST be detected before the plain "color"
+  // matcher so a "Variation Color" schema field never receives the literal
+  // color value (e.g. "Green") — Jomashop rejects that with "is not
+  // included in the list" because the field is a Yes/No enum.
+  if (
+    has("variationcolor") ||
+    has("variantcolor") ||
+    has("colorvariation") ||
+    has("coloryesno") ||
+    has("variationcolour") ||
+    has("variantcolour") ||
+    has("colouryesno")
+  )
+    return "variation_color_yes_no";
   if (has("productidtype") || has("productidkind") || has("idtype")) return "product_id_type";
   if (has("productid") && !has("productidtype") && !has("productidkind")) return "product_id";
   if (has("upc") && !has("upclookup")) return "product_id";
@@ -1547,6 +1612,22 @@ export function buildSchemaProperties(
       const hit = resolveCategorySynonym(prop.field, src, prop.options);
       if (hit) return { value: hit, source: src };
     }
+    // Footwear fallback: tokenize the product title/name so a Shoe Category
+    // or Shoe Style field resolves to "Sandals"/"Mules"/etc. when the
+    // product code wasn't specific (e.g. raw_category_code === "SHOE" or
+    // "MULE" but the live schema doesn't list "MULE" — it lists "Mules").
+    // The synonym resolver is option-gated so this is null-safe.
+    if (canonical.name) {
+      const tokens = canonical.name
+        .toLowerCase()
+        .replace(/[^a-z]+/g, " ")
+        .split(/\s+/)
+        .filter((t) => t.length >= 3);
+      for (const tok of tokens) {
+        const hit = resolveCategorySynonym(prop.field, tok, prop.options);
+        if (hit) return { value: hit, source: `title:${tok}` };
+      }
+    }
     return null;
   }
 
@@ -1704,7 +1785,58 @@ export function coerceCanonicalForCategory(
     (p) => p && typeof p.field === "string" && /gender/i.test(p.field),
   );
   if (genderProp) {
-    const opts = (genderProp.options || []).map((o) => o.toLowerCase());
+    const optsRaw = genderProp.options || [];
+    const opts = optsRaw.map((o) => o.toLowerCase());
+    // Pick the verbatim accepted-option spelling so the outgoing payload
+    // uses Jomashop's exact casing (Ladies / Mens / Womens / Boys / Girls).
+    const pickAccepted = (candidates: string[]): string | undefined => {
+      for (const cand of candidates) {
+        const idx = opts.indexOf(cand.toLowerCase());
+        if (idx !== -1) return optsRaw[idx];
+      }
+      return undefined;
+    };
+
+    // Footwear / Apparel gender option-aware coercion. Live Footwear
+    // categories often accept Ladies/Mens/Kids/Boys/Girls instead of
+    // Men/Women/Unisex. Normalize so a Shopify tag/metafield value of
+    // "Women" lands on whichever spelling Jomashop actually publishes —
+    // Ladies first, then Women's, then Women. Same idea for Men/Mens and
+    // Kids/Childrens/Boys/Girls. This runs BEFORE enum coercion so the
+    // required Gender field passes.
+    if (out.gender && opts.length > 0 && !opts.includes(out.gender.toLowerCase())) {
+      const g = out.gender.toLowerCase().replace(/[^a-z]+/g, "");
+      let chosen: string | undefined;
+      if (g === "women" || g === "woman" || g === "female" || g === "ladies" || g === "lady" || g === "womens") {
+        chosen = pickAccepted(["Ladies", "Women", "Womens", "Women's", "Female"]);
+      } else if (g === "men" || g === "man" || g === "male" || g === "mens") {
+        chosen = pickAccepted(["Mens", "Men", "Men's", "Male"]);
+      } else if (
+        g === "kids" || g === "kid" || g === "child" || g === "children" ||
+        g === "childrens" || g === "boy" || g === "boys" || g === "girl" || g === "girls"
+      ) {
+        // Try Kids family first; if the live list separates Boys/Girls,
+        // fall back to the closer match when known.
+        const isBoy = g === "boy" || g === "boys";
+        const isGirl = g === "girl" || g === "girls";
+        if (isBoy) {
+          chosen = pickAccepted(["Boys", "Boy", "Kids", "Childrens", "Children"]);
+        } else if (isGirl) {
+          chosen = pickAccepted(["Girls", "Girl", "Kids", "Childrens", "Children"]);
+        } else {
+          chosen = pickAccepted(["Kids", "Childrens", "Children", "Kid"]);
+        }
+      } else if (g === "unisex" || g === "uni") {
+        chosen = pickAccepted(["Unisex", "Uni", "Adult"]);
+      }
+      if (chosen) {
+        out.gender = chosen;
+      }
+    }
+
+    // Apparel Kids → Unisex fallback when Kids isn't accepted (existing
+    // behaviour kept for Apparel — Footwear's Kids may now be accepted via
+    // the Ladies/Mens/Kids coercion above).
     if (
       out.gender &&
       out.gender.toLowerCase() === "kids" &&
@@ -2199,6 +2331,34 @@ export const FORBIDDEN_TOP_LEVEL_LEGACY_FIELDS: ReadonlyArray<string> = [
   "dimensions",
 ];
 
+/**
+ * Pull the variant-scoped size value off the mapper's per-variant `options`
+ * map. `options` is keyed by the Shopify product option name (e.g. "Size",
+ * "Shoe Size"); this looks for any option whose normalized name is a
+ * size-like token and returns the trimmed value. Returns undefined when
+ * the variant has no size option.
+ */
+export function extractVariantSize(
+  variant: MappedProduct["variants"][number] | null | undefined,
+): string | undefined {
+  if (!variant || !variant.options || typeof variant.options !== "object") return undefined;
+  for (const [k, v] of Object.entries(variant.options)) {
+    const tok = String(k).toLowerCase().replace(/[^a-z0-9]+/g, "");
+    if (
+      tok === "size" ||
+      tok === "shoesize" ||
+      tok === "apparelsize" ||
+      tok === "sizeus" ||
+      tok === "sizeeu" ||
+      tok === "sizeuk"
+    ) {
+      const trimmed = typeof v === "string" ? v.trim() : "";
+      if (trimmed !== "") return trimmed;
+    }
+  }
+  return undefined;
+}
+
 /** True when ANY schema label uses Title Case / spaces — i.e. the schema is
  *  the exact-label live (or post-rewrite fallback) shape, not the legacy
  *  lowercase one that Jomashop now rejects. */
@@ -2269,6 +2429,39 @@ export function buildJomashopProductPayload(
       continue;
     }
     properties[k] = v;
+  }
+
+  // Per-variant size substitution. Schema-driven mapping wrote a single
+  // product-level value for any size-like field (Shoe Size / Apparel Size /
+  // Size) from the FIRST variant's option value. When the push is targeted
+  // at a specific variant — every variant push is — the size MUST be that
+  // variant's actual size, not the first variant's. Find the variant's
+  // size from its `options` map (populated from product.options + variant
+  // option1/2/3 by the mapper) and overwrite any size-like property key.
+  if (variant) {
+    const variantSizeValue = extractVariantSize(variant);
+    if (variantSizeValue !== undefined && variantSizeValue !== "") {
+      for (const key of Object.keys(properties)) {
+        const tok = String(key).toLowerCase().replace(/[^a-z0-9]+/g, "");
+        // Match size-like labels but NEVER the Yes/No Variation Size enum
+        // (Variation Size (Yes/No) lives at the product level and is a
+        // boolean flag — sending "34" there would trigger Jomashop's "is
+        // not included in the list" rejection). Also skip the size *type*
+        // (US/EU/UK) which is product-wide.
+        if (tok === "variationsize" || tok === "variationsizeyesno") continue;
+        if (tok === "sizetype" || tok === "shoesizetype" || tok === "apparelsizetype" || tok === "sizesystem") continue;
+        if (
+          tok === "shoesize" ||
+          tok === "apparelsize" ||
+          tok === "size" ||
+          tok === "sizeus" ||
+          tok === "sizeeu" ||
+          tok === "sizeuk"
+        ) {
+          properties[key] = variantSizeValue;
+        }
+      }
+    }
   }
   const propertiesUseLiveLabels = schemaUsesExactLabels(
     Object.keys(properties).map((field) => ({ field })),

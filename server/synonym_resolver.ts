@@ -49,7 +49,14 @@ function fieldGroupFor(field: string): FieldGroup | null {
   if (!t) return null;
   if (t.includes("article")) return "article";
   if (t.includes("appareltype") || t === "type" || t === "apparelttype") return "apparel_type";
-  if (t.includes("shoetype") || t.includes("footweartype") || t.includes("shoecategory")) return "shoe_type";
+  if (
+    t.includes("shoetype") ||
+    t.includes("footweartype") ||
+    t.includes("shoecategory") ||
+    t.includes("shoestyle") ||
+    t === "shoetypes"
+  )
+    return "shoe_type";
   if (
     t.includes("handbagtype") ||
     t.includes("bagtype") ||
@@ -193,30 +200,62 @@ const SYNONYMS: Record<FieldGroup, Record<string, string[]>> = {
     heac: ["Headwear"],
     mask: ["Masks"],
   },
-  // Footwear Shoe Type / Type / Footwear Type
+  // Footwear Shoe Type / Type / Footwear Type / Shoe Category / Shoe Style.
+  // Keys include both the short Shopify code AND the common full noun (so a
+  // product title like "Roger Vivier Green Sandal" can drive resolution off
+  // raw_category_code OR the title-derived synonym below). All values are
+  // gated on the live accepted-options list, so extras here cost nothing.
   shoe_type: {
     snek: ["Sneakers", "Athletic Shoes"],
+    sneaker: ["Sneakers", "Athletic Shoes"],
+    sneakers: ["Sneakers", "Athletic Shoes"],
     heel: ["Heels", "Pumps", "High Heels"],
+    heels: ["Heels", "Pumps", "High Heels"],
     pump: ["Pumps", "Heels"],
+    pumps: ["Pumps", "Heels"],
     sand: ["Sandals"],
+    sandal: ["Sandals"],
+    sandals: ["Sandals"],
     loaf: ["Loafers", "Loafers & Slip-Ons", "Slip-Ons"],
+    loafer: ["Loafers", "Loafers & Slip-Ons", "Slip-Ons"],
+    loafers: ["Loafers", "Loafers & Slip-Ons", "Slip-Ons"],
     boot: ["Boots", "Ankle Boots"],
+    boots: ["Boots", "Ankle Boots"],
     ankb: ["Ankle Boots", "Boots"],
     knee: ["Knee-High Boots", "Boots"],
     bool: ["Boots"],
     flip: ["Flip-Flops", "Sandals"],
+    flipflop: ["Flip-Flops", "Sandals"],
+    flipflops: ["Flip-Flops", "Sandals"],
     derby: ["Derbys", "Oxfords"],
+    derbys: ["Derbys", "Oxfords"],
     oxfo: ["Oxfords", "Dress Shoes"],
-    mule: ["Mules", "Slides"],
+    oxford: ["Oxfords", "Dress Shoes"],
+    oxfords: ["Oxfords", "Dress Shoes"],
+    mule: ["Mules", "Slides", "Sandals", "Flats"],
+    mules: ["Mules", "Slides", "Sandals", "Flats"],
     slid: ["Slides"],
+    slide: ["Slides"],
+    slides: ["Slides"],
     slpr: ["Slippers"],
+    slipper: ["Slippers"],
+    slippers: ["Slippers"],
     dsho: ["Dress Shoes"],
+    dress: ["Dress Shoes"],
     flat: ["Flats", "Ballet Flats"],
+    flats: ["Flats", "Ballet Flats"],
     ball: ["Ballet Flats", "Flats"],
+    ballet: ["Ballet Flats", "Flats"],
     espa: ["Espadrilles"],
+    espadrille: ["Espadrilles"],
+    espadrilles: ["Espadrilles"],
     wedg: ["Wedges"],
+    wedge: ["Wedges"],
+    wedges: ["Wedges"],
     moca: ["Moccasins"],
     moc: ["Moccasins"],
+    moccasin: ["Moccasins"],
+    moccasins: ["Moccasins"],
   },
   // Handbags Type / Style / Bag Type
   handbag_type: {

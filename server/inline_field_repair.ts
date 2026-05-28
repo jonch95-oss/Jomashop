@@ -195,6 +195,7 @@ export function buildInlineRepairFieldDescriptors(
   schemaFields: SchemaPropertyDescriptor[],
   mappedProperties: Record<string, unknown>,
   invalidEnums: Array<{ field: string; value: string; options: string[] }>,
+  variantOptionsByVariantId?: Record<string, Record<string, string>>,
 ): InlineRepairFieldDescriptor[] {
   const invalidByField = new Map<string, { value: string; options: string[] }>();
   for (const ie of invalidEnums || []) {
@@ -205,13 +206,39 @@ export function buildInlineRepairFieldDescriptors(
       });
     }
   }
+  // For variant-targeted size fields, gather the set of variants that
+  // already carry a non-empty size on their Shopify option. When EVERY
+  // variant has a size, the field is treated as "ok" — the inline repair
+  // panel must not ask the operator to fill Shoe Size by hand when each
+  // SKU clearly has one already (e.g. sizes 34, 35, 36, ...). The push
+  // payload substitutes the variant's own size at send time
+  // (extractVariantSize + buildJomashopProductPayload).
+  const variantSizes: string[] = [];
+  let variantCount = 0;
+  if (variantOptionsByVariantId && typeof variantOptionsByVariantId === "object") {
+    for (const opts of Object.values(variantOptionsByVariantId)) {
+      variantCount += 1;
+      if (!opts || typeof opts !== "object") continue;
+      for (const [k, v] of Object.entries(opts)) {
+        const tok = String(k).toLowerCase().replace(/[^a-z0-9]+/g, "");
+        if (tok === "size" || tok === "shoesize" || tok === "apparelsize") {
+          if (typeof v === "string" && v.trim() !== "") variantSizes.push(v.trim());
+        }
+      }
+    }
+  }
+  const allVariantsHaveSize = variantCount > 0 && variantSizes.length >= variantCount;
   return schemaFields
     .filter(
       (f) => f && typeof f.field === "string" && f.field.trim() !== "" && f.field !== "undefined",
     )
     .map((f) => {
       const metaTarget = deriveMetafieldTargetForProductField(f.field);
-      const currentValue = (() => {
+      const isVariantTargeted = fieldIsVariantTargeted(f.field);
+      const fieldTok = String(f.field).toLowerCase().replace(/[^a-z0-9]+/g, "");
+      const isSizeField =
+        fieldTok === "size" || fieldTok === "shoesize" || fieldTok === "apparelsize";
+      let currentValue = (() => {
         const direct = (mappedProperties as any)[f.field];
         if (direct !== undefined && direct !== null) return String(direct);
         const wanted = f.field.toLowerCase().trim();
@@ -222,6 +249,19 @@ export function buildInlineRepairFieldDescriptors(
         }
         return "";
       })();
+      // If the field is a variant-scoped size AND every variant carries a
+      // non-empty size in its Shopify option, fall back to summarizing the
+      // variant sizes so the inline panel reports the field as "ok" with a
+      // value the operator can recognize ("34, 35, 36, 37, 38"). The push
+      // payload uses the specific variant's size at send time.
+      if (
+        isVariantTargeted &&
+        isSizeField &&
+        currentValue.trim() === "" &&
+        allVariantsHaveSize
+      ) {
+        currentValue = variantSizes.join(", ");
+      }
       const invalid = invalidByField.get(f.field);
       const isInvalid = invalid !== undefined;
       const invalidValue = invalid ? invalid.value : "";
@@ -241,7 +281,7 @@ export function buildInlineRepairFieldDescriptors(
         only_integer: f.only_integer === true,
         min_length: f.min_length,
         max_length: f.max_length,
-        isVariantTargeted: fieldIsVariantTargeted(f.field),
+        isVariantTargeted,
         metafieldTarget: `${metaTarget.namespace}.${metaTarget.key}`,
         currentValue,
         invalidValue,
@@ -339,7 +379,12 @@ export function registerInlineFieldRepairRoutes(app: Express): void {
         sourceCategory: category,
         categoryAliased: canonical !== category,
         schemaSource: live.source,
-        fields: buildInlineRepairFieldDescriptors(fields, mappedProperties, invalidEnums),
+        fields: buildInlineRepairFieldDescriptors(
+          fields,
+          mappedProperties,
+          invalidEnums,
+          variantOptionsByVariantId,
+        ),
         variantOptionsByVariantId,
       });
     } catch (err) {

@@ -26,6 +26,7 @@ import {
   buildI1ProductEnvelope,
   buildJomashopProductPayload,
   buildSchemaProperties,
+  extractVariantSize,
   coerceJomashopToSupported,
   findMetafieldSource,
   findMsrpSource,
@@ -6621,6 +6622,369 @@ function runInlineRepairResponseShape() {
   );
 }
 
+// ---------- Roger Vivier Footwear variant tests ----------------------------
+function runFootwearVariantSizeRogerVivier() {
+  console.log(
+    "Case RV-1: Footwear variant sizes 34-38 — Shoe Size derived per variant, push payload uses variant size",
+  );
+  // Mock live Footwear schema with Ladies/Mens/Kids gender, Variation
+  // Color/Size Yes/No enums, and Shoe Category/Style. Matches what the
+  // user reported in the screenshots.
+  const footwearSchema: SchemaPropertyDescriptor[] = [
+    { field: "Gender", label: "Gender", required: true, type: "enum", options: ["Ladies", "Mens", "Kids"] },
+    { field: "Shoe Size", label: "Shoe Size", required: true, type: "string" },
+    { field: "Shoe Size Type", label: "Shoe Size Type", required: true, type: "enum", options: ["US", "EU", "UK", "IT", "FR"] },
+    { field: "Color", label: "Color", required: true, type: "string" },
+    {
+      field: "Variation Size (Yes/No)",
+      label: "Variation Size (Yes/No)",
+      required: true,
+      type: "enum",
+      options: ["Yes", "No"],
+    },
+    {
+      field: "Variation Color (Yes/No)",
+      label: "Variation Color (Yes/No)",
+      required: true,
+      type: "enum",
+      options: ["Yes", "No"],
+    },
+    {
+      field: "Shoe Category",
+      label: "Shoe Category",
+      required: false,
+      type: "enum",
+      options: ["Sneakers", "Heels", "Pumps", "Boots", "Sandals", "Mules", "Slides", "Loafers", "Flats", "Wedges"],
+      allow_omit: true,
+      omit_when_unknown_enum: true,
+    },
+    {
+      field: "Shoe Style",
+      label: "Shoe Style",
+      required: false,
+      type: "enum",
+      options: ["Sneakers", "Heels", "Pumps", "Boots", "Sandals", "Mules", "Slides", "Loafers", "Flats", "Wedges"],
+      allow_omit: true,
+      omit_when_unknown_enum: true,
+    },
+  ];
+
+  const product: ShopifyProduct = {
+    id: "rv-green-sandal",
+    title: "Roger Vivier Womens Green Sandal",
+    vendor: "Roger Vivier",
+    product_type: "MULE",
+    tags: ["Women", "Sandal", "Mule"],
+    images: [{ src: "https://example.test/rv.jpg" }],
+    options: [
+      { name: "Size", values: ["34", "35", "36", "37", "38"] },
+    ],
+    variants: [
+      { id: 9001, sku: "RV-GRN-34", price: "850.00", inventory_quantity: 1, option1: "34" },
+      { id: 9002, sku: "RV-GRN-35", price: "850.00", inventory_quantity: 1, option1: "35" },
+      { id: 9003, sku: "RV-GRN-36", price: "850.00", inventory_quantity: 1, option1: "36" },
+      { id: 9004, sku: "RV-GRN-37", price: "850.00", inventory_quantity: 1, option1: "37" },
+      { id: 9005, sku: "RV-GRN-38", price: "850.00", inventory_quantity: 1, option1: "38" },
+    ],
+    metafields: [
+      { namespace: "custom", key: "color", value: "Green", name: "Color" },
+      { namespace: "custom", key: "size_scale", value: "EU" },
+      { namespace: "custom", key: "gender", value: "Women" },
+    ],
+  };
+
+  const mapped = mapShopifyToJomashop(product, footwearSchema, "Footwear");
+
+  // (1) Shoe Size canonical resolves from the first variant's size option.
+  assert(
+    mapped.properties["Shoe Size"] === "34",
+    `RV-1a: Shoe Size derived from first variant option (got=${JSON.stringify(mapped.properties["Shoe Size"])})`,
+  );
+  // (2) Shoe Size MUST NOT appear in missing_required — every variant
+  //     carries a non-empty size.
+  assert(
+    !(mapped.missing_required || []).includes("Shoe Size"),
+    `RV-1b: Shoe Size not flagged as missing (missing_required=${JSON.stringify(mapped.missing_required)})`,
+  );
+
+  // (3) Push payload per SKU includes that variant's specific Shoe Size.
+  for (const v of mapped.variants) {
+    const built = buildJomashopProductPayload(mapped, v.vendor_sku, {
+      manufacturer_id: 1,
+      category_id: 2,
+    });
+    const expectedSize = v.options.Size;
+    const props = (built.payload.properties as Record<string, unknown>) || {};
+    assert(
+      String(props["Shoe Size"]) === String(expectedSize),
+      `RV-1c (${v.vendor_sku}): push payload Shoe Size === ${expectedSize} (got=${JSON.stringify(props["Shoe Size"])})`,
+    );
+    // Variation Size (Yes/No) stays "Yes" — never the literal size.
+    assert(
+      props["Variation Size (Yes/No)"] === "Yes",
+      `RV-1d (${v.vendor_sku}): Variation Size (Yes/No) === "Yes" (got=${JSON.stringify(props["Variation Size (Yes/No)"])})`,
+    );
+  }
+
+  // (4) Variation Size & Variation Color both map to "Yes".
+  assert(
+    mapped.properties["Variation Size (Yes/No)"] === "Yes",
+    `RV-1e: Variation Size (Yes/No) === "Yes" (got=${JSON.stringify(mapped.properties["Variation Size (Yes/No)"])})`,
+  );
+
+  // (5) extractVariantSize helper agrees per-variant.
+  const v34 = mapped.variants.find((v) => v.vendor_sku === "RV-GRN-34");
+  const v38 = mapped.variants.find((v) => v.vendor_sku === "RV-GRN-38");
+  assert(
+    extractVariantSize(v34) === "34",
+    `RV-1f: extractVariantSize(variant 34) === "34" (got=${JSON.stringify(extractVariantSize(v34))})`,
+  );
+  assert(
+    extractVariantSize(v38) === "38",
+    `RV-1g: extractVariantSize(variant 38) === "38" (got=${JSON.stringify(extractVariantSize(v38))})`,
+  );
+}
+
+function runFootwearVariationColorYesNo() {
+  console.log(
+    "Case RV-2: Variation Color (Yes/No) maps to Yes/No — never the literal color value",
+  );
+  const schema: SchemaPropertyDescriptor[] = [
+    { field: "Color", label: "Color", required: true, type: "string" },
+    {
+      field: "Variation Color (Yes/No)",
+      label: "Variation Color (Yes/No)",
+      required: true,
+      type: "enum",
+      options: ["Yes", "No"],
+    },
+  ];
+
+  // (a) Product with a Color option and a non-empty value → Yes.
+  const withColor: ShopifyProduct = {
+    id: "rv-vcyn-1",
+    title: "Roger Vivier Womens Green Sandal",
+    vendor: "Roger Vivier",
+    product_type: "MULE",
+    options: [{ name: "Color", values: ["Green"] }, { name: "Size", values: ["34"] }],
+    variants: [
+      { id: 1, sku: "VCYN-1", price: "100.00", inventory_quantity: 1, option1: "Green", option2: "34" },
+    ],
+    metafields: [],
+  };
+  const mappedYes = mapShopifyToJomashop(withColor, schema, "Footwear");
+  assert(
+    mappedYes.properties["Variation Color (Yes/No)"] === "Yes",
+    `RV-2a: Variation Color (Yes/No) === "Yes" (got=${JSON.stringify(mappedYes.properties["Variation Color (Yes/No)"])})`,
+  );
+  // Critically, the literal color value "Green" MUST NOT leak into the
+  // Yes/No field — Jomashop would reject it as "is not included in the list".
+  assert(
+    mappedYes.properties["Variation Color (Yes/No)"] !== "Green",
+    `RV-2b: literal color value never sent into Variation Color (Yes/No)`,
+  );
+  assert(
+    !(mappedYes.invalid_enums || []).some((e) => e.field === "Variation Color (Yes/No)"),
+    `RV-2c: Variation Color (Yes/No) not flagged invalid (got=${JSON.stringify(mappedYes.invalid_enums)})`,
+  );
+
+  // (b) Product without a Color option AND no color metafield → No.
+  const noColor: ShopifyProduct = {
+    id: "rv-vcyn-2",
+    title: "Plain SKU",
+    vendor: "Brand",
+    product_type: "MULE",
+    options: [{ name: "Size", values: ["34"] }],
+    variants: [
+      { id: 1, sku: "VCYN-2", price: "100.00", inventory_quantity: 1, option1: "34" },
+    ],
+    metafields: [],
+  };
+  const mappedNo = mapShopifyToJomashop(noColor, schema, "Footwear");
+  assert(
+    mappedNo.properties["Variation Color (Yes/No)"] === "No",
+    `RV-2d: Variation Color (Yes/No) === "No" when no color present (got=${JSON.stringify(mappedNo.properties["Variation Color (Yes/No)"])})`,
+  );
+}
+
+function runFootwearGenderWomenToLadies() {
+  console.log(
+    "Case RV-3: Footwear Gender Women → Ladies when live accepted options list Ladies",
+  );
+  const schemaLadies: SchemaPropertyDescriptor[] = [
+    {
+      field: "Gender",
+      label: "Gender",
+      required: true,
+      type: "enum",
+      options: ["Ladies", "Mens", "Kids"],
+    },
+    { field: "Color", label: "Color", required: true, type: "string" },
+  ];
+
+  const womens: ShopifyProduct = {
+    id: "rv-gender-1",
+    title: "Roger Vivier Womens Green Sandal",
+    vendor: "Roger Vivier",
+    product_type: "MULE",
+    options: [{ name: "Size", values: ["34"] }],
+    variants: [
+      { id: 1, sku: "RV-G-1", price: "100.00", inventory_quantity: 1, option1: "34" },
+    ],
+    metafields: [
+      { namespace: "custom", key: "color", value: "Green" },
+      { namespace: "custom", key: "gender", value: "Women" },
+    ],
+  };
+  const mapped = mapShopifyToJomashop(womens, schemaLadies, "Footwear");
+  assert(
+    mapped.properties["Gender"] === "Ladies",
+    `RV-3a: Gender Women → "Ladies" (got=${JSON.stringify(mapped.properties["Gender"])})`,
+  );
+  assert(
+    !(mapped.invalid_enums || []).some((e) => e.field === "Gender"),
+    `RV-3b: Gender not flagged invalid (got=${JSON.stringify(mapped.invalid_enums)})`,
+  );
+
+  // Men → Mens
+  const mens = {
+    ...womens,
+    id: "rv-gender-2",
+    metafields: [
+      { namespace: "custom", key: "color", value: "Black" },
+      { namespace: "custom", key: "gender", value: "Men" },
+    ],
+  };
+  const mappedMens = mapShopifyToJomashop(mens, schemaLadies, "Footwear");
+  assert(
+    mappedMens.properties["Gender"] === "Mens",
+    `RV-3c: Gender Men → "Mens" (got=${JSON.stringify(mappedMens.properties["Gender"])})`,
+  );
+
+  // When live accepted options are the legacy Men/Women set, the mapper
+  // must NOT spuriously coerce — Women stays Women.
+  const schemaLegacy: SchemaPropertyDescriptor[] = [
+    {
+      field: "Gender",
+      label: "Gender",
+      required: true,
+      type: "enum",
+      options: ["Men", "Women", "Unisex", "Kids"],
+    },
+    { field: "Color", label: "Color", required: true, type: "string" },
+  ];
+  const mappedLegacy = mapShopifyToJomashop(womens, schemaLegacy, "Footwear");
+  assert(
+    mappedLegacy.properties["Gender"] === "Women",
+    `RV-3d: Gender stays Women when the live list lists Women (got=${JSON.stringify(mappedLegacy.properties["Gender"])})`,
+  );
+}
+
+function runFootwearShoeCategoryMuleSandal() {
+  console.log(
+    "Case RV-4: Footwear Shoe Category / Shoe Style auto-mapped from product_type=MULE / title=Sandal",
+  );
+  const schema: SchemaPropertyDescriptor[] = [
+    {
+      field: "Shoe Category",
+      label: "Shoe Category",
+      required: false,
+      type: "enum",
+      options: ["Sneakers", "Heels", "Pumps", "Boots", "Sandals", "Mules", "Slides", "Loafers", "Flats", "Wedges"],
+      allow_omit: true,
+      omit_when_unknown_enum: true,
+    },
+    {
+      field: "Shoe Style",
+      label: "Shoe Style",
+      required: false,
+      type: "enum",
+      options: ["Sneakers", "Heels", "Sandals", "Mules", "Slides", "Loafers", "Flats", "Wedges"],
+      allow_omit: true,
+      omit_when_unknown_enum: true,
+    },
+    { field: "Color", label: "Color", required: true, type: "string" },
+  ];
+
+  const muleProduct: ShopifyProduct = {
+    id: "rv-mule-1",
+    title: "Roger Vivier Womens Green Sandal",
+    vendor: "Roger Vivier",
+    product_type: "MULE",
+    options: [{ name: "Size", values: ["34"] }],
+    variants: [
+      { id: 1, sku: "RV-M-1", price: "100.00", inventory_quantity: 1, option1: "34" },
+    ],
+    metafields: [{ namespace: "custom", key: "color", value: "Green" }],
+  };
+  const mapped = mapShopifyToJomashop(muleProduct, schema, "Footwear");
+  // At least one of Shoe Category / Shoe Style resolved to a live option
+  // — never left blank when the title or product_type can be matched.
+  const shoeCat = mapped.properties["Shoe Category"];
+  const shoeStyle = mapped.properties["Shoe Style"];
+  assert(
+    shoeCat === "Mules" || shoeCat === "Sandals" || shoeStyle === "Mules" || shoeStyle === "Sandals",
+    `RV-4a: Shoe Category/Style resolved from MULE/Sandal (Shoe Category=${JSON.stringify(shoeCat)}, Shoe Style=${JSON.stringify(shoeStyle)})`,
+  );
+}
+
+function runInlineRepairRecognizesPerVariantSize() {
+  console.log(
+    "Case RV-5: Inline repair panel does NOT request Shoe Size when every variant supplies one",
+  );
+  const footwearSchema: SchemaPropertyDescriptor[] = [
+    { field: "Gender", label: "Gender", required: true, type: "enum", options: ["Ladies", "Mens", "Kids"] },
+    { field: "Shoe Size", label: "Shoe Size", required: true, type: "string" },
+    { field: "Shoe Size Type", label: "Shoe Size Type", required: true, type: "enum", options: ["US", "EU", "UK"] },
+    { field: "Color", label: "Color", required: true, type: "string" },
+  ];
+
+  // Case A: properties already carries Shoe Size (mapper saw the variant
+  // option) — the descriptor should be "ok".
+  const variantOpts: Record<string, Record<string, string>> = {
+    "1": { Size: "34" },
+    "2": { Size: "35" },
+    "3": { Size: "36" },
+    "4": { Size: "37" },
+    "5": { Size: "38" },
+  };
+  const descA = buildInlineRepairFieldDescriptors(
+    footwearSchema,
+    { Gender: "Ladies", "Shoe Size": "34", "Shoe Size Type": "EU", Color: "Green" },
+    [],
+    variantOpts,
+  );
+  const shoeSizeA = descA.find((d) => d.field === "Shoe Size");
+  assert(
+    shoeSizeA !== undefined && shoeSizeA.status === "ok",
+    `RV-5a: Shoe Size status === "ok" when variants supply it (got=${JSON.stringify(shoeSizeA)})`,
+  );
+  assert(
+    shoeSizeA !== undefined && shoeSizeA.needsRepair === false,
+    `RV-5b: Shoe Size needsRepair === false (got=${JSON.stringify(shoeSizeA)})`,
+  );
+
+  // Case B: mapper-emitted properties happen to be missing "Shoe Size"
+  // (e.g. canonical extraction failed) but every variant carries one —
+  // the helper must still surface "ok" with the variant sizes as
+  // currentValue so the operator isn't asked to fill it manually.
+  const descB = buildInlineRepairFieldDescriptors(
+    footwearSchema,
+    { Gender: "Ladies", "Shoe Size Type": "EU", Color: "Green" },
+    [],
+    variantOpts,
+  );
+  const shoeSizeB = descB.find((d) => d.field === "Shoe Size");
+  assert(
+    shoeSizeB !== undefined && shoeSizeB.status === "ok",
+    `RV-5c: Shoe Size status === "ok" when properties is blank but variants supply size (got=${JSON.stringify(shoeSizeB)})`,
+  );
+  assert(
+    shoeSizeB !== undefined && /34/.test(shoeSizeB.currentValue) && /38/.test(shoeSizeB.currentValue),
+    `RV-5d: currentValue summarizes variant sizes 34..38 (got=${JSON.stringify(shoeSizeB?.currentValue)})`,
+  );
+}
+
 runInlineRepairWarningUsesCanonicalApparel();
 runInlineRepairCompactProjectionCarriesInvalidEnums();
 runDeriveReadinessAfterRepair();
@@ -6683,6 +7047,12 @@ await runProductFieldDropdownCoverage();
 await runProductFieldSheetRecognitionAndForceWriteback();
 await runGoLivePatchTests();
 await runFullCatalogAndDisconnectedExportTests();
+
+runFootwearVariantSizeRogerVivier();
+runFootwearVariationColorYesNo();
+runFootwearGenderWomenToLadies();
+runFootwearShoeCategoryMuleSandal();
+runInlineRepairRecognizesPerVariantSize();
 
 if (failures > 0) {
   console.error(`\n${failures} assertion(s) failed.`);
