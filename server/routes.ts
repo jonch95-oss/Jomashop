@@ -60,6 +60,7 @@ import {
 import { registerResolutionAuditRoutes } from "./resolution_audit";
 import { registerJomashopMappingExcelRoutes } from "./jomashop_mapping_excel";
 import { registerJomashopProductFieldExcelRoutes } from "./jomashop_product_field_excel";
+import { registerInlineFieldRepairRoutes } from "./inline_field_repair";
 import { pushInventoryUpdate, registerWebhookRoutes, registerShopifyWebhooks } from "./webhooks";
 import { logMemory } from "./memlog";
 import { releaseLock, withLockOr409 } from "./stability";
@@ -3258,6 +3259,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // Valid values are written to Shopify metafields (jomashop.<key>) and the
   // cached preview is invalidated.
   registerJomashopProductFieldExcelRoutes(app);
+  registerInlineFieldRepairRoutes(app);
 
   // ---------- Shopify webhooks (public, HMAC-verified) ----------
   registerWebhookRoutes(app);

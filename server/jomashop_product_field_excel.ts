@@ -158,6 +158,13 @@ const VARIANT_FIELD_TOKENS = new Set<string>([
   "variation",
   "shoesize",
   "size_us",
+  // Apparel / footwear size labels — the size *value* is per-variant in
+  // Shopify (each variant has its own size + a separate metafield row), so
+  // the inline repair flow routes "Apparel Size" to ProductVariant. The
+  // *size system* (Apparel Size Type / Size Code) is a product-wide setting
+  // (US vs EU sizing for the whole product), so it stays on the product
+  // metafield — do NOT include those tokens here.
+  "apparelsize",
 ]);
 
 export function fieldIsVariantTargeted(propertyName: string): boolean {
@@ -228,7 +235,7 @@ export function deriveMetafieldTargetForProductField(propertyName: string): {
 
 // ---------- Schema loading per category ----------
 
-async function loadLiveSchemaForCategory(category: string): Promise<{
+export async function loadLiveSchemaForCategory(category: string): Promise<{
   fields: SchemaPropertyDescriptor[];
   source: "live-v1" | "live-i1" | "fallback" | "unknown";
 }> {
@@ -1348,7 +1355,7 @@ export async function parseProductFieldUpload(
 
 const ADMIN_API_VERSION = "2024-10";
 
-async function writeMetafield(
+export async function writeMetafield(
   conn: { shopDomain: string; accessToken: string },
   ownerId: string,
   namespace: string,

@@ -21,6 +21,7 @@ import { BulkRepairCard } from "@/components/BulkRepair";
 import { CategoryMappingCard } from "@/components/CategoryMapping";
 import { BrandMappingCard } from "@/components/BrandMapping";
 import { ResolutionAuditCard } from "@/components/ResolutionAudit";
+import { InlineFieldRepair } from "@/components/InlineFieldRepair";
 import type { MappedProduct } from "@/lib/types";
 
 type OverrideFields = {
@@ -953,6 +954,45 @@ export default function Products() {
                         </Button>
                       </div>
                     </CardHeader>
+                    {!p.is_sample &&
+                      p.source.shopify_product_id !== undefined &&
+                      p.source.shopify_product_id !== null &&
+                      (missing.length > 0 ||
+                        (Array.isArray(p.unverified_required_options) &&
+                          p.unverified_required_options.length > 0)) && (
+                        <details
+                          className="border-b border-card-border bg-amber-500/[0.04] p-4"
+                          data-testid={`details-inline-repair-${p.vendor_sku}`}
+                        >
+                          <summary className="flex cursor-pointer items-center gap-2 text-sm font-medium">
+                            <AlertTriangle className="h-4 w-4 text-amber-500" />
+                            Repair missing Jomashop fields ({missing.length})
+                            <span className="text-[11px] font-normal text-muted-foreground">
+                              — fill the required fields below and save without leaving the page
+                            </span>
+                          </summary>
+                          <div className="mt-3">
+                            <InlineFieldRepair
+                              productId={String(p.source.shopify_product_id)}
+                              missingFields={missing}
+                              onSaved={() => {
+                                // Invalidate cache + push-status queries so the
+                                // list view re-derives readiness with the new
+                                // metafield values on the next refetch.
+                                queryClient.invalidateQueries({
+                                  queryKey: ["/api/products/cache"],
+                                });
+                                queryClient.invalidateQueries({
+                                  queryKey: ["/api/push-statuses"],
+                                });
+                              }}
+                              onSaveAndPush={() => {
+                                openPushModal(idx, p);
+                              }}
+                            />
+                          </div>
+                        </details>
+                      )}
                     <CardContent className="grid grid-cols-1 gap-4 p-5 md:grid-cols-3">
                       <div>
                         <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Brand / Designer</div>

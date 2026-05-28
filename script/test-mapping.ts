@@ -77,6 +77,7 @@ import {
   resolveSheetCategory,
   type ProductFieldExportResult,
 } from "../server/jomashop_product_field_excel";
+import { validateInlineFieldValue } from "../server/inline_field_repair";
 
 // Pure (storage-free) enum override resolver that mimics the production
 // lookupEnumOverride for tests. Mirrors the strict trust gate used in
@@ -5690,6 +5691,212 @@ async function runFullCatalogAndDisconnectedExportTests() {
   }
 }
 
+function runInlineFieldRepairValidation() {
+  console.log("Case 53: inline field repair validation against live schema");
+
+  // Enum field — accepted option passes; non-accepted fails.
+  const articleField: SchemaPropertyDescriptor = {
+    field: "Article",
+    required: true,
+    type: "enum",
+    options: ["Shirt", "Pants", "Dress"],
+  };
+  assert(
+    validateInlineFieldValue(articleField, "Shirt") === null,
+    "Case 53a: accepted enum value passes validation (Article=Shirt)",
+  );
+  const bad = validateInlineFieldValue(articleField, "Sock");
+  assert(
+    typeof bad === "string" && bad.includes("not in the live accepted-options list"),
+    `Case 53a: rejected enum value returns informative error (got "${bad}")`,
+  );
+  const blank = validateInlineFieldValue(articleField, "");
+  assert(
+    typeof blank === "string" && blank === "Value is required.",
+    `Case 53a: blank required value rejected (got "${blank}")`,
+  );
+
+  // Multi-select enum (comma-separated) — every token must match.
+  const multiField: SchemaPropertyDescriptor = {
+    field: "Materials",
+    required: true,
+    type: "enum",
+    options: ["Cotton", "Wool", "Silk"],
+    multiple: true,
+  };
+  assert(
+    validateInlineFieldValue(multiField, "Cotton, Wool") === null,
+    "Case 53b: multi-select all-accepted tokens pass",
+  );
+  const multiBad = validateInlineFieldValue(multiField, "Cotton, Plastic");
+  assert(
+    typeof multiBad === "string" && multiBad.includes("Plastic"),
+    `Case 53b: multi-select rejects one bad token (got "${multiBad}")`,
+  );
+
+  // Numeric with bounds + integer-only.
+  const ageField: SchemaPropertyDescriptor = {
+    field: "Age",
+    required: false,
+    type: "integer",
+    only_integer: true,
+    min_value: 0,
+    max_value: 120,
+  };
+  assert(validateInlineFieldValue(ageField, "42") === null, "Case 53c: integer in range passes (Age=42)");
+  const ageDecErr = validateInlineFieldValue(ageField, "3.5");
+  assert(
+    typeof ageDecErr === "string" && ageDecErr.includes("integer"),
+    `Case 53c: decimal rejected for integer field (got "${ageDecErr}")`,
+  );
+  const ageHighErr = validateInlineFieldValue(ageField, "200");
+  assert(
+    typeof ageHighErr === "string" && ageHighErr.includes("max_value"),
+    `Case 53c: above-max rejected (got "${ageHighErr}")`,
+  );
+
+  // String length bounds.
+  const skuField: SchemaPropertyDescriptor = {
+    field: "Parent SKU",
+    required: false,
+    type: "string",
+    min_length: 3,
+    max_length: 50,
+  };
+  assert(validateInlineFieldValue(skuField, "ABC-123") === null, "Case 53d: in-range string passes");
+  const tooShort = validateInlineFieldValue(skuField, "A");
+  assert(
+    typeof tooShort === "string" && tooShort.includes("min_length"),
+    `Case 53d: too-short string rejected (got "${tooShort}")`,
+  );
+
+  // Global 1000-char cap when schema doesn't declare a longer max_length.
+  const longField: SchemaPropertyDescriptor = {
+    field: "Description",
+    required: false,
+    type: "string",
+  };
+  const longErr = validateInlineFieldValue(longField, "x".repeat(1001));
+  assert(
+    typeof longErr === "string" && longErr.includes("1000"),
+    `Case 53d: 1001-char string rejected by global cap (got "${longErr}")`,
+  );
+
+  // Unknown field — falls back to global cap only.
+  assert(
+    validateInlineFieldValue(undefined, "anything ok") === null,
+    "Case 53e: unknown field accepts any non-blank string",
+  );
+}
+
+function runInlineFieldRepairMetafieldTargets() {
+  console.log("Case 54: inline field repair metafield namespace/key + variant routing");
+
+  // Default namespace strategy — slugified field name in `jomashop` namespace.
+  const apparelSize = deriveMetafieldTargetForProductField("Apparel Size");
+  assert(
+    apparelSize.namespace === "jomashop" && apparelSize.key === "apparel_size",
+    `Case 54a: Apparel Size → jomashop.apparel_size (got ${apparelSize.namespace}.${apparelSize.key})`,
+  );
+  const sizeCode = deriveMetafieldTargetForProductField("Apparel Size Type/Size Code");
+  assert(
+    sizeCode.namespace === "jomashop" && sizeCode.key === "apparel_size_type_size_code",
+    `Case 54a: punctuation-heavy field slugifies cleanly (got ${sizeCode.namespace}.${sizeCode.key})`,
+  );
+  const variationSize = deriveMetafieldTargetForProductField("Variation Size (Yes/No)");
+  assert(
+    variationSize.namespace === "jomashop" && variationSize.key === "variation_size_yes_no",
+    `Case 54a: Variation Size (Yes/No) → jomashop.variation_size_yes_no (got ${variationSize.namespace}.${variationSize.key})`,
+  );
+  const productId = deriveMetafieldTargetForProductField("Product ID");
+  const productIdType = deriveMetafieldTargetForProductField("Product ID Type");
+  assert(
+    productId.key === "product_id" && productIdType.key === "product_id_type",
+    "Case 54a: Product ID / Product ID Type slugify distinctly",
+  );
+
+  // Variant routing — Size-family fields write to the variant; everything
+  // else writes to the product. This is the rule the inline-repair backend
+  // uses to pick `gid://shopify/ProductVariant/...` vs `Product`.
+  assert(fieldIsVariantTargeted("Apparel Size") === true, "Case 54b: Apparel Size routes to variant");
+  assert(fieldIsVariantTargeted("Shoe Size") === true, "Case 54b: Shoe Size routes to variant");
+  assert(fieldIsVariantTargeted("Variation Size") === true, "Case 54b: Variation Size routes to variant");
+  assert(fieldIsVariantTargeted("Variation Size (Yes/No)") === true, "Case 54b: Variation Size (Yes/No) routes to variant");
+  assert(fieldIsVariantTargeted("Color") === false, "Case 54b: Color routes to product");
+  assert(fieldIsVariantTargeted("Gender") === false, "Case 54b: Gender routes to product");
+  assert(fieldIsVariantTargeted("Article") === false, "Case 54b: Article routes to product");
+  assert(fieldIsVariantTargeted("Parent SKU") === false, "Case 54b: Parent SKU routes to product");
+  assert(fieldIsVariantTargeted("Product ID") === false, "Case 54b: Product ID routes to product");
+  // Size system / size code is a product-wide setting (US vs EU sizing for
+  // the whole product), so it stays on the product metafield even though it
+  // has "Size" in the name.
+  assert(
+    fieldIsVariantTargeted("Apparel Size Type") === false,
+    "Case 54b: Apparel Size Type (size system) routes to product",
+  );
+  assert(
+    fieldIsVariantTargeted("Size Code") === false,
+    "Case 54b: Size Code (size system) routes to product",
+  );
+}
+
+function runInlineFieldRepairPostSaveReadiness() {
+  console.log("Case 55: post-save remap clears missing-required when metafields satisfy schema");
+
+  // Simulate a product that was missing Color before the inline repair, then
+  // re-mapped after the metafield was written.
+  const apparelSchema: SchemaPropertyDescriptor[] = [
+    { field: "Color", required: true, type: "string" },
+    { field: "Gender", required: true, type: "enum", options: ["Men", "Women"] },
+    { field: "Article", required: true, type: "enum", options: ["Shirt", "Pants"] },
+  ];
+
+  const before: ShopifyProduct = {
+    id: "p-inline-1",
+    title: "Cavalli Class Mens Navy Shirt",
+    vendor: "Cavalli Class",
+    product_type: "Clothing",
+    tags: [],
+    body_html: "",
+    metafields: [
+      { namespace: "jomashop", key: "gender", value: "Men" },
+      { namespace: "jomashop", key: "article", value: "Shirt" },
+    ],
+  };
+  const mappedBefore = mapShopifyToJomashop(before, apparelSchema);
+  assert(
+    Array.isArray((mappedBefore as any).missing_required) &&
+      ((mappedBefore as any).missing_required as string[]).map((s) => s.toLowerCase()).includes("color"),
+    "Case 55a: missing_required surfaces Color before inline repair",
+  );
+
+  // After the inline repair writes `jomashop.color = "Navy"`, re-mapping must
+  // pick the value up from the metafield and clear missing_required.
+  const after: ShopifyProduct = {
+    ...before,
+    metafields: [
+      ...(before.metafields || []),
+      { namespace: "jomashop", key: "color", value: "Navy" },
+    ],
+  };
+  const mappedAfter = mapShopifyToJomashop(after, apparelSchema);
+  assert(
+    Array.isArray((mappedAfter as any).missing_required) &&
+      !(((mappedAfter as any).missing_required as string[]).map((s) => s.toLowerCase()).includes("color")),
+    "Case 55b: missing_required drops Color after inline repair writeback",
+  );
+  // Push-ready when all required fields satisfied and no invalid enums.
+  const stillMissing = ((mappedAfter as any).missing_required as string[]) || [];
+  const invalid = ((mappedAfter as any).invalid_enums as Array<unknown>) || [];
+  assert(
+    stillMissing.length === 0 && invalid.length === 0,
+    `Case 55b: product is push-ready after inline repair (missing=${stillMissing.length}, invalid=${invalid.length})`,
+  );
+}
+
+runInlineFieldRepairValidation();
+runInlineFieldRepairMetafieldTargets();
+runInlineFieldRepairPostSaveReadiness();
 runResolvedRecordsRequiredForReadiness();
 runBuiltInBrandSeeds();
 await runResolutionAuditHelpers();
