@@ -300,6 +300,163 @@ function verifyShopifyHmac(query: Record<string, string | string[] | undefined>)
   }
 }
 
+type JomashopOrderLine = {
+  sku?: string;
+  jomashop_sku?: string;
+  quantity?: number | string;
+  price?: number | string;
+};
+
+type JomashopOrder = {
+  sales_order_number?: string;
+  placed_at?: string;
+  status?: string;
+  gift_message?: string | null;
+  ship_method?: string | null;
+  shipping_address?: Record<string, unknown> | null;
+  line_items?: JomashopOrderLine[];
+};
+
+function extractJomashopOrders(data: unknown): JomashopOrder[] {
+  const d: any = data;
+  if (Array.isArray(d)) return d as JomashopOrder[];
+  if (Array.isArray(d?.orders)) return d.orders as JomashopOrder[];
+  if (Array.isArray(d?.data?.orders)) return d.data.orders as JomashopOrder[];
+  if (Array.isArray(d?.items)) return d.items as JomashopOrder[];
+  if (Array.isArray(d?.data)) return d.data as JomashopOrder[];
+  if (d?.order && typeof d.order === "object") return [d.order as JomashopOrder];
+  return [];
+}
+
+function numericShopifyId(raw: unknown): number | undefined {
+  if (raw === null || raw === undefined) return undefined;
+  const m = String(raw).match(/(\d+)$/);
+  if (!m) return undefined;
+  const n = Number(m[1]);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function shopifyAddressFromJomashop(addr: Record<string, unknown> | null | undefined): Record<string, unknown> | undefined {
+  if (!addr || typeof addr !== "object") return undefined;
+  const fullName = String(addr.name ?? "").trim();
+  const [firstName, ...lastParts] = fullName.split(/\s+/).filter(Boolean);
+  return {
+    first_name: firstName || undefined,
+    last_name: lastParts.join(" ") || undefined,
+    address1: addr.address1 ? String(addr.address1) : undefined,
+    address2: addr.address2 ? String(addr.address2) : undefined,
+    city: addr.city ? String(addr.city) : undefined,
+    province: addr.state ? String(addr.state) : undefined,
+    zip: addr.zip ? String(addr.zip) : undefined,
+    country_code: addr.country ? String(addr.country) : undefined,
+    name: fullName || undefined,
+  };
+}
+
+async function createShopifyOrderFromJomashop(
+  conn: { shopDomain: string; accessToken: string },
+  order: JomashopOrder,
+): Promise<{ ok: boolean; status: number; data?: unknown; error?: string; shopifyOrderId?: string }> {
+  const salesOrderNumber = String(order.sales_order_number || "").trim();
+  if (!salesOrderNumber) {
+    return { ok: false, status: 422, error: "Missing sales_order_number" };
+  }
+
+  const pushed = storage.listPushStatuses(conn.shopDomain);
+  const byShopifySku = new Map(pushed.map((p) => [p.shopifySku, p]));
+  const byJomashopSku = new Map(
+    pushed
+      .filter((p) => p.jomashopSku)
+      .map((p) => [String(p.jomashopSku), p]),
+  );
+
+  const lineItems = (Array.isArray(order.line_items) ? order.line_items : []).map((li) => {
+    const sku = String(li.sku || "").trim();
+    const jomashopSku = String(li.jomashop_sku || "").trim();
+    const push = byShopifySku.get(sku) || byJomashopSku.get(jomashopSku);
+    const variantId = numericShopifyId(push?.shopifyVariantId);
+    const quantity = Math.max(parseInt(String(li.quantity ?? "1"), 10) || 1, 1);
+    const priceNumber = Number(li.price ?? 0);
+    const base: Record<string, unknown> = {
+      quantity,
+      price: Number.isFinite(priceNumber) ? String(priceNumber) : "0.00",
+      sku: sku || push?.shopifySku || jomashopSku || undefined,
+      title: sku || push?.shopifySku || jomashopSku || "Jomashop item",
+      requires_shipping: true,
+    };
+    if (variantId !== undefined) {
+      base.variant_id = variantId;
+      delete base.title;
+      delete base.price;
+      delete base.sku;
+    }
+    return base;
+  });
+
+  if (lineItems.length === 0) {
+    return { ok: false, status: 422, error: "Order has no line_items to import" };
+  }
+
+  const address = shopifyAddressFromJomashop(order.shipping_address);
+  const body = {
+    order: {
+      source_name: "jomashop",
+      financial_status: "pending",
+      inventory_behaviour: "decrement_obeying_policy",
+      tags: "jomashop,jomashop-import",
+      note: [
+        `Imported from Jomashop sales order ${salesOrderNumber}.`,
+        order.gift_message ? `Gift message: ${order.gift_message}` : null,
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      note_attributes: [
+        { name: "jomashop_sales_order_number", value: salesOrderNumber },
+        { name: "jomashop_status", value: String(order.status || "") },
+        { name: "jomashop_ship_method", value: String(order.ship_method || "") },
+      ],
+      processed_at: order.placed_at || undefined,
+      shipping_address: address,
+      billing_address: address,
+      shipping_lines: order.ship_method
+        ? [{ title: String(order.ship_method), code: String(order.ship_method), price: "0.00" }]
+        : undefined,
+      line_items: lineItems,
+    },
+  };
+
+  const resp = await fetch(`https://${conn.shopDomain}/admin/api/2024-10/orders.json`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Shopify-Access-Token": conn.accessToken,
+    },
+    body: JSON.stringify(body),
+  });
+  const text = await resp.text().catch(() => "");
+  let data: any = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = text;
+  }
+  if (!resp.ok) {
+    return {
+      ok: false,
+      status: resp.status,
+      error: typeof data === "string" ? data : JSON.stringify(data),
+      data,
+    };
+  }
+  const shopifyOrderId = data?.order?.admin_graphql_api_id || data?.order?.id;
+  return {
+    ok: true,
+    status: resp.status,
+    data,
+    shopifyOrderId: shopifyOrderId !== undefined && shopifyOrderId !== null ? String(shopifyOrderId) : undefined,
+  };
+}
+
 // -------------------- routes --------------------
 
 export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
@@ -349,6 +506,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       "import.product-fields",
       "bulkRepair.export",
       "import.bulk-repair",
+      "orders.import-to-shopify",
     ];
     res.json({
       ok: true,
@@ -914,9 +1072,160 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.get("/api/jomashop/orders", async (req, res) => {
     if (!jomashopConfigured()) return res.json({ configured: false, items: [] });
     const status = String(req.query.status || "new");
-    const result = await jomashopRequest({ path: "/v1/orders", query: { status } });
+    const result = await jomashopRequest({
+      path: "/v1/orders",
+      query: {
+        status,
+        page: String(req.query.page ?? "1"),
+        per_page: String(req.query.per_page ?? "50"),
+      },
+    });
     if (!result.ok) return res.status(502).json({ error: result.error });
     res.json({ configured: true, data: result.data });
+  });
+
+  app.post("/api/jomashop/orders/import-to-shopify", async (req, res) => {
+    const confirm = req.body?.confirm === true;
+    if (!confirm) {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing confirmation. Set confirm: true to create Shopify orders.",
+      });
+    }
+    if (!jomashopConfigured()) {
+      return res.status(503).json({ ok: false, error: "Jomashop credentials not configured." });
+    }
+    const conn = getActiveShopifyConnection();
+    if (!conn) {
+      return res.status(503).json({ ok: false, error: "No connected Shopify store with an access token." });
+    }
+    if (!withLockOr409(res, "orders.import-to-shopify")) return;
+    const status = String(req.body?.status || "new");
+    const limit = Math.min(Math.max(parseInt(String(req.body?.limit ?? "50"), 10) || 50, 1), 100);
+    const startedAt = Date.now();
+    const job = storage.createSyncJob({
+      jobType: "orders_import_shopify",
+      status: "running",
+      startedAt,
+      finishedAt: null,
+      totalItems: 0,
+      successItems: 0,
+      errorItems: 0,
+      summary: `Import Jomashop ${status} orders to Shopify`,
+    });
+    try {
+      const result = await jomashopRequest({ path: "/v1/orders", query: { status, page: 1, per_page: limit } });
+      if (!result.ok) {
+        storage.updateSyncJob(job.id, {
+          status: "failed",
+          finishedAt: Date.now(),
+          errorItems: 1,
+          summary: `Jomashop orders fetch failed: ${result.error}`,
+        });
+        return res.status(502).json({ ok: false, error: result.error });
+      }
+      const orders = extractJomashopOrders(result.data).slice(0, limit);
+      const imported = storage.listImportedOrders();
+      const importedBySo = new Map(imported.map((o) => [o.salesOrderNumber, o]));
+      const results: Array<{
+        sales_order_number: string;
+        status: "created" | "skipped" | "failed";
+        shopify_order_id?: string | null;
+        message: string;
+      }> = [];
+      let created = 0;
+      let skipped = 0;
+      let failed = 0;
+
+      for (const order of orders) {
+        const so = String(order.sales_order_number || "").trim();
+        if (!so) {
+          failed += 1;
+          results.push({ sales_order_number: "", status: "failed", message: "Order missing sales_order_number" });
+          continue;
+        }
+        const existing = importedBySo.get(so);
+        if (existing?.shopifyOrderId) {
+          skipped += 1;
+          results.push({
+            sales_order_number: so,
+            status: "skipped",
+            shopify_order_id: existing.shopifyOrderId,
+            message: "Already imported to Shopify",
+          });
+          storage.upsertImportedOrder({
+            salesOrderNumber: so,
+            status: String(order.status || existing.status || status),
+            payloadJson: JSON.stringify(order),
+            shopifyOrderId: existing.shopifyOrderId,
+            importedAt: existing.importedAt,
+            updatedAt: Date.now(),
+          });
+          continue;
+        }
+
+        const create = await createShopifyOrderFromJomashop(conn, order);
+        if (create.ok) {
+          created += 1;
+          storage.upsertImportedOrder({
+            salesOrderNumber: so,
+            status: String(order.status || status),
+            payloadJson: JSON.stringify(order),
+            shopifyOrderId: create.shopifyOrderId ?? null,
+            importedAt: existing?.importedAt ?? Date.now(),
+            updatedAt: Date.now(),
+          });
+          results.push({
+            sales_order_number: so,
+            status: "created",
+            shopify_order_id: create.shopifyOrderId ?? null,
+            message: "Created Shopify order",
+          });
+        } else {
+          failed += 1;
+          storage.upsertImportedOrder({
+            salesOrderNumber: so,
+            status: String(order.status || status),
+            payloadJson: JSON.stringify({ ...order, shopify_import_error: create.error }),
+            shopifyOrderId: existing?.shopifyOrderId ?? null,
+            importedAt: existing?.importedAt ?? Date.now(),
+            updatedAt: Date.now(),
+          });
+          results.push({
+            sales_order_number: so,
+            status: "failed",
+            message: create.error || `Shopify order create failed (${create.status})`,
+          });
+        }
+      }
+
+      storage.updateSyncJob(job.id, {
+        status: failed > 0 ? "failed" : "success",
+        finishedAt: Date.now(),
+        totalItems: orders.length,
+        successItems: created + skipped,
+        errorItems: failed,
+        summary: `Orders import: ${created} created / ${skipped} skipped / ${failed} failed`,
+      });
+      storage.appendLog({
+        jobId: job.id,
+        level: failed > 0 ? "warn" : "info",
+        message: `Jomashop orders import to Shopify: ${created} created / ${skipped} skipped / ${failed} failed`,
+        detailsJson: JSON.stringify({ status, limit, results }),
+        createdAt: Date.now(),
+      });
+      return res.json({ ok: failed === 0, jobId: job.id, fetched: orders.length, created, skipped, failed, results });
+    } catch (err) {
+      storage.updateSyncJob(job.id, {
+        status: "failed",
+        finishedAt: Date.now(),
+        errorItems: 1,
+        summary: (err as Error).message,
+      });
+      return res.status(500).json({ ok: false, error: (err as Error).message });
+    } finally {
+      releaseLock("orders.import-to-shopify");
+    }
   });
 
   // ---------- Sync previews ----------
