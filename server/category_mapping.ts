@@ -24,6 +24,10 @@ import {
 import { getActiveShopifyConnection } from "./shopify";
 import { getCategories } from "./jomashop";
 import {
+  CANONICAL_JOMASHOP_CATEGORY_ALIASES,
+  canonicalJomashopCategory,
+} from "@shared/schema";
+import {
   MAX_IMPORT_ROWS,
   rejectIfTooManyRows,
 } from "./stability";
@@ -215,6 +219,212 @@ export async function aggregateCategoryCodes(): Promise<CategoryAggregateResult>
   result.rows = rows;
   return result;
 }
+
+// ---------- Audit (embedded UI) ----------
+
+export type CategoryAuditStatus =
+  | "mapped" // operator-saved override resolves to a category present in live (or supported) list
+  | "alias" // built-in default OR alias rewrite (Clothing → Apparel) drives the result
+  | "unmapped" // no operator override, no built-in default — needs decision
+  | "invalid"; // a mapping exists but the target is not in live Jomashop categories OR supported list
+
+export type CategoryAuditRow = {
+  shopify_category_code: string;
+  shopify_category_code_normalized: string;
+  product_count: number;
+  missing_count: number;
+  sample_titles: string[];
+  sample_skus: string[];
+  /** What the operator (or built-in) currently says the category should be.
+   *  null when no mapping exists. */
+  current_jomashop_category: string | null;
+  /** Final category name after the canonical alias step (e.g. Clothing → Apparel). */
+  resolved_jomashop_category: string | null;
+  /** True when the canonical alias step changed the value. UI uses this to
+   *  render "Clothing → Apparel" badges. */
+  has_alias: boolean;
+  alias_target: string | null;
+  /** Where the mapping comes from. "operator" wins over "built-in". */
+  source: "operator" | "built-in" | "none";
+  status: CategoryAuditStatus;
+  /** Human-readable explanation surfaced to the UI. */
+  status_reason: string;
+  suggested_category: string;
+  ambiguous: boolean;
+  jomashop_schema_loaded: boolean;
+};
+
+export type CategoryAuditResult = {
+  shopDomain: string | null;
+  fromCache: boolean;
+  cachedAt: number | null;
+  totalProducts: number;
+  uniqueCodes: number;
+  jomashopCategoriesAvailable: boolean;
+  jomashopCategories: string[];
+  /** Combined choice list for the inline dropdown — live categories when
+   *  available, plus any SUPPORTED_CATEGORIES not already in the live list. */
+  pickerCategories: string[];
+  totals: {
+    mapped: number;
+    alias: number;
+    unmapped: number;
+    invalid: number;
+    needsMapping: number; // unmapped + invalid (i.e. the "needs decision" bucket)
+    productsAffectedNeedsMapping: number;
+  };
+  rows: CategoryAuditRow[];
+};
+
+/**
+ * Pure helper: compute audit rows for a given aggregate + Jomashop category
+ * list. Extracted so the unit tests can call it without spinning up Express.
+ */
+export function buildCategoryAuditRows(
+  agg: CategoryAggregateResult,
+): { rows: CategoryAuditRow[]; pickerCategories: string[] } {
+  // Build the combined picker list — live Jomashop categories first (in their
+  // original order), then any SUPPORTED_CATEGORIES not already present.
+  const seen = new Set<string>();
+  const pickerCategories: string[] = [];
+  for (const name of agg.jomashopCategories) {
+    const key = name.toLowerCase().trim();
+    if (key && !seen.has(key)) {
+      seen.add(key);
+      pickerCategories.push(name);
+    }
+  }
+  for (const name of SUPPORTED_CATEGORIES) {
+    const key = name.toLowerCase().trim();
+    if (key && !seen.has(key)) {
+      seen.add(key);
+      pickerCategories.push(name);
+    }
+  }
+
+  const liveSet = new Set(
+    agg.jomashopCategories.map((c) => c.toLowerCase().trim()),
+  );
+  const supportedSet = new Set(
+    (SUPPORTED_CATEGORIES as readonly string[]).map((c) => c.toLowerCase().trim()),
+  );
+
+  const rows: CategoryAuditRow[] = agg.rows.map((r) => {
+    const current = r.current_jomashop_category;
+    // The override notes column on the aggregate row tells us which source
+    // provided the mapping. We re-check the storage layer indirectly via the
+    // built-in table to determine the precise source.
+    const builtInDefault = BUILT_IN_CATEGORY_OVERRIDES[r.shopify_category_code_normalized] ?? null;
+    let source: CategoryAuditRow["source"];
+    if (current && builtInDefault && current === builtInDefault && !r.current_override_notes?.startsWith("built-in")) {
+      // Ambiguous — could be either. Default to operator when notes don't say built-in.
+      source = "operator";
+    } else if (current && builtInDefault && current === builtInDefault) {
+      source = "built-in";
+    } else if (current) {
+      source = "operator";
+    } else {
+      source = "none";
+    }
+
+    // Apply the canonical alias step (Clothing → Apparel etc.) to surface the
+    // value that actually lands in live calls.
+    const canonical = current ? canonicalJomashopCategory(current) : null;
+    const hasAlias = Boolean(current && canonical && canonical !== current);
+    const aliasTarget = hasAlias ? (canonical as string) : null;
+    const resolved = canonical;
+
+    let status: CategoryAuditStatus;
+    let statusReason: string;
+    if (!current) {
+      status = "unmapped";
+      statusReason = "No Jomashop category mapping for this Shopify code yet.";
+    } else {
+      // Validate against live list (if available) or supported list.
+      const finalLower = (resolved ?? current).toLowerCase().trim();
+      const inLive = liveSet.size > 0 && liveSet.has(finalLower);
+      const inSupported = supportedSet.has(finalLower);
+      const known = agg.jomashopCategoriesAvailable ? inLive : inSupported;
+      if (!known) {
+        status = "invalid";
+        statusReason = agg.jomashopCategoriesAvailable
+          ? `"${resolved ?? current}" is not in the live Jomashop categories list.`
+          : `"${resolved ?? current}" is not in the supported categories list and live list is unavailable.`;
+      } else if (hasAlias) {
+        status = "alias";
+        statusReason = `Resolves via alias: ${current} → ${aliasTarget}.`;
+      } else if (source === "built-in") {
+        status = "alias";
+        statusReason = `Using built-in default mapping (${current}). Override to change.`;
+      } else {
+        status = "mapped";
+        statusReason = `Saved mapping → ${current}.`;
+      }
+    }
+
+    return {
+      shopify_category_code: r.shopify_category_code,
+      shopify_category_code_normalized: r.shopify_category_code_normalized,
+      product_count: r.product_count,
+      missing_count: r.missing_count,
+      sample_titles: r.sample_titles,
+      sample_skus: r.sample_skus,
+      current_jomashop_category: current,
+      resolved_jomashop_category: resolved,
+      has_alias: hasAlias,
+      alias_target: aliasTarget,
+      source,
+      status,
+      status_reason: statusReason,
+      suggested_category: r.suggested_category,
+      ambiguous: r.ambiguous,
+      jomashop_schema_loaded: r.jomashop_schema_loaded,
+    };
+  });
+  return { rows, pickerCategories };
+}
+
+/**
+ * Build the full audit response (consumed by `GET /api/category-mapping/audit`
+ * and by the unit tests).
+ */
+export async function buildCategoryAudit(): Promise<CategoryAuditResult> {
+  const agg = await aggregateCategoryCodes();
+  const { rows, pickerCategories } = buildCategoryAuditRows(agg);
+  const totals = {
+    mapped: 0,
+    alias: 0,
+    unmapped: 0,
+    invalid: 0,
+    needsMapping: 0,
+    productsAffectedNeedsMapping: 0,
+  };
+  for (const r of rows) {
+    totals[r.status] += 1;
+    if (r.status === "unmapped" || r.status === "invalid") {
+      totals.needsMapping += 1;
+      totals.productsAffectedNeedsMapping += r.product_count;
+    }
+  }
+  return {
+    shopDomain: agg.shopDomain,
+    fromCache: agg.fromCache,
+    cachedAt: agg.cachedAt,
+    totalProducts: agg.totalProducts,
+    uniqueCodes: agg.uniqueCodes,
+    jomashopCategoriesAvailable: agg.jomashopCategoriesAvailable,
+    jomashopCategories: agg.jomashopCategories,
+    pickerCategories,
+    totals,
+    rows,
+  };
+}
+
+/**
+ * Re-export so the audit/save endpoints can use the same alias as the
+ * canonical resolver. Kept here to avoid cross-server imports inside tests.
+ */
+export const CATEGORY_CANONICAL_ALIASES = CANONICAL_JOMASHOP_CATEGORY_ALIASES;
 
 // ---------- XLSX export ----------
 
@@ -727,6 +937,150 @@ export function registerCategoryMappingRoutes(app: Express): void {
         notes: o.notes,
         updated_at: o.updatedAt,
       })),
+    });
+  });
+
+  // GET: embedded audit — lists every distinct Shopify code with its status
+  // (mapped / alias / unmapped / invalid), affected products, and the picker
+  // list for the inline dropdown.
+  app.get("/api/category-mapping/audit", async (_req, res) => {
+    try {
+      const result = await buildCategoryAudit();
+      res.json({ ok: true, ...result });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: (err as Error).message });
+    }
+  });
+
+  // POST: inline save — single or batch. Body shape:
+  //   { mappings: [{ shopify_category_code, jomashop_category, notes? }, ...] }
+  // Each non-empty target is upserted; empty target deletes the override.
+  // Cache is invalidated once at the end. Unknown Jomashop categories (not
+  // in the live list) are rejected unless { allowUnknown: true } is set.
+  app.post("/api/category-mapping/save", async (req, res) => {
+    const body = (req.body ?? {}) as {
+      mappings?: Array<{
+        shopify_category_code?: string;
+        jomashop_category?: string;
+        notes?: string | null;
+      }>;
+      allowUnknown?: boolean;
+    };
+    const mappings = Array.isArray(body.mappings) ? body.mappings : [];
+    if (mappings.length === 0) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "No mappings supplied. Send at least one entry." });
+    }
+    if (mappings.length > MAX_IMPORT_ROWS) {
+      return res
+        .status(400)
+        .json({ ok: false, error: `Too many mappings — limit is ${MAX_IMPORT_ROWS}.` });
+    }
+
+    // Resolve the live Jomashop category list once for validation.
+    let liveCategories: string[] = [];
+    try {
+      const live = await getCategories();
+      if (live.ok) {
+        const raw = live.data as unknown;
+        const arr =
+          (Array.isArray(raw) ? raw : (raw as { data?: unknown }).data) ||
+          (raw as { categories?: unknown }).categories;
+        if (Array.isArray(arr)) {
+          liveCategories = arr
+            .map((c) => (typeof c === "string" ? c : (c as { name?: string }).name))
+            .filter((s): s is string => Boolean(s));
+        }
+      }
+    } catch {
+      // best-effort
+    }
+    const liveLower = new Set(liveCategories.map((c) => c.toLowerCase().trim()));
+    const supportedLower = new Set(
+      (SUPPORTED_CATEGORIES as readonly string[]).map((c) => c.toLowerCase().trim()),
+    );
+    const knownSet = liveLower.size > 0 ? liveLower : supportedLower;
+
+    const applied: Array<{ code: string; category: string }> = [];
+    const cleared: string[] = [];
+    const unknown: Array<{ code: string; category: string }> = [];
+    const errors: Array<{ code: string; error: string }> = [];
+
+    for (const m of mappings) {
+      const codeRaw = m.shopify_category_code ?? "";
+      const norm = normalizeCategoryCode(codeRaw);
+      if (!norm) {
+        errors.push({ code: codeRaw, error: "Missing or empty shopify_category_code." });
+        continue;
+      }
+      const target = (m.jomashop_category ?? "").trim();
+      if (target === "") {
+        storage.deleteCategoryOverride(norm);
+        cleared.push(norm);
+        continue;
+      }
+      const isKnown = knownSet.has(target.toLowerCase().trim());
+      if (!isKnown && !body.allowUnknown) {
+        unknown.push({ code: norm, category: target });
+        continue;
+      }
+      storage.upsertCategoryOverride({
+        shopifyCategoryCode: norm,
+        jomashopCategory: target,
+        notes: m.notes ?? null,
+        updatedAt: Date.now(),
+      });
+      applied.push({ code: norm, category: target });
+    }
+
+    // Invalidate cache so the next preview shows the new resolution.
+    const conn = getActiveShopifyConnection();
+    const shopDomain =
+      conn?.shopDomain ??
+      storage.listStores().find((s) => s.oauthStatus === "connected")?.shopDomain ??
+      null;
+    if (shopDomain && (applied.length > 0 || cleared.length > 0)) {
+      try {
+        storage.clearProductCache(shopDomain);
+      } catch {
+        // non-fatal
+      }
+    }
+
+    storage.appendLog({
+      level: applied.length > 0 || cleared.length > 0 ? "info" : "warn",
+      message: `Inline category mapping save: applied ${applied.length}, cleared ${cleared.length}, unknown ${unknown.length}, errors ${errors.length}`,
+      detailsJson: JSON.stringify({ applied, cleared, unknown, errors }),
+      createdAt: Date.now(),
+    });
+
+    if (unknown.length > 0 && !body.allowUnknown) {
+      return res.status(409).json({
+        ok: false,
+        applied: applied.length,
+        cleared: cleared.length,
+        unknown,
+        errors,
+        shopDomain,
+        cacheInvalidated: Boolean(shopDomain) && (applied.length > 0 || cleared.length > 0),
+        error:
+          "One or more mappings reference Jomashop categories not in the live list. Re-submit with `allowUnknown: true` to save anyway, or pick a value from the live list.",
+      });
+    }
+
+    res.json({
+      ok: errors.length === 0,
+      applied: applied.length,
+      cleared: cleared.length,
+      unknown,
+      errors,
+      shopDomain,
+      cacheInvalidated: Boolean(shopDomain) && (applied.length > 0 || cleared.length > 0),
+      note:
+        shopDomain && (applied.length > 0 || cleared.length > 0)
+          ? "Saved. Click Refresh from Shopify on the Products page to recompute readiness."
+          : "Saved.",
     });
   });
 

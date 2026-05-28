@@ -6091,6 +6091,221 @@ function runCanonicalApparelAliasFromClothing() {
   );
 }
 
+async function runCategoryAuditRowsHelpers() {
+  console.log("Case 58: buildCategoryAuditRows surfaces correct status per row");
+  const { buildCategoryAuditRows } = await import("../server/category_mapping");
+  type Row = Parameters<typeof buildCategoryAuditRows>[0]["rows"][number];
+  const makeRow = (overrides: Partial<Row>): Row => ({
+    shopify_category_code: "DRSH",
+    shopify_category_code_normalized: "drsh",
+    suggested_category: "Apparel",
+    product_count: 3,
+    missing_count: 0,
+    sample_titles: ["Dress Shirt"],
+    sample_skus: ["DS-1"],
+    current_jomashop_category: null,
+    current_override_notes: null,
+    jomashop_schema_loaded: true,
+    ambiguous: false,
+    ...overrides,
+  });
+  const agg = {
+    shopDomain: "test.myshopify.com",
+    fromCache: true,
+    cachedAt: Date.now(),
+    totalProducts: 12,
+    uniqueCodes: 5,
+    jomashopCategoriesAvailable: true,
+    jomashopCategories: ["Apparel", "Footwear", "Handbags", "Accessories"],
+    rows: [
+      // Mapped — operator override pointing at a live category.
+      makeRow({
+        shopify_category_code: "PANT",
+        shopify_category_code_normalized: "pant",
+        current_jomashop_category: "Apparel",
+        suggested_category: "Apparel",
+      }),
+      // Alias — current value is "Clothing" which canonicalizes to "Apparel".
+      makeRow({
+        shopify_category_code: "CLTH",
+        shopify_category_code_normalized: "clth",
+        current_jomashop_category: "Clothing",
+        suggested_category: "Apparel",
+      }),
+      // Unmapped — no mapping at all.
+      makeRow({
+        shopify_category_code: "WIDG",
+        shopify_category_code_normalized: "widg",
+        current_jomashop_category: null,
+        suggested_category: "WIDG",
+        product_count: 7,
+      }),
+      // Invalid — operator picked something not in live list.
+      makeRow({
+        shopify_category_code: "BOGUS",
+        shopify_category_code_normalized: "bogus",
+        current_jomashop_category: "NotARealCategory",
+        suggested_category: "BOGUS",
+        product_count: 2,
+      }),
+      // Built-in alias path — DRSH normalizes to drsh which is in
+      // BUILT_IN_CATEGORY_OVERRIDES → Apparel.
+      makeRow({
+        shopify_category_code: "DRSH",
+        shopify_category_code_normalized: "drsh",
+        current_jomashop_category: "Apparel",
+        current_override_notes: "built-in default (override to change)",
+        suggested_category: "Apparel",
+        product_count: 4,
+      }),
+    ],
+  };
+  const { rows, pickerCategories } = buildCategoryAuditRows(agg);
+  const byCode = new Map(rows.map((r) => [r.shopify_category_code_normalized, r] as const));
+  const pant = byCode.get("pant");
+  assert(pant && pant.status === "mapped", `Case 58a: PANT → Apparel surfaces as mapped (got ${pant?.status})`);
+  const clth = byCode.get("clth");
+  assert(
+    clth && clth.status === "alias" && clth.has_alias && clth.alias_target === "Apparel",
+    `Case 58b: CLTH (Clothing) surfaces as alias with target Apparel (got status=${clth?.status} alias=${clth?.alias_target})`,
+  );
+  const widg = byCode.get("widg");
+  assert(
+    widg && widg.status === "unmapped" && widg.current_jomashop_category === null,
+    `Case 58c: WIDG with no mapping surfaces as unmapped (got status=${widg?.status})`,
+  );
+  const bogus = byCode.get("bogus");
+  assert(
+    bogus && bogus.status === "invalid",
+    `Case 58d: BOGUS pointing at NotARealCategory surfaces as invalid (got status=${bogus?.status})`,
+  );
+  const drsh = byCode.get("drsh");
+  assert(
+    drsh && drsh.status === "alias" && drsh.source === "built-in",
+    `Case 58e: DRSH driven by built-in default surfaces as alias with source=built-in (got status=${drsh?.status} source=${drsh?.source})`,
+  );
+  // Picker list — live categories must come first, then SUPPORTED_CATEGORIES
+  // not already present.
+  assert(
+    pickerCategories[0] === "Apparel" && pickerCategories.includes("Eyewear"),
+    `Case 58f: pickerCategories merges live + supported (got [${pickerCategories.slice(0, 6).join(", ")} …])`,
+  );
+  // Sanity: needs-mapping bucket includes unmapped + invalid for the UI count.
+  const needs = rows.filter((r) => r.status === "unmapped" || r.status === "invalid");
+  assert(
+    needs.length === 2 && needs.some((r) => r.shopify_category_code_normalized === "widg") &&
+      needs.some((r) => r.shopify_category_code_normalized === "bogus"),
+    `Case 58g: needs-mapping bucket includes both unmapped and invalid`,
+  );
+
+  // Status reason strings carry the original code → alias target for the UI
+  // tooltip so the operator can see "Clothing → Apparel" at a glance.
+  assert(
+    clth && /Clothing\s*→\s*Apparel/.test(clth.status_reason),
+    `Case 58h: alias status_reason names original + alias target (got "${clth?.status_reason}")`,
+  );
+
+  // Affected-product totals: only unmapped+invalid rows contribute to the
+  // needs-mapping bucket count, which the UI surfaces as the "products
+  // blocked" badge.
+  const blocked =
+    (byCode.get("widg")?.product_count ?? 0) + (byCode.get("bogus")?.product_count ?? 0);
+  assert(blocked === 9, `Case 58i: blocked product total = 9 (got ${blocked})`);
+}
+
+async function runCategoryAuditFallsBackWhenLiveUnavailable() {
+  console.log("Case 59: audit picker falls back to supported list when live missing");
+  const { buildCategoryAuditRows } = await import("../server/category_mapping");
+  type Row = Parameters<typeof buildCategoryAuditRows>[0]["rows"][number];
+  const makeRow = (overrides: Partial<Row>): Row => ({
+    shopify_category_code: "PANT",
+    shopify_category_code_normalized: "pant",
+    suggested_category: "Apparel",
+    product_count: 1,
+    missing_count: 0,
+    sample_titles: [],
+    sample_skus: [],
+    current_jomashop_category: "Apparel",
+    current_override_notes: null,
+    jomashop_schema_loaded: true,
+    ambiguous: false,
+    ...overrides,
+  });
+  const agg = {
+    shopDomain: null,
+    fromCache: false,
+    cachedAt: null,
+    totalProducts: 1,
+    uniqueCodes: 1,
+    jomashopCategoriesAvailable: false,
+    jomashopCategories: ["Apparel", "Footwear", "Handbags", "Accessories", "Eyewear", "Rings", "Necklaces", "Bracelets", "Earrings", "Pins & Brooches", "Home Decor", "Shoes", "Clothing"],
+    rows: [makeRow({})],
+  };
+  const { rows, pickerCategories } = buildCategoryAuditRows(agg);
+  assert(
+    pickerCategories.includes("Apparel") &&
+      pickerCategories.includes("Footwear") &&
+      pickerCategories.includes("Handbags") &&
+      pickerCategories.includes("Eyewear") &&
+      pickerCategories.includes("Pins & Brooches") &&
+      pickerCategories.includes("Home Decor"),
+    `Case 59a: supported-list fallback picker covers Apparel/Footwear/Handbags/Eyewear/Pins & Brooches/Home Decor`,
+  );
+  // Apparel from the fallback list is still considered known — so PANT with
+  // current=Apparel must surface as mapped.
+  const pant = rows[0];
+  assert(
+    pant.status === "mapped",
+    `Case 59b: PANT → Apparel still mapped against fallback supported list (got ${pant.status})`,
+  );
+}
+
+async function runCategoryAuditAliasOnInvalid() {
+  console.log("Case 60: invalid status overrides alias when canonical target is not live");
+  const { buildCategoryAuditRows } = await import("../server/category_mapping");
+  type Row = Parameters<typeof buildCategoryAuditRows>[0]["rows"][number];
+  // Live list intentionally OMITS "Apparel" — so a current="Clothing" mapping
+  // that canonicalizes to "Apparel" is still invalid (live list says no).
+  const agg = {
+    shopDomain: "x.myshopify.com",
+    fromCache: true,
+    cachedAt: Date.now(),
+    totalProducts: 1,
+    uniqueCodes: 1,
+    jomashopCategoriesAvailable: true,
+    jomashopCategories: ["Footwear", "Handbags"],
+    rows: [
+      {
+        shopify_category_code: "CLTH",
+        shopify_category_code_normalized: "clth",
+        suggested_category: "Apparel",
+        product_count: 5,
+        missing_count: 0,
+        sample_titles: [],
+        sample_skus: [],
+        current_jomashop_category: "Clothing",
+        current_override_notes: null,
+        jomashop_schema_loaded: true,
+        ambiguous: false,
+      } as Row,
+    ],
+  };
+  const { rows } = buildCategoryAuditRows(agg);
+  const row = rows[0];
+  assert(
+    row.status === "invalid",
+    `Case 60a: alias target not in live list → invalid (got ${row.status})`,
+  );
+  assert(
+    row.has_alias && row.alias_target === "Apparel",
+    `Case 60b: alias bookkeeping still set even when status is invalid (alias_target=${row.alias_target})`,
+  );
+}
+
+await runCategoryAuditRowsHelpers();
+await runCategoryAuditFallsBackWhenLiveUnavailable();
+await runCategoryAuditAliasOnInvalid();
+
 runInlineFieldRepairValidation();
 runInlineFieldRepairMetafieldTargets();
 runInlineFieldRepairPostSaveReadiness();
