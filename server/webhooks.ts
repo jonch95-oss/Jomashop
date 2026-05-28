@@ -116,12 +116,12 @@ export async function pushInventoryUpdate(opts: {
     body.price = price;
   }
   // Persist MSRP across inventory updates so the Jomashop portal keeps a
-  // populated MSRP column when only stock/price changes are pushed. Without
-  // this, /v1/inventory PUTs would silently strip the MSRP that the original
-  // /i1/products push set.
+  // populated MSRP column when only stock/price changes are pushed. The
+  // Jomashop inventory API calls this field `map_price` (while product create
+  // uses `msrp`).
   const msrp = stored?.msrp;
   if (msrp !== null && msrp !== undefined && Number.isFinite(Number(msrp))) {
-    body.msrp = msrp;
+    body.map_price = msrp;
   }
   const targetSku = lookup.jomashopSku || lookup.shopifySku;
   const resp = await jomashopRequest({

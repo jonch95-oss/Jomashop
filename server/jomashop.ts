@@ -47,7 +47,7 @@ export function clearToken(): void {
 }
 
 async function loginInternal(cfg: JomashopConfig): Promise<void> {
-  const res = await fetch(`${cfg.baseUrl}/v1/session`, {
+  const res = await fetch(`${cfg.baseUrl}/v1/sessions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ user: { email: cfg.email, password: cfg.password } }),
@@ -67,7 +67,7 @@ async function loginInternal(cfg: JomashopConfig): Promise<void> {
 
 async function refreshInternal(cfg: JomashopConfig): Promise<void> {
   if (!token) return loginInternal(cfg);
-  const res = await fetch(`${cfg.baseUrl}/v1/session`, {
+  const res = await fetch(`${cfg.baseUrl}/v1/sessions`, {
     method: "PUT",
     headers: {
       Authorization: `Bearer ${token.jwt}`,
