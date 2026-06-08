@@ -474,6 +474,13 @@ export function registerInlineFieldRepairRoutes(app: Express): void {
     for (const d of descriptors || []) {
       if (d && typeof d.field === "string") descriptorByField.set(d.field, d);
     }
+    descriptorByField.set("Commercial Discount", {
+      field: "Commercial Discount",
+      required: true,
+      type: "number",
+      min_value: 0,
+      max_value: 100,
+    } as SchemaPropertyDescriptor);
 
     // First pass — collect validation errors so we never write a partial set
     // of values when validation fails on a sibling field.

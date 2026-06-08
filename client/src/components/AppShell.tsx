@@ -16,7 +16,7 @@ import { AdminTokenGate } from "./AdminTokenGate";
 const NAV: Array<{ href: string; label: string; icon: React.ComponentType<{ className?: string }>; group?: string }> = [
   { href: "/", label: "Overview", icon: LayoutDashboard, group: "Operate" },
   { href: "/setup", label: "Setup", icon: Plug, group: "Operate" },
-  { href: "/mapping", label: "Field Mapping", icon: ArrowLeftRight, group: "Operate" },
+  { href: "/mapping", label: "Mapping & Excel", icon: ArrowLeftRight, group: "Operate" },
   { href: "/products", label: "Products", icon: PackageSearch, group: "Catalog" },
   { href: "/inventory", label: "Inventory", icon: Boxes, group: "Catalog" },
   { href: "/orders", label: "Orders", icon: ClipboardList, group: "Fulfill" },
@@ -101,11 +101,11 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             <div className="flex items-center gap-2">
               <ShieldAlert className="h-3.5 w-3.5 text-primary" />
               <span className="text-[10px] font-medium uppercase tracking-[0.18em] text-muted-foreground">
-                Scaffold mode
+                Shopify source of truth
               </span>
             </div>
             <p className="mt-1 text-xs text-muted-foreground">
-              Configure env vars, then complete Shopify OAuth + Jomashop session in Setup.
+              Edits should write back to Shopify jomashop.* metafields before pushing live.
             </p>
           </div>
         </div>

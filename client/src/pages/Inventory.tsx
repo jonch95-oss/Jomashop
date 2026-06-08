@@ -56,7 +56,7 @@ export default function Inventory() {
     <>
       <PageHeader
         title="Inventory"
-        description="Bulk inventory update preview. Maps to PUT /v1/inventory/update-statuses or POST /v1/inventory/upload-updates."
+        description="Pushed-SKU inventory reconciliation. Zero total Shopify quantity sends Jomashop out_of_stock and drafts the Shopify product; adding quantity back reactivates it."
         actions={
           <div className="flex flex-wrap gap-2">
             <Button
@@ -67,7 +67,7 @@ export default function Inventory() {
               size="sm"
             >
               <RefreshCw className={`mr-2 h-3.5 w-3.5 ${sync.isPending ? "animate-spin" : ""}`} />{" "}
-              {sync.isPending ? "Syncing…" : "Sync inventory to Jomashop"}
+              {sync.isPending ? "Syncing…" : "Sync pushed SKUs to Jomashop"}
             </Button>
             <Button data-testid="button-download-csv" onClick={downloadCsv} variant="outline" size="sm">
               <Download className="mr-2 h-3.5 w-3.5" /> Export preview CSV
@@ -77,7 +77,7 @@ export default function Inventory() {
       />
 
       <div className="mb-4 rounded-md border border-border bg-card/40 px-4 py-2.5 text-xs text-muted-foreground">
-        {q.data.note}
+        {q.data.note} Inventory updates use Jomashop's documented fields: quantity, price, map_price, and status. Shopify visibility follows stock automatically for pushed products.
       </div>
 
       {syncResult && (
@@ -101,7 +101,7 @@ export default function Inventory() {
 
       <Card>
         <CardHeader className="border-b border-card-border">
-          <CardTitle className="text-sm">Bulk payload preview</CardTitle>
+          <CardTitle className="text-sm">Pushed SKU inventory preview</CardTitle>
         </CardHeader>
         <CardContent className="p-0">
           <div className="overflow-x-auto">

@@ -20,7 +20,6 @@ import { authHeaders } from "@/lib/adminToken";
 import { BulkRepairCard } from "@/components/BulkRepair";
 import { CategoryMappingCard } from "@/components/CategoryMapping";
 import { BrandMappingCard } from "@/components/BrandMapping";
-import { ResolutionAuditCard } from "@/components/ResolutionAudit";
 import { InlineFieldRepair } from "@/components/InlineFieldRepair";
 import { canonicalJomashopCategory } from "@shared/schema";
 import type { MappedProduct } from "@/lib/types";
@@ -94,6 +93,7 @@ type ProductFilter =
   | "pushed"
   | "not_pushed"
   | "rejected"
+  | "missing_discount"
   | "unresolved_brand"
   | "unresolved_category"
   | "sample";
@@ -142,6 +142,15 @@ function isReady(p: MappedProduct): boolean {
   return p.readiness === "ready";
 }
 
+function hasCommercialDiscount(p: MappedProduct): boolean {
+  return p.commercial_discount_missing !== true && typeof p.commercial_discount === "number" && p.commercial_discount > 0;
+}
+
+function commercialDiscountLabel(p: MappedProduct): string {
+  if (!hasCommercialDiscount(p)) return "missing";
+  return `${Math.round(p.commercial_discount * 1000) / 10}%`;
+}
+
 /**
  * Compact summary of required enum fields that are blocked because Jomashop's
  * accepted option list isn't known AND no enum mapping resolves the source
@@ -166,6 +175,7 @@ function unresolvedRequiredEnumSummary(p: MappedProduct): string | null {
  */
 function isPushBlocked(p: MappedProduct): boolean {
   if (p.is_sample) return true;
+  if (!hasCommercialDiscount(p)) return true;
   if (p.readiness === "ready") return false;
   // "rejected" rows can still be retried via the modal; we surface them
   // through the modal flow rather than the row button so the operator has
@@ -443,11 +453,13 @@ export default function Products() {
 
   const overrideBlanks = TOP_LEVEL_FIELDS.filter((k) => overrides[k].trim() === "");
   const targetIsSample = pushTarget?.mapped.is_sample === true;
+  const targetMissingDiscount = pushTarget ? !hasCommercialDiscount(pushTarget.mapped) : false;
   const canConfirm =
     pushTarget !== null &&
     overrideBlanks.length === 0 &&
     !push.isPending &&
-    !targetIsSample;
+    !targetIsSample &&
+    !targetMissingDiscount;
 
   // Unique brand + final Jomashop category lists derived from the loaded
   // catalog. Used to populate the new filter dropdowns.
@@ -493,6 +505,7 @@ export default function Products() {
       pushed: 0,
       not_pushed: 0,
       rejected: 0,
+      missing_discount: 0,
       unresolved_brand: 0,
       unresolved_category: 0,
       sample: 0,
@@ -504,6 +517,7 @@ export default function Products() {
       if (state === "pushed") counts.pushed += 1;
       else if (state === "rejected" || state === "failed") counts.rejected += 1;
       else if (!p.is_sample) counts.not_pushed += 1;
+      if (!p.is_sample && !hasCommercialDiscount(p)) counts.missing_discount += 1;
       if (isReady(p)) counts.ready += 1;
       else if (miss.length > 0 && !p.is_sample) counts.missing += 1;
       if (!p.is_sample && brandUnresolved(p)) counts.unresolved_brand += 1;
@@ -540,6 +554,7 @@ export default function Products() {
       if (filter === "pushed") return state === "pushed";
       if (filter === "not_pushed") return state === "not_pushed" && !p.is_sample;
       if (filter === "rejected") return state === "rejected" || state === "failed";
+      if (filter === "missing_discount") return !p.is_sample && !hasCommercialDiscount(p);
       if (filter === "unresolved_brand") return !p.is_sample && brandUnresolved(p);
       if (filter === "unresolved_category") return !p.is_sample && categoryUnresolved(p);
       if (filter === "sample") return p.is_sample === true;
@@ -629,6 +644,7 @@ export default function Products() {
     { key: "pushed", label: "Pushed", count: filterCounts.pushed },
     { key: "not_pushed", label: "Not pushed", count: filterCounts.not_pushed },
     { key: "rejected", label: "Rejected / Needs fix", count: filterCounts.rejected },
+    { key: "missing_discount", label: "Missing discount", count: filterCounts.missing_discount },
     { key: "unresolved_brand", label: "Unresolved brand", count: filterCounts.unresolved_brand },
     {
       key: "unresolved_category",
@@ -644,7 +660,7 @@ export default function Products() {
     <>
       <PageHeader
         title="Products"
-        description="Preview Shopify → Jomashop product mapping, then push one when ready. Initial load uses the cached preview — click Refresh from Shopify to re-paginate."
+        description="Go-live control center for Shopify → Jomashop. Cached product state is saved; inline repairs write back to Shopify jomashop.* metafields and update the card without a full refresh."
         actions={
           <Button
             data-testid="button-refresh-from-shopify"
@@ -670,7 +686,38 @@ export default function Products() {
         <div className="space-y-4">
           {banner}
 
-          <ResolutionAuditCard onAfterApply={() => refresh.mutate()} />
+          <div className="grid grid-cols-1 gap-3 lg:grid-cols-4" data-testid="go-live-command-center">
+            <Card className="lg:col-span-4 border-primary/30 bg-primary/5">
+              <CardHeader className="border-b border-card-border pb-3">
+                <CardTitle className="text-sm">Go Live Command Center</CardTitle>
+              </CardHeader>
+              <CardContent className="grid gap-3 p-4 md:grid-cols-4">
+                <div className="rounded border border-border bg-background/70 p-3">
+                  <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Ready and controlled</div>
+                  <div className="mt-1 text-2xl font-semibold tabular-nums">{filterCounts.ready}</div>
+                  <div className="mt-1 text-[11px] text-muted-foreground">Only these can be pushed. Bulk push uses your current filters and asks for confirmation.</div>
+                </div>
+                <div className="rounded border border-border bg-background/70 p-3">
+                  <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Needs Shopify writeback</div>
+                  <div className="mt-1 text-2xl font-semibold tabular-nums">{filterCounts.missing + filterCounts.missing_discount}</div>
+                  <div className="mt-1 text-[11px] text-muted-foreground">Fix inline or Excel-import. Saved fields go to Shopify metafields under jomashop.*.</div>
+                </div>
+                <div className="rounded border border-border bg-background/70 p-3">
+                  <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Discount blocked</div>
+                  <div className="mt-1 text-2xl font-semibold tabular-nums">{filterCounts.missing_discount}</div>
+                  <div className="mt-1 text-[11px] text-muted-foreground">Commercial Discount is required. Missing discount blocks all product and variant pushes.</div>
+                </div>
+                <div className="rounded border border-border bg-background/70 p-3">
+                  <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Already live</div>
+                  <div className="mt-1 text-2xl font-semibold tabular-nums">{filterCounts.pushed}</div>
+                  <div className="mt-1 text-[11px] text-muted-foreground">Pushed products can be updated, and inventory sync only targets pushed SKUs.</div>
+                </div>
+                <div className="md:col-span-4 rounded border border-dashed border-border bg-background/60 p-3 text-xs text-muted-foreground">
+                  Workflow: map category/brand → fix missing fields → write back to Shopify → review this filtered list → bulk push only the exact products you choose. You should only need Refresh from Shopify after external Shopify edits or a fresh catalog pull.
+                </div>
+              </CardContent>
+            </Card>
+          </div>
 
           <CategoryMappingCard onAfterApply={() => refresh.mutate()} />
 
@@ -904,6 +951,16 @@ export default function Products() {
                             Needs category verification
                           </Badge>
                         )}
+                        {!hasCommercialDiscount(p) && (
+                          <Badge
+                            data-testid={`badge-missing-discount-${p.vendor_sku}`}
+                            variant="outline"
+                            className="bg-red-500/10 text-[10px] uppercase text-red-600 dark:text-red-400"
+                            title="Add jomashop.commercial_discount in Shopify before pushing"
+                          >
+                            Missing Commercial Discount
+                          </Badge>
+                        )}
                         {missing.length > 0 && (
                           <Badge
                             data-testid={`badge-missing-${p.vendor_sku}`}
@@ -959,6 +1016,7 @@ export default function Products() {
                       p.source.shopify_product_id !== undefined &&
                       p.source.shopify_product_id !== null &&
                       (missing.length > 0 ||
+                        !hasCommercialDiscount(p) ||
                         (Array.isArray(p.unverified_required_options) &&
                           p.unverified_required_options.length > 0) ||
                         (Array.isArray(p.invalid_enums) && p.invalid_enums.length > 0) ||
@@ -982,7 +1040,7 @@ export default function Products() {
                         >
                           <summary className="flex cursor-pointer items-center gap-2 text-sm font-medium">
                             <AlertTriangle className="h-4 w-4 text-amber-500" />
-                            Repair missing Jomashop fields ({missing.length})
+                            Repair missing Jomashop fields ({missing.length + (!hasCommercialDiscount(p) ? 1 : 0)})
                             <span className="text-[11px] font-normal text-muted-foreground">
                               — fill the required fields below and save without leaving the page
                             </span>
@@ -1173,6 +1231,16 @@ export default function Products() {
                         <div className="mt-3 text-[10px] uppercase tracking-wider text-muted-foreground">Jomashop price</div>
                         <div className="mt-1 text-sm font-medium tabular-nums">
                           {p.jomashop_price !== null ? `$${p.jomashop_price.toFixed(2)}` : "—"}
+                        </div>
+                        <div className="mt-3 text-[10px] uppercase tracking-wider text-muted-foreground">Commercial Discount</div>
+                        <div
+                          className={`mt-1 text-sm font-medium tabular-nums ${hasCommercialDiscount(p) ? "text-emerald-600 dark:text-emerald-400" : "text-red-600 dark:text-red-400"}`}
+                          data-testid={`text-commercial-discount-${p.vendor_sku}`}
+                        >
+                          {commercialDiscountLabel(p)}
+                          <span className="ml-2 text-[10px] font-normal uppercase tracking-wider text-muted-foreground">
+                            source: {p.commercial_discount_source || (hasCommercialDiscount(p) ? "metafield" : "missing")}
+                          </span>
                         </div>
                         {p.last_push_error && (
                           <div className="mt-3 text-[10px] uppercase tracking-wider text-red-500">
@@ -1562,6 +1630,11 @@ export default function Products() {
                     ? "Live Shopify product — already pushed (this will update Jomashop)"
                     : "Live Shopify product"}
               </div>
+              {targetMissingDiscount && (
+                <div className="rounded border border-red-500/40 bg-red-500/5 p-2 text-[11px] text-red-600 dark:text-red-400">
+                  Commercial Discount is missing. Add <code className="font-mono">jomashop.commercial_discount</code> in Shopify using inline repair or Excel before pushing.
+                </div>
+              )}
               {(pushTarget.mapped.push_state === "rejected" ||
                 pushTarget.mapped.push_state === "failed") &&
                 (pushTarget.mapped.last_rejected_category ||
@@ -1838,6 +1911,19 @@ export default function Products() {
                   Pre-flight checklist
                 </div>
                 <ul className="space-y-1">
+                  <li
+                    className={`flex items-center gap-2 ${!targetMissingDiscount ? "text-emerald-500" : "text-red-500"}`}
+                  >
+                    {!targetMissingDiscount ? (
+                      <CheckCircle2 className="h-3.5 w-3.5" />
+                    ) : (
+                      <XCircle className="h-3.5 w-3.5" />
+                    )}
+                    <span className="font-mono">commercial_discount</span>
+                    <span className="ml-auto truncate text-muted-foreground">
+                      {!targetMissingDiscount ? commercialDiscountLabel(pushTarget.mapped) : "missing — push blocked"}
+                    </span>
+                  </li>
                   {TOP_LEVEL_FIELDS.map((k) => {
                     const ok = overrides[k].trim() !== "";
                     return (
@@ -2031,10 +2117,12 @@ function shopifyProductFromMapped(m: MappedProduct): Record<string, unknown> {
       };
     }),
     metafields: [
-      { namespace: "custom", key: "commercial_discount", value: m.commercial_discount },
+      ...(hasCommercialDiscount(m)
+        ? [{ namespace: "jomashop", key: "commercial_discount", value: m.commercial_discount }]
+        : []),
       ...Object.entries(m.properties)
         .filter(([, v]) => v !== null && v !== undefined && v !== "")
-        .map(([k, v]) => ({ namespace: "luxe", key: k, value: v as string | number })),
+        .map(([k, v]) => ({ namespace: "jomashop", key: k, value: v as string | number })),
     ],
   };
 }

@@ -40,6 +40,7 @@ import {
   findMsrpSource,
   normalizeI1CategorySchema,
   readParentSku,
+  extractVariantSize,
   type ShopifyProduct,
   type SchemaPropertyDescriptor,
 } from "./mapping";
@@ -158,6 +159,9 @@ const VARIANT_FIELD_TOKENS = new Set<string>([
   "variation",
   "shoesize",
   "size_us",
+  "sizeus",
+  "sizeeu",
+  "sizeuk",
   // Apparel / footwear size labels — the size *value* is per-variant in
   // Shopify (each variant has its own size + a separate metafield row), so
   // the inline repair flow routes "Apparel Size" to ProductVariant. The
@@ -434,7 +438,12 @@ export async function aggregateProductFieldRows(opts: {
 
       const fieldWritebackTargets: Record<string, { namespace: string; key: string }> = {};
 
-      const mkRow = (variantId: string, variantOptions: Record<string, string>, isVariant: boolean) => {
+      const mkRow = (
+        variantId: string,
+        variantOptions: Record<string, string>,
+        isVariant: boolean,
+        variantSize?: string,
+      ) => {
         const fieldValues: Record<string, string> = {};
         for (const f of cleanFields) {
           // Look up the current app-derived value for this field by exact
@@ -451,11 +460,15 @@ export async function aggregateProductFieldRows(opts: {
             }
           }
           // Variant-targeted fields prefer the variant's own option value.
-          if (isVariant && fieldIsVariantTargeted(f.field) && variantOptions) {
-            for (const [k, val] of Object.entries(variantOptions)) {
-              if (String(k).toLowerCase().includes(f.field.toLowerCase())) {
-                v = val;
-                break;
+          if (isVariant && fieldIsVariantTargeted(f.field)) {
+            if (variantSize) {
+              v = variantSize;
+            } else if (variantOptions) {
+              for (const [k, val] of Object.entries(variantOptions)) {
+                if (String(k).toLowerCase().includes(f.field.toLowerCase())) {
+                  v = val;
+                  break;
+                }
               }
             }
           }
@@ -523,7 +536,7 @@ export async function aggregateProductFieldRows(opts: {
           const variantId =
             variantIds[i] !== undefined ? String(variantIds[i]) : String(v?.vendor_sku ?? "");
           const opts = (v?.options && typeof v.options === "object") ? v.options as Record<string, string> : {};
-          mkRow(variantId, opts, true);
+          mkRow(variantId, opts, true, extractVariantSize(v));
           totalRows += 1;
         }
       } else {
@@ -533,7 +546,7 @@ export async function aggregateProductFieldRows(opts: {
           (variants[0]?.options && typeof variants[0].options === "object")
             ? (variants[0].options as Record<string, string>)
             : {};
-        mkRow(variantId, opts, false);
+        mkRow(variantId, opts, false, extractVariantSize(variants[0]));
         totalRows += 1;
       }
       if (stopCategoryEarly) break;
@@ -1157,6 +1170,10 @@ export async function parseProductFieldUpload(
       };
       aggByCategoryName.set(categoryName, cat);
     }
+    const existingRowById = new Map<string, ProductFieldExportRow>();
+    for (const existing of cat.rows) {
+      if (existing.rowId) existingRowById.set(existing.rowId, existing);
+    }
 
     // Build column-by-header lookup.
     const headerByCol: Record<number, string> = {};
@@ -1301,14 +1318,11 @@ export async function parseProductFieldUpload(
       const anyValue = Object.keys(fieldValues).length > 0 || msrpVal !== "";
       if (!rowId && !anyValue) continue;
       if (anyValue) {
+        const existingRow = rowId ? existingRowById.get(rowId) : undefined;
         for (const f of cat.fields) {
           if (!f.required) continue;
-          if (!fieldValues[f.field]) {
-            // Allow operator to leave required fields blank IF the current
-            // value coming back from the source already has one — we can't
-            // see that here, so report a soft warning rather than a hard
-            // error. We'll flag as a note in `errors` only when no other
-            // values are present.
+          const existingValue = existingRow?.fieldValues?.[f.field];
+          if (!fieldValues[f.field] && !(typeof existingValue === "string" && existingValue.trim() !== "")) {
             errors.push(
               `Required field "${f.field}" left blank — provide a value to fill the gap.`,
             );
@@ -1458,6 +1472,19 @@ function gcSessions(): void {
   }
 }
 
+export function productFieldSessionStats(): {
+  active: number;
+  cap: number;
+  ttlMs: number;
+} {
+  gcSessions();
+  return {
+    active: SESSIONS.size,
+    cap: MAX_PRODUCT_FIELD_SESSIONS,
+    ttlMs: SESSION_TTL_MS,
+  };
+}
+
 export function registerJomashopProductFieldExcelRoutes(app: Express): void {
   const upload = multer({
     storage: multer.memoryStorage(),
@@ -1466,9 +1493,31 @@ export function registerJomashopProductFieldExcelRoutes(app: Express): void {
 
   // GET: JSON summary (debug / UI preview).
   app.get("/api/jomashop-product-fields/summary", async (req, res) => {
+    const includeAll = String(req.query.all ?? "") === "1" || String(req.query.all ?? "") === "true";
+    const categoryFilter = typeof req.query.category === "string" ? req.query.category.trim() : "";
+    if (!withLockOr409(res, "productFieldSummary")) return;
     try {
-      const includeAll = String(req.query.all ?? "") === "1" || String(req.query.all ?? "") === "true";
-      const agg = await aggregateProductFieldRows({ includeAll });
+      logMemory("productFieldSummary.start", { includeAll, categoryFilter });
+      const agg = await aggregateProductFieldRows({
+        includeAll,
+        categoryFilter: categoryFilter || undefined,
+        rowLimit: MAX_EXPORT_ROWS + 1,
+      });
+      const rowCount = agg.categories.reduce((acc, c) => acc + c.rows.length, 0);
+      if (rowCount > MAX_EXPORT_ROWS) {
+        return res.status(413).json({
+          ok: false,
+          error:
+            `Summary would aggregate more than ${MAX_EXPORT_ROWS} rows. ` +
+            `Choose a Jomashop category filter before previewing/exporting.`,
+          rowCount,
+          maxExportRows: MAX_EXPORT_ROWS,
+          availableCategories: agg.categories.map((c) => ({
+            category: c.category,
+            rows: c.rows.length,
+          })),
+        });
+      }
       res.json({
         ok: true,
         shopDomain: agg.shopDomain,
@@ -1476,6 +1525,9 @@ export function registerJomashopProductFieldExcelRoutes(app: Express): void {
         cachedAt: agg.cachedAt,
         totalProducts: agg.totalProducts,
         includedAll: agg.includedAll,
+        categoryFilter: categoryFilter || null,
+        rowCount,
+        truncated: Boolean(agg.truncated),
         categories: agg.categories.map((c) => ({
           category: c.category,
           fieldsSource: c.fieldsSource,
@@ -1489,7 +1541,10 @@ export function registerJomashopProductFieldExcelRoutes(app: Express): void {
         })),
       });
     } catch (err) {
+      logMemory("productFieldSummary.failed", { message: (err as Error).message });
       res.status(500).json({ ok: false, error: (err as Error).message });
+    } finally {
+      releaseLock("productFieldSummary");
     }
   });
 
