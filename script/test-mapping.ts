@@ -68,7 +68,7 @@ import {
   type MappingRowExportRecord,
 } from "../server/jomashop_mapping_excel";
 import { MAX_EXPORT_ROWS, fieldIsVariantTargeted } from "../server/jomashop_product_field_excel";
-import { buildBulkFillGrid } from "../server/bulk_fill";
+import { buildBulkFillGrid, rowResolutionNeeds } from "../server/bulk_fill";
 import {
   buildProductFieldWorkbook,
   parseProductFieldUpload,
@@ -7142,11 +7142,52 @@ function runBulkFillGridTests() {
       invalid_enums: [{ field: "Color", value: "TEAL", options: ["NAVY", "BLACK"] }],
       source: { shopify_product_id: "p-E", shopify_variant_ids: ["v-E1"] },
     },
+    {
+      // F: blocked only on brand resolution (no missing fields).
+      category: "Apparel",
+      readiness: "needs-category-verification",
+      is_sample: false,
+      vendor_sku: "SKU-F",
+      properties: { Color: "NAVY", Material: "Cotton", Brand: "Tods" },
+      missing_required: [],
+      missing_top_level: [],
+      invalid_enums: [],
+      jomashop_resolution: {
+        i1_available: true,
+        outbound_brand: "Tods",
+        manufacturer: null,
+        manufacturer_suggestion: { id: 1, name: "Tod's" },
+        outbound_category: "Apparel",
+        category_record: { id: 2, name: "Apparel" },
+      },
+      source: { shopify_product_id: "p-F", shopify_variant_ids: ["v-F1"] },
+    },
+    {
+      // G: blocked only on category resolution.
+      category: "Apparel",
+      readiness: "needs-category-verification",
+      is_sample: false,
+      vendor_sku: "SKU-G",
+      raw_category: "FOO",
+      suggested_category: "Apparel",
+      properties: { Color: "NAVY", Material: "Cotton", Brand: "Z" },
+      missing_required: [],
+      missing_top_level: [],
+      invalid_enums: [],
+      jomashop_resolution: {
+        i1_available: true,
+        outbound_brand: "Z",
+        manufacturer: { id: 9, name: "Z" },
+        outbound_category: "FOO",
+        category_record: null,
+      },
+      source: { shopify_product_id: "p-G", shopify_variant_ids: ["v-G1"] },
+    },
   ];
 
   const grid = buildBulkFillGrid(allMapped, schemaByCategory);
 
-  assert(grid.unreadyProducts === 3, `BF-1: 3 unready products (A,D,E) (got ${grid.unreadyProducts})`);
+  assert(grid.unreadyProducts === 5, `BF-1: 5 unready products (A,D,E,F,G) (got ${grid.unreadyProducts})`);
   assert(grid.categories.length === 1, `BF-2: single category group (got ${grid.categories.length})`);
   const apparel = grid.categories[0];
   assert(apparel && apparel.category === "Apparel", `BF-3: category canonicalized to Apparel (got ${apparel?.category})`);
@@ -7189,6 +7230,29 @@ function runBulkFillGridTests() {
       apparel.rows.find((r) => r.productId === "p-C") === undefined,
     `BF-15: ready + sample rows excluded`,
   );
+
+  // Brand / category resolution columns.
+  const brandCol = apparel.fields.find((f) => f.kind === "brand");
+  assert(brandCol !== undefined, `BF-16: brand resolution column present (kind=brand)`);
+  assert(brandCol?.suggestion === "Tod's", `BF-17: brand column carries the suggestion (got ${brandCol?.suggestion})`);
+  const rowF = apparel.rows.find((r) => r.productId === "p-F");
+  assert(
+    rowF !== undefined && rowF.cells[brandCol!.field]?.invalidValue === "Tods",
+    `BF-18: row F brand cell carries the Shopify source brand`,
+  );
+  const categoryCol = apparel.fields.find((f) => f.kind === "category");
+  assert(categoryCol !== undefined, `BF-19: category resolution column present (kind=category)`);
+  const rowG = apparel.rows.find((r) => r.productId === "p-G");
+  assert(
+    rowG !== undefined && rowG.cells[categoryCol!.field]?.invalidValue === "FOO",
+    `BF-20: row G category cell carries the Shopify source code`,
+  );
+
+  // rowResolutionNeeds direct unit check.
+  const needsF = rowResolutionNeeds(allMapped.find((m) => m.source.shopify_product_id === "p-F"));
+  assert(needsF.brand === true && needsF.category === false, `BF-21: rowResolutionNeeds flags brand only for F`);
+  const needsG = rowResolutionNeeds(allMapped.find((m) => m.source.shopify_product_id === "p-G"));
+  assert(needsG.category === true && needsG.brand === false, `BF-22: rowResolutionNeeds flags category only for G`);
 }
 
 runBulkFillGridTests();

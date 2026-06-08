@@ -25,8 +25,11 @@ import { useToast } from "@/hooks/use-toast";
 import { apiRequest } from "@/lib/queryClient";
 import { authHeaders } from "@/lib/adminToken";
 
+type FieldKind = "field" | "topLevel" | "brand" | "category";
+
 type FieldDescriptor = {
   field: string;
+  kind: FieldKind;
   required: boolean;
   type: string;
   options: string[];
@@ -34,6 +37,7 @@ type FieldDescriptor = {
   multiple: boolean;
   isVariantTargeted: boolean;
   metafieldTarget: string;
+  suggestion: string;
   isTopLevel: boolean;
 };
 
@@ -95,6 +99,8 @@ type ApplyResponse = {
   ok: boolean;
   totalWritten: number;
   totalFailed: number;
+  totalMappingsSaved: number;
+  needsRefresh: boolean;
   nowReady: number;
   products: ApplyProductResult[];
 };
@@ -105,6 +111,7 @@ type Edits = Record<string, Record<string, string>>;
 export default function BulkFill() {
   const { toast } = useToast();
   const [edits, setEdits] = useState<Edits>({});
+  const [saveAsMapping, setSaveAsMapping] = useState(true);
   const [saving, setSaving] = useState(false);
   const [pushing, setPushing] = useState(false);
   const [pushProgress, setPushProgress] = useState<{ pushed: number; failed: number; total: number } | null>(
@@ -127,6 +134,16 @@ export default function BulkFill() {
   });
 
   const data = gridQ.data;
+
+  const fieldKindByName = useMemo(() => {
+    const map: Record<string, FieldKind> = {};
+    if (data) {
+      for (const g of data.categories) {
+        for (const f of g.fields) map[f.field] = f.kind;
+      }
+    }
+    return map;
+  }, [data]);
 
   function setCell(productId: string, field: string, value: string) {
     setEdits((prev) => ({
@@ -169,11 +186,18 @@ export default function BulkFill() {
 
   async function saveAll() {
     if (saving) return;
-    const payload: Array<{ productId: string; fields: Array<{ field: string; value: string }> }> = [];
+    const payload: Array<{
+      productId: string;
+      fields: Array<{ field: string; value: string; kind: FieldKind }>;
+    }> = [];
     for (const [productId, fields] of Object.entries(edits)) {
       const filled = Object.entries(fields)
         .filter(([, v]) => String(v).trim() !== "")
-        .map(([field, value]) => ({ field, value: String(value).trim() }));
+        .map(([field, value]) => ({
+          field,
+          value: String(value).trim(),
+          kind: fieldKindByName[field] ?? ("field" as FieldKind),
+        }));
       if (filled.length > 0) payload.push({ productId, fields: filled });
     }
     if (payload.length === 0) {
@@ -184,6 +208,7 @@ export default function BulkFill() {
     try {
       const res = await apiRequest("POST", "/api/jomashop/bulk-fill/apply", {
         confirm: true,
+        saveAsMapping,
         edits: payload,
       });
       const body = (await res.json()) as ApplyResponse;
@@ -195,10 +220,14 @@ export default function BulkFill() {
       }
       setReadyOverride((prev) => ({ ...prev, ...newlyReady }));
       toast({
-        title: `Saved ${body.totalWritten} value(s)`,
-        description: `${body.nowReady} product(s) now ready to push${
-          body.totalFailed > 0 ? ` · ${body.totalFailed} failed (${validationFails} validation)` : ""
-        }.`,
+        title: `Saved ${body.totalWritten} value(s)${
+          body.totalMappingsSaved > 0 ? ` · ${body.totalMappingsSaved} reusable mapping(s)` : ""
+        }`,
+        description: body.needsRefresh
+          ? `${body.nowReady} ready · brand/category mappings saved — Refresh from Shopify on Products to re-verify, then push.`
+          : `${body.nowReady} product(s) now ready to push${
+              body.totalFailed > 0 ? ` · ${body.totalFailed} failed (${validationFails} validation)` : ""
+            }.`,
         variant: body.totalFailed > 0 ? "destructive" : "default",
       });
       // Clear edits that were successfully written; keep failed ones so the
@@ -315,6 +344,15 @@ export default function BulkFill() {
         <Badge variant="outline" className="gap-1">
           {data.totalProducts} total in cache
         </Badge>
+        <label className="flex items-center gap-1.5" title="Save each fix as a reusable enum/brand/category mapping so the same issue auto-resolves on future products.">
+          <input
+            type="checkbox"
+            checked={saveAsMapping}
+            onChange={(e) => setSaveAsMapping(e.target.checked)}
+            data-testid="checkbox-save-as-mapping"
+          />
+          Save fixes as reusable mappings
+        </label>
         {!data.shopifyConnected && (
           <span className="text-amber-500">
             No connected Shopify store — saving requires an OAuth-installed store.
@@ -524,7 +562,12 @@ function CategoryGridCard({
                             data-testid={`cell-${row.productId}-${f.field}`}
                           />
                         )}
-                        {cell.status === "invalid" && !edited && (
+                        {(f.kind === "brand" || f.kind === "category") && cell.invalidValue && (
+                          <div className="mt-0.5 truncate text-[10px] text-muted-foreground" title={cell.invalidValue}>
+                            Shopify: {cell.invalidValue} → saved as mapping
+                          </div>
+                        )}
+                        {f.kind !== "brand" && f.kind !== "category" && cell.status === "invalid" && !edited && (
                           <div className="mt-0.5 flex items-center gap-1 text-[10px] text-destructive">
                             <XCircle className="h-3 w-3" /> not in accepted list
                           </div>

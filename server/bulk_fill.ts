@@ -1,7 +1,7 @@
 import type { Express } from "express";
 import { storage } from "./storage";
 import { getActiveShopifyConnection } from "./shopify";
-import type { SchemaPropertyDescriptor } from "./mapping";
+import { type SchemaPropertyDescriptor, normalizeCategoryCode } from "./mapping";
 import { canonicalJomashopCategory, type SupportedCategory } from "@shared/schema";
 import {
   deriveMetafieldTargetForProductField,
@@ -9,9 +9,10 @@ import {
   loadLiveSchemaForCategory,
   writeMetafield,
 } from "./jomashop_product_field_excel";
-import { lookupEnumOverride } from "./enum_mapping";
+import { lookupEnumOverride, normalizeEnumSourceValue } from "./enum_mapping";
+import { normalizeBrandKey } from "./brand_mapping";
 import { validateInlineFieldValue } from "./inline_field_repair";
-import { deriveReadinessFromMapping, type CompactMappedProduct } from "./compact_mapped";
+import { deriveReadinessFromMapping } from "./compact_mapped";
 
 /**
  * Bulk fill grid: one screen to fill every product-level required Jomashop
@@ -37,6 +38,8 @@ import { deriveReadinessFromMapping, type CompactMappedProduct } from "./compact
  */
 
 const COMMERCIAL_DISCOUNT_FIELD = "Commercial Discount";
+const BRAND_FIELD = "Brand → Jomashop";
+const CATEGORY_FIELD = "Category → Jomashop";
 
 const COMMERCIAL_DISCOUNT_DESCRIPTOR: SchemaPropertyDescriptor = {
   field: COMMERCIAL_DISCOUNT_FIELD,
@@ -46,8 +49,22 @@ const COMMERCIAL_DISCOUNT_DESCRIPTOR: SchemaPropertyDescriptor = {
   max_value: 100,
 } as SchemaPropertyDescriptor;
 
+/**
+ * What kind of fix a grid column represents:
+ *  - "field":     a category schema property → Shopify metafield write.
+ *  - "topLevel":  Commercial Discount → jomashop.commercial_discount metafield.
+ *  - "brand":     Shopify brand → Jomashop manufacturer (brand_override).
+ *  - "category":  Shopify category code → Jomashop category (category_override).
+ *
+ * Brand/category fixes are saved as reusable overrides (no Shopify write) and
+ * take effect for every current and future product with the same brand/code on
+ * the next preview refresh.
+ */
+export type BulkFillKind = "field" | "topLevel" | "brand" | "category";
+
 export type BulkFillFieldDescriptor = {
   field: string;
+  kind: BulkFillKind;
   required: boolean;
   type: string;
   options: string[];
@@ -55,10 +72,27 @@ export type BulkFillFieldDescriptor = {
   multiple: boolean;
   isVariantTargeted: boolean;
   metafieldTarget: string;
-  /** True for the synthetic Commercial Discount column (written to
-   *  jomashop.commercial_discount, not a category schema property). */
+  /** Suggested value (brand/category resolution suggestion) shown as a hint. */
+  suggestion: string;
+  /** Backwards-compatible flag — true for the Commercial Discount column. */
   isTopLevel: boolean;
 };
+
+/**
+ * Whether a cached row is blocked on brand and/or category resolution against
+ * the live Jomashop /i1 lists. Shared by the grid builder and the apply route
+ * so both agree on which rows surface a brand/category fix.
+ */
+export function rowResolutionNeeds(m: any): { brand: boolean; category: boolean } {
+  const res = m?.jomashop_resolution || {};
+  const i1 = res.i1_available === true;
+  const brand =
+    i1 && Boolean(res.outbound_brand && String(res.outbound_brand).trim()) && !res.manufacturer;
+  const categoryUnresolved =
+    i1 && Boolean(res.outbound_category && String(res.outbound_category).trim()) && !res.category_record;
+  const category = categoryUnresolved || m?.ambiguous_category === true;
+  return { brand, category };
+}
 
 export type BulkFillCell = {
   field: string;
@@ -175,8 +209,11 @@ export function buildBulkFillGrid(
       if (f && f !== "undefined" && !fieldIsVariantTargeted(f)) rowRepairFields.add(f);
     }
     const wantsCommercialDiscount = missingTopLevel.includes("commercial_discount");
+    const needs = rowResolutionNeeds(m);
 
-    if (rowRepairFields.size === 0 && !wantsCommercialDiscount) continue;
+    if (rowRepairFields.size === 0 && !wantsCommercialDiscount && !needs.brand && !needs.category) {
+      continue;
+    }
 
     unready += 1;
 
@@ -192,27 +229,44 @@ export function buildBulkFillGrid(
     }
 
     // Register any new columns surfaced by this row.
-    const ensureColumn = (field: string, def: SchemaPropertyDescriptor | undefined, isTopLevel: boolean) => {
-      if (group!.fields.some((c) => c.field === field)) return;
-      const target = isTopLevel
-        ? { namespace: "jomashop", key: "commercial_discount" }
-        : deriveMetafieldTargetForProductField(field);
+    const ensureColumn = (
+      field: string,
+      def: SchemaPropertyDescriptor | undefined,
+      kind: BulkFillKind,
+      suggestion = "",
+    ) => {
+      const existing = group!.fields.find((c) => c.field === field);
+      if (existing) {
+        if (suggestion && !existing.suggestion) existing.suggestion = suggestion;
+        return;
+      }
+      const target =
+        kind === "topLevel"
+          ? "jomashop.commercial_discount"
+          : kind === "field"
+            ? (() => {
+                const t = deriveMetafieldTargetForProductField(field);
+                return `${t.namespace}.${t.key}`;
+              })()
+            : ""; // brand/category: saved as an override, no metafield
       group!.fields.push({
         field,
-        required: def?.required === true || isTopLevel,
-        type: def?.type ?? (isTopLevel ? "number" : "string"),
+        kind,
+        required: def?.required === true || kind !== "field",
+        type: def?.type ?? (kind === "topLevel" ? "number" : "string"),
         options: Array.isArray(def?.options) ? (def!.options as string[]) : [],
         options_unverified: def?.options_unverified === true,
         multiple: def?.multiple === true,
         isVariantTargeted: false,
-        metafieldTarget: `${target.namespace}.${target.key}`,
-        isTopLevel,
+        metafieldTarget: target,
+        suggestion,
+        isTopLevel: kind === "topLevel",
       });
     };
 
     const cells: Record<string, BulkFillCell> = {};
     for (const field of Array.from(rowRepairFields)) {
-      ensureColumn(field, fieldDefByName.get(field), false);
+      ensureColumn(field, fieldDefByName.get(field), "field");
       const invalid = invalidByField.get(field);
       const currentValue = readProperty(m.properties, field);
       const isMissing = currentValue.trim() === "" || lc(currentValue) === "undefined";
@@ -224,12 +278,36 @@ export function buildBulkFillGrid(
       };
     }
     if (wantsCommercialDiscount) {
-      ensureColumn(COMMERCIAL_DISCOUNT_FIELD, COMMERCIAL_DISCOUNT_DESCRIPTOR, true);
+      ensureColumn(COMMERCIAL_DISCOUNT_FIELD, COMMERCIAL_DISCOUNT_DESCRIPTOR, "topLevel");
       cells[COMMERCIAL_DISCOUNT_FIELD] = {
         field: COMMERCIAL_DISCOUNT_FIELD,
         status: "missing",
         currentValue: "",
         invalidValue: "",
+      };
+    }
+    const res = m?.jomashop_resolution || {};
+    if (needs.brand) {
+      const suggestion = res.manufacturer_suggestion?.name ? String(res.manufacturer_suggestion.name) : "";
+      ensureColumn(BRAND_FIELD, undefined, "brand", suggestion);
+      cells[BRAND_FIELD] = {
+        field: BRAND_FIELD,
+        status: "invalid",
+        currentValue: suggestion,
+        invalidValue: String(res.outbound_brand ?? m.brand ?? ""),
+      };
+    }
+    if (needs.category) {
+      const suggestion =
+        (res.category_record?.name && String(res.category_record.name)) ||
+        (typeof m.suggested_category === "string" ? m.suggested_category : "") ||
+        "";
+      ensureColumn(CATEGORY_FIELD, undefined, "category", suggestion);
+      cells[CATEGORY_FIELD] = {
+        field: CATEGORY_FIELD,
+        status: "invalid",
+        currentValue: suggestion,
+        invalidValue: String(res.outbound_category ?? m.raw_category ?? ""),
       };
     }
 
@@ -251,12 +329,13 @@ export function buildBulkFillGrid(
     });
   }
 
-  // Stable column order: required schema order first (alphabetical fallback),
-  // Commercial Discount last.
+  // Stable column order: schema fields first (alphabetical), then Commercial
+  // Discount, then the brand/category resolution columns.
+  const kindOrder: Record<BulkFillKind, number> = { field: 0, topLevel: 1, brand: 2, category: 3 };
   const categories = Array.from(groups.values()).sort((a, b) => a.category.localeCompare(b.category));
   for (const g of categories) {
     g.fields.sort((a, b) => {
-      if (a.isTopLevel !== b.isTopLevel) return a.isTopLevel ? 1 : -1;
+      if (a.kind !== b.kind) return kindOrder[a.kind] - kindOrder[b.kind];
       return a.field.localeCompare(b.field);
     });
   }
@@ -279,8 +358,16 @@ function ownerIdForVariant(variantId: string | number): string {
 type ApplyEdit = {
   productId: string;
   variantId?: string | null;
-  fields: Array<{ field: string; value: string | number }>;
+  fields: Array<{ field: string; value: string | number; kind?: BulkFillKind }>;
 };
+
+function inferKind(field: string, explicit?: BulkFillKind): BulkFillKind {
+  if (explicit) return explicit;
+  if (field === COMMERCIAL_DISCOUNT_FIELD) return "topLevel";
+  if (field === BRAND_FIELD) return "brand";
+  if (field === CATEGORY_FIELD) return "category";
+  return "field";
+}
 
 export function registerBulkFillRoutes(app: Express): void {
   /**
@@ -386,7 +473,13 @@ export function registerBulkFillRoutes(app: Express): void {
    * one bad value never blocks the rest of the batch.
    */
   app.post("/api/jomashop/bulk-fill/apply", async (req, res) => {
-    const body = (req.body || {}) as { confirm?: boolean; edits?: ApplyEdit[] };
+    const body = (req.body || {}) as {
+      confirm?: boolean;
+      edits?: ApplyEdit[];
+      /** Persist each fix as a reusable override (enum/brand/category) so the
+       *  same source value auto-resolves on future products. Default true. */
+      saveAsMapping?: boolean;
+    };
     if (!body.confirm) {
       return res.status(400).json({
         ok: false,
@@ -397,6 +490,7 @@ export function registerBulkFillRoutes(app: Express): void {
     if (edits.length === 0) {
       return res.status(400).json({ ok: false, error: "No edits supplied." });
     }
+    const saveAsMapping = body.saveAsMapping !== false;
 
     const conn = getActiveShopifyConnection();
     if (!conn) {
@@ -448,8 +542,10 @@ export function registerBulkFillRoutes(app: Express): void {
 
     type FieldResult = {
       field: string;
+      kind: BulkFillKind;
       ok: boolean;
       metafieldTarget: string | null;
+      mappingSaved: boolean;
       error: string | null;
       validationError: string | null;
     };
@@ -457,15 +553,18 @@ export function registerBulkFillRoutes(app: Express): void {
       productId: string;
       sku: string;
       written: number;
+      mappingsSaved: number;
       failed: number;
       fields: FieldResult[];
       readiness: string | null;
       push_ready: boolean;
+      needsRefresh: boolean;
     };
 
     const productResults: ProductResult[] = [];
     let totalWritten = 0;
     let totalFailed = 0;
+    let totalMappingsSaved = 0;
 
     for (const edit of edits) {
       const productId = String(edit?.productId ?? "");
@@ -475,16 +574,20 @@ export function registerBulkFillRoutes(app: Express): void {
         productId,
         sku: row ? String(row.vendor_sku ?? row.sku ?? "") : "",
         written: 0,
+        mappingsSaved: 0,
         failed: 0,
         fields: [],
         readiness: null,
         push_ready: false,
+        needsRefresh: false,
       };
       if (!productId || !row) {
         result.fields.push({
           field: "*",
+          kind: "field",
           ok: false,
           metafieldTarget: null,
+          mappingSaved: false,
           error: "Product not found in cached preview. Refresh from Shopify and retry.",
           validationError: null,
         });
@@ -496,15 +599,96 @@ export function registerBulkFillRoutes(app: Express): void {
 
       const descriptors = await descriptorsFor(String(row.category || ""));
       const canonical = canonicalJomashopCategory(String(row.category || "")) || String(row.category || "");
+      const invalidByFieldOrig = new Map<string, string>();
+      for (const ie of Array.isArray(row.invalid_enums) ? row.invalid_enums : []) {
+        if (ie && typeof ie.field === "string") invalidByFieldOrig.set(lc(ie.field), String(ie.value ?? ""));
+      }
+      const needs = rowResolutionNeeds(row);
 
       // Track applied values so we can update the cached row in place.
       const appliedValues: Array<{ field: string; value: string; isTopLevel: boolean }> = [];
+      // Brand/category overrides resolved on this row (gate readiness + need a
+      // full refresh to re-verify against the live /i1 lists).
+      const resolutionApplied = { brand: false, category: false };
 
       for (const f of fields) {
         const fieldName = typeof f?.field === "string" ? f.field.trim() : "";
         if (!fieldName) continue;
+        const kind = inferKind(fieldName, f?.kind);
         const rawValue = String(f?.value ?? "").trim();
-        const isTopLevel = fieldName === COMMERCIAL_DISCOUNT_FIELD;
+
+        // ---- Brand / Category resolution fixes: saved as reusable overrides,
+        //      no Shopify metafield write. ----
+        if (kind === "brand" || kind === "category") {
+          if (!rawValue) {
+            result.fields.push({
+              field: fieldName,
+              kind,
+              ok: false,
+              metafieldTarget: null,
+              mappingSaved: false,
+              error: null,
+              validationError: "Value is required.",
+            });
+            result.failed += 1;
+            totalFailed += 1;
+            continue;
+          }
+          try {
+            if (kind === "brand") {
+              const sourceBrand =
+                String(row?.jomashop_resolution?.outbound_brand ?? row.brand ?? "").trim();
+              const normBrand = normalizeBrandKey(sourceBrand);
+              if (!normBrand) throw new Error("Source brand is empty — cannot save a brand mapping.");
+              storage.upsertBrandOverride({
+                shopifyBrand: normBrand,
+                jomashopBrand: rawValue,
+                notes: "bulk-fill",
+                updatedAt: Date.now(),
+              });
+              resolutionApplied.brand = true;
+            } else {
+              const sourceCode = String(row.raw_category ?? row.category ?? "").trim();
+              const normCode = normalizeCategoryCode(sourceCode);
+              if (!normCode) throw new Error("Source category code is empty — cannot save a category mapping.");
+              storage.upsertCategoryOverride({
+                shopifyCategoryCode: normCode,
+                jomashopCategory: rawValue,
+                notes: "bulk-fill",
+                updatedAt: Date.now(),
+              });
+              resolutionApplied.category = true;
+            }
+            result.fields.push({
+              field: fieldName,
+              kind,
+              ok: true,
+              metafieldTarget: null,
+              mappingSaved: true,
+              error: null,
+              validationError: null,
+            });
+            result.mappingsSaved += 1;
+            totalMappingsSaved += 1;
+            result.needsRefresh = true;
+          } catch (err) {
+            result.fields.push({
+              field: fieldName,
+              kind,
+              ok: false,
+              metafieldTarget: null,
+              mappingSaved: false,
+              error: (err as Error).message,
+              validationError: null,
+            });
+            result.failed += 1;
+            totalFailed += 1;
+          }
+          continue;
+        }
+
+        // ---- Schema field / Commercial Discount: validate + write metafield ----
+        const isTopLevel = kind === "topLevel";
         // Resolve descriptor (case-insensitive label match).
         let fdef = descriptors.get(fieldName);
         if (!fdef) {
@@ -518,6 +702,8 @@ export function registerBulkFillRoutes(app: Express): void {
         }
         // Apply a saved enum override before validation + writeback so the
         // canonical Jomashop label is what we store and validate.
+        const sourceValueForMapping =
+          invalidByFieldOrig.get(lc(fieldName)) || readProperty(row.properties, fieldName);
         let value = rawValue;
         if (fdef && fdef.type === "enum" && Array.isArray(fdef.options)) {
           const override = lookupEnumOverride(canonical, fdef.field, value, fdef.options);
@@ -528,8 +714,10 @@ export function registerBulkFillRoutes(app: Express): void {
         if (validationError) {
           result.fields.push({
             field: fieldName,
+            kind,
             ok: false,
             metafieldTarget: null,
+            mappingSaved: false,
             error: null,
             validationError,
           });
@@ -543,10 +731,51 @@ export function registerBulkFillRoutes(app: Express): void {
           : deriveMetafieldTargetForProductField(fieldName);
         const ownerId = ownerIdForProduct(row?.source?.shopify_product_id ?? productId);
         const write = await writeMetafield(conn, ownerId, target.namespace, target.key, value);
+
+        // Save a reusable enum mapping (source value → chosen option) so the
+        // same Shopify value auto-resolves on every future product. Only for
+        // enum schema fields with a real source value that differs from the
+        // chosen option; saved as VERIFIED because the chosen value comes from
+        // the live accepted-options list.
+        let mappingSaved = false;
+        if (
+          write.ok &&
+          saveAsMapping &&
+          !isTopLevel &&
+          fdef &&
+          fdef.type === "enum" &&
+          Array.isArray(fdef.options) &&
+          fdef.options.length > 0 &&
+          sourceValueForMapping &&
+          normalizeEnumSourceValue(sourceValueForMapping) &&
+          normalizeEnumSourceValue(sourceValueForMapping) !== normalizeEnumSourceValue(value)
+        ) {
+          try {
+            storage.upsertEnumOverride({
+              jomashopCategory: canonical,
+              jomashopField: fdef.field,
+              sourceValue: normalizeEnumSourceValue(sourceValueForMapping),
+              jomashopOption: value,
+              notes: "bulk-fill",
+              verified: true,
+              operatorVerified: false,
+              acceptedOptionsJson: JSON.stringify(fdef.options),
+              updatedAt: Date.now(),
+            });
+            mappingSaved = true;
+            result.mappingsSaved += 1;
+            totalMappingsSaved += 1;
+          } catch {
+            // non-fatal — the metafield write already landed the fix
+          }
+        }
+
         result.fields.push({
           field: fieldName,
+          kind,
           ok: write.ok,
           metafieldTarget: `${target.namespace}.${target.key}`,
+          mappingSaved,
           error: write.ok ? null : write.error,
           validationError: null,
         });
@@ -626,13 +855,28 @@ export function registerBulkFillRoutes(app: Express): void {
         }
 
         result.readiness = readiness;
-        result.push_ready =
-          newMissingRequired.length === 0 &&
-          newMissingTopLevel.length === 0 &&
-          newInvalidEnums.length === 0;
       } else {
         result.readiness = String(row.readiness ?? "missing");
       }
+
+      // Gate readiness on brand/category resolution. deriveReadinessFromMapping
+      // only inspects missing/invalid schema fields, so a row blocked only on
+      // brand/category would otherwise look "ready". Brand/category overrides
+      // saved here still need a full preview refresh to re-verify against the
+      // live /i1 lists before the row is genuinely push-ready.
+      const unresolvedBrand = needs.brand && !resolutionApplied.brand;
+      const unresolvedCategory = needs.category && !resolutionApplied.category;
+      const resolutionPending = resolutionApplied.brand || resolutionApplied.category;
+      if (resolutionPending) result.needsRefresh = true;
+      if (resolutionPending || unresolvedBrand || unresolvedCategory) {
+        if (result.readiness === "ready") result.readiness = "needs-category-verification";
+        if (row.readiness === "ready") row.readiness = "needs-category-verification";
+      }
+      result.push_ready =
+        result.readiness === "ready" &&
+        !resolutionPending &&
+        !unresolvedBrand &&
+        !unresolvedCategory;
 
       productResults.push(result);
     }
@@ -652,15 +896,19 @@ export function registerBulkFillRoutes(app: Express): void {
       // will recompute readiness from Shopify.
     }
 
+    const needsRefreshCount = productResults.filter((p) => p.needsRefresh).length;
+
     storage.appendLog({
       level: totalFailed === 0 ? "info" : "warn",
-      message: `Bulk fill: ${totalWritten} metafield write(s) across ${edits.length} product(s), ${totalFailed} failure(s)`,
+      message: `Bulk fill: ${totalWritten} metafield write(s), ${totalMappingsSaved} reusable mapping(s) saved across ${edits.length} product(s), ${totalFailed} failure(s)`,
       detailsJson: JSON.stringify({
         products: productResults.map((p) => ({
           productId: p.productId,
           written: p.written,
+          mappingsSaved: p.mappingsSaved,
           failed: p.failed,
           readiness: p.readiness,
+          needsRefresh: p.needsRefresh,
         })),
       }),
       createdAt: Date.now(),
@@ -671,13 +919,17 @@ export function registerBulkFillRoutes(app: Express): void {
       shopDomain: conn.shopDomain,
       totalWritten,
       totalFailed,
+      totalMappingsSaved,
+      needsRefresh: needsRefreshCount > 0,
       nowReady: productResults.filter((p) => p.push_ready).length,
       products: productResults,
       cacheUpdatedFor: conn.shopDomain,
       note:
-        totalFailed === 0
-          ? "Applied. Rows that became ready can be pushed now."
-          : "Applied with some failures — see per-field results.",
+        needsRefreshCount > 0
+          ? "Applied. Brand/category mappings were saved — click Refresh from Shopify on Products to re-verify those rows against Jomashop, then push."
+          : totalFailed === 0
+            ? "Applied. Rows that became ready can be pushed now."
+            : "Applied with some failures — see per-field results.",
     });
   });
 }
