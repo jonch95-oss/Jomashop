@@ -10,6 +10,7 @@ import { ErrorBoundary } from "@/components/ErrorBoundary";
 import Overview from "@/pages/Overview";
 import Setup from "@/pages/Setup";
 import Mapping from "@/pages/Mapping";
+import BulkFill from "@/pages/BulkFill";
 import Products from "@/pages/Products";
 import Inventory from "@/pages/Inventory";
 import Orders from "@/pages/Orders";
@@ -24,6 +25,7 @@ function AppRouter() {
           <Route path="/" component={Overview} />
           <Route path="/setup" component={Setup} />
           <Route path="/mapping" component={Mapping} />
+          <Route path="/bulk-fill" component={BulkFill} />
           <Route path="/products" component={Products} />
           <Route path="/inventory" component={Inventory} />
           <Route path="/orders" component={Orders} />
