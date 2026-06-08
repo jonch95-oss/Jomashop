@@ -9,6 +9,7 @@ import {
   Truck,
   ClipboardList,
   ShieldAlert,
+  Rows3,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { AdminTokenGate } from "./AdminTokenGate";
@@ -17,6 +18,7 @@ const NAV: Array<{ href: string; label: string; icon: React.ComponentType<{ clas
   { href: "/", label: "Overview", icon: LayoutDashboard, group: "Operate" },
   { href: "/setup", label: "Setup", icon: Plug, group: "Operate" },
   { href: "/mapping", label: "Mapping & Excel", icon: ArrowLeftRight, group: "Operate" },
+  { href: "/bulk-fill", label: "Bulk Fill", icon: Rows3, group: "Catalog" },
   { href: "/products", label: "Products", icon: PackageSearch, group: "Catalog" },
   { href: "/inventory", label: "Inventory", icon: Boxes, group: "Catalog" },
   { href: "/orders", label: "Orders", icon: ClipboardList, group: "Fulfill" },

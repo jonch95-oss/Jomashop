@@ -67,7 +67,8 @@ import {
   type AggregateMappingsResult,
   type MappingRowExportRecord,
 } from "../server/jomashop_mapping_excel";
-import { MAX_EXPORT_ROWS } from "../server/jomashop_product_field_excel";
+import { MAX_EXPORT_ROWS, fieldIsVariantTargeted } from "../server/jomashop_product_field_excel";
+import { buildBulkFillGrid, rowResolutionNeeds } from "../server/bulk_fill";
 import {
   buildProductFieldWorkbook,
   parseProductFieldUpload,
@@ -7054,6 +7055,207 @@ runFootwearVariationColorYesNo();
 runFootwearGenderWomenToLadies();
 runFootwearShoeCategoryMuleSandal();
 runInlineRepairRecognizesPerVariantSize();
+
+function runBulkFillGridTests() {
+  console.log("Case BF: bulk-fill grid builder column selection + status");
+
+  const schemaByCategory = new Map<
+    string,
+    { fields: SchemaPropertyDescriptor[]; source: string }
+  >([
+    [
+      "Apparel",
+      {
+        source: "live-v1",
+        fields: [
+          { field: "Color", required: true, type: "enum", options: ["NAVY", "BLACK"] },
+          { field: "Material", required: true, type: "string", options: [] },
+          { field: "Brand", required: true, type: "string", options: [] },
+          // Variant-targeted size must never become a grid column.
+          { field: "Shoe Size", required: true, type: "string", options: [] },
+        ] as SchemaPropertyDescriptor[],
+      },
+    ],
+  ]);
+
+  const allMapped: any[] = [
+    {
+      // A: Apparel (via legacy alias "Clothing"), missing Color + Material.
+      category: "Clothing",
+      readiness: "missing",
+      is_sample: false,
+      vendor_sku: "SKU-A",
+      name: "Product A",
+      brand: "Gucci",
+      properties: { Brand: "Gucci" },
+      missing_required: ["Color", "Material", "Shoe Size"],
+      missing_top_level: [],
+      invalid_enums: [],
+      source: { shopify_product_id: "p-A", shopify_variant_ids: ["v-A1"] },
+    },
+    {
+      // B: already ready — excluded.
+      category: "Apparel",
+      readiness: "ready",
+      is_sample: false,
+      vendor_sku: "SKU-B",
+      properties: {},
+      missing_required: [],
+      missing_top_level: [],
+      invalid_enums: [],
+      source: { shopify_product_id: "p-B", shopify_variant_ids: ["v-B1"] },
+    },
+    {
+      // C: sample — excluded.
+      category: "Apparel",
+      readiness: "missing",
+      is_sample: true,
+      vendor_sku: "SKU-C",
+      properties: {},
+      missing_required: ["Color"],
+      missing_top_level: [],
+      invalid_enums: [],
+      source: { shopify_product_id: "p-C", shopify_variant_ids: [] },
+    },
+    {
+      // D: only missing Commercial Discount (top-level blocker).
+      category: "Apparel",
+      readiness: "missing",
+      is_sample: false,
+      vendor_sku: "SKU-D",
+      name: "Product D",
+      properties: { Color: "NAVY", Material: "Cotton", Brand: "X" },
+      missing_required: [],
+      missing_top_level: ["commercial_discount"],
+      invalid_enums: [],
+      source: { shopify_product_id: "p-D", shopify_variant_ids: ["v-D1"] },
+    },
+    {
+      // E: invalid enum on Color (already a column via A) — status invalid.
+      category: "Apparel",
+      readiness: "missing",
+      is_sample: false,
+      vendor_sku: "SKU-E",
+      properties: { Color: "TEAL", Material: "Wool", Brand: "Y" },
+      missing_required: ["Color"],
+      missing_top_level: [],
+      invalid_enums: [{ field: "Color", value: "TEAL", options: ["NAVY", "BLACK"] }],
+      source: { shopify_product_id: "p-E", shopify_variant_ids: ["v-E1"] },
+    },
+    {
+      // F: blocked only on brand resolution (no missing fields).
+      category: "Apparel",
+      readiness: "needs-category-verification",
+      is_sample: false,
+      vendor_sku: "SKU-F",
+      properties: { Color: "NAVY", Material: "Cotton", Brand: "Tods" },
+      missing_required: [],
+      missing_top_level: [],
+      invalid_enums: [],
+      jomashop_resolution: {
+        i1_available: true,
+        outbound_brand: "Tods",
+        manufacturer: null,
+        manufacturer_suggestion: { id: 1, name: "Tod's" },
+        outbound_category: "Apparel",
+        category_record: { id: 2, name: "Apparel" },
+      },
+      source: { shopify_product_id: "p-F", shopify_variant_ids: ["v-F1"] },
+    },
+    {
+      // G: blocked only on category resolution.
+      category: "Apparel",
+      readiness: "needs-category-verification",
+      is_sample: false,
+      vendor_sku: "SKU-G",
+      raw_category: "FOO",
+      suggested_category: "Apparel",
+      properties: { Color: "NAVY", Material: "Cotton", Brand: "Z" },
+      missing_required: [],
+      missing_top_level: [],
+      invalid_enums: [],
+      jomashop_resolution: {
+        i1_available: true,
+        outbound_brand: "Z",
+        manufacturer: { id: 9, name: "Z" },
+        outbound_category: "FOO",
+        category_record: null,
+      },
+      source: { shopify_product_id: "p-G", shopify_variant_ids: ["v-G1"] },
+    },
+  ];
+
+  const grid = buildBulkFillGrid(allMapped, schemaByCategory);
+
+  assert(grid.unreadyProducts === 5, `BF-1: 5 unready products (A,D,E,F,G) (got ${grid.unreadyProducts})`);
+  assert(grid.categories.length === 1, `BF-2: single category group (got ${grid.categories.length})`);
+  const apparel = grid.categories[0];
+  assert(apparel && apparel.category === "Apparel", `BF-3: category canonicalized to Apparel (got ${apparel?.category})`);
+
+  const colNames = apparel.fields.map((f) => f.field);
+  assert(colNames.includes("Color"), `BF-4: Color is a column (got ${colNames.join(", ")})`);
+  assert(colNames.includes("Material"), `BF-5: Material is a column (got ${colNames.join(", ")})`);
+  assert(
+    colNames.includes("Commercial Discount"),
+    `BF-6: Commercial Discount column present from row D (got ${colNames.join(", ")})`,
+  );
+  assert(!colNames.includes("Brand"), `BF-7: Brand (no row needs it) is NOT a column (got ${colNames.join(", ")})`);
+  if (fieldIsVariantTargeted("Shoe Size")) {
+    assert(!colNames.includes("Shoe Size"), `BF-8: variant-targeted Shoe Size excluded (got ${colNames.join(", ")})`);
+  }
+
+  const colorCol = apparel.fields.find((f) => f.field === "Color");
+  assert(colorCol?.type === "enum" && colorCol.options.length === 2, `BF-9: Color column carries enum options`);
+  const discountCol = apparel.fields.find((f) => f.field === "Commercial Discount");
+  assert(
+    discountCol?.isTopLevel === true && discountCol.metafieldTarget === "jomashop.commercial_discount",
+    `BF-10: Commercial Discount maps to jomashop.commercial_discount`,
+  );
+
+  const rowA = apparel.rows.find((r) => r.productId === "p-A");
+  assert(rowA?.cells["Color"]?.status === "missing", `BF-11: row A Color is missing (got ${rowA?.cells["Color"]?.status})`);
+  assert(rowA?.variantId === "v-A1", `BF-12: row A carries first variant id (got ${rowA?.variantId})`);
+  const rowD = apparel.rows.find((r) => r.productId === "p-D");
+  assert(
+    rowD !== undefined && Object.keys(rowD.cells).length === 1 && rowD.cells["Commercial Discount"] !== undefined,
+    `BF-13: row D only needs Commercial Discount`,
+  );
+  const rowE = apparel.rows.find((r) => r.productId === "p-E");
+  assert(
+    rowE?.cells["Color"]?.status === "invalid" && rowE?.cells["Color"]?.invalidValue === "TEAL",
+    `BF-14: row E Color is invalid with the offending value (got ${rowE?.cells["Color"]?.status})`,
+  );
+  assert(
+    apparel.rows.find((r) => r.productId === "p-B") === undefined &&
+      apparel.rows.find((r) => r.productId === "p-C") === undefined,
+    `BF-15: ready + sample rows excluded`,
+  );
+
+  // Brand / category resolution columns.
+  const brandCol = apparel.fields.find((f) => f.kind === "brand");
+  assert(brandCol !== undefined, `BF-16: brand resolution column present (kind=brand)`);
+  assert(brandCol?.suggestion === "Tod's", `BF-17: brand column carries the suggestion (got ${brandCol?.suggestion})`);
+  const rowF = apparel.rows.find((r) => r.productId === "p-F");
+  assert(
+    rowF !== undefined && rowF.cells[brandCol!.field]?.invalidValue === "Tods",
+    `BF-18: row F brand cell carries the Shopify source brand`,
+  );
+  const categoryCol = apparel.fields.find((f) => f.kind === "category");
+  assert(categoryCol !== undefined, `BF-19: category resolution column present (kind=category)`);
+  const rowG = apparel.rows.find((r) => r.productId === "p-G");
+  assert(
+    rowG !== undefined && rowG.cells[categoryCol!.field]?.invalidValue === "FOO",
+    `BF-20: row G category cell carries the Shopify source code`,
+  );
+
+  // rowResolutionNeeds direct unit check.
+  const needsF = rowResolutionNeeds(allMapped.find((m) => m.source.shopify_product_id === "p-F"));
+  assert(needsF.brand === true && needsF.category === false, `BF-21: rowResolutionNeeds flags brand only for F`);
+  const needsG = rowResolutionNeeds(allMapped.find((m) => m.source.shopify_product_id === "p-G"));
+  assert(needsG.category === true && needsG.brand === false, `BF-22: rowResolutionNeeds flags category only for G`);
+}
+
+runBulkFillGridTests();
 
 if (failures > 0) {
   console.error(`\n${failures} assertion(s) failed.`);

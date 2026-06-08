@@ -64,6 +64,8 @@ import {
   registerJomashopProductFieldExcelRoutes,
 } from "./jomashop_product_field_excel";
 import { registerInlineFieldRepairRoutes } from "./inline_field_repair";
+import { registerBulkFillRoutes } from "./bulk_fill";
+import { registerBulkPushRoutes } from "./bulk_push";
 import { pushInventoryUpdate, registerWebhookRoutes, registerShopifyWebhooks } from "./webhooks";
 import { heapMb, logMemory, rssMb } from "./memlog";
 import { lockStatus, releaseLock, withLockOr409 } from "./stability";
@@ -3399,6 +3401,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // cached preview is invalidated.
   registerJomashopProductFieldExcelRoutes(app);
   registerInlineFieldRepairRoutes(app);
+  registerBulkFillRoutes(app);
+  registerBulkPushRoutes(app);
 
   // ---------- Shopify webhooks (public, HMAC-verified) ----------
   registerWebhookRoutes(app);
