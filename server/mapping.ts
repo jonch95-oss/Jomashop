@@ -2539,7 +2539,18 @@ export function buildJomashopProductPayload(
 
   // Validation surfaces (used by the push route to refuse the call when
   // either schema-required props or top-level identifiers are missing).
-  const missingRequired = mapped.warnings.filter((w) => /Missing required/.test(w));
+  // Use the structured field list (the same signal the preview/readiness UI
+  // consumes) rather than regex-matching warning sentences. Matching prose
+  // produced full sentences like `Missing required Footwear field "Color" …`
+  // instead of bare field names, which (a) made the push route's
+  // `blockingInvalidEnums` filter — `missingRequired.includes(inv.field)` —
+  // never match, silently disabling the "invalid value on a required field"
+  // preflight, and (b) surfaced unreadable sentences in the 422 response.
+  // Sourcing from `mapped.missing_required` keeps the push gate and the
+  // Products UI on a single source of truth.
+  const missingRequired = Array.isArray(mapped.missing_required)
+    ? [...mapped.missing_required]
+    : [];
   const missingTopLevel: string[] = [];
   if (!sku) {
     missingTopLevel.push("sku");
