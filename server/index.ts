@@ -20,10 +20,59 @@ const httpServer = createServer(app);
 // the previous build returned a 503 here because the admin-token gate ran
 // first and Express's app.use("/api", mw) had stripped the "/api" prefix,
 // causing the `req.path === "/api/health"` exemption to never match.
+// Build/version markers so you can confirm WHICH commit Render actually
+// deployed (a green health check alone can't tell a new build from a stale
+// one). Render injects RENDER_GIT_COMMIT / RENDER_GIT_BRANCH automatically;
+// SERVER_STARTED_AT is captured at process start, so it jumps every deploy.
+const SERVER_STARTED_AT = new Date().toISOString();
+const BUILD_COMMIT = (
+  process.env.RENDER_GIT_COMMIT ||
+  process.env.GIT_COMMIT ||
+  process.env.SOURCE_VERSION ||
+  ""
+).trim();
+const COMMIT_SHORT = BUILD_COMMIT ? BUILD_COMMIT.slice(0, 7) : "unknown";
+
+// Feature flags present only in this build — their presence in the live
+// response proves the go-live/bulk-fill code was deployed.
+const BUILD_FEATURES = [
+  "push-gate-missing-required-fix",
+  "bulk-fill-grid",
+  "bulk-fill-reusable-mappings",
+  "bulk-fill-brand-category-resolution",
+  "bulk-push",
+];
+
+function versionInfo() {
+  return {
+    ok: true,
+    commit: BUILD_COMMIT || "unknown",
+    commitShort: COMMIT_SHORT,
+    branch: process.env.RENDER_GIT_BRANCH || null,
+    service: process.env.RENDER_SERVICE_NAME || null,
+    instance: process.env.RENDER_INSTANCE_ID || null,
+    nodeEnv: process.env.NODE_ENV || "development",
+    startedAt: SERVER_STARTED_AT,
+    uptimeSeconds: Math.round(process.uptime()),
+    features: BUILD_FEATURES,
+    time: new Date().toISOString(),
+  };
+}
+
 app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, time: new Date().toISOString() });
+  res.json({
+    ok: true,
+    time: new Date().toISOString(),
+    commit: COMMIT_SHORT,
+    startedAt: SERVER_STARTED_AT,
+    uptimeSeconds: Math.round(process.uptime()),
+  });
 });
 app.head("/api/health", (_req, res) => res.status(200).end());
+
+// Public version endpoint (no admin token) — hit this after a Render deploy to
+// confirm the commit + that the new features shipped.
+app.get("/api/version", (_req, res) => res.json(versionInfo()));
 
 declare module "http" {
   interface IncomingMessage {
@@ -50,7 +99,13 @@ function requireAdminToken(req: Request, res: Response, next: NextFunction) {
   // so req.path is e.g. "/health" not "/api/health". Match both for safety
   // (this middleware is also called from /api/health directly above as a
   // belt-and-braces guard).
-  if (req.path === "/api/health" || req.path === "/health") return next();
+  if (
+    req.path === "/api/health" ||
+    req.path === "/health" ||
+    req.path === "/api/version" ||
+    req.path === "/version"
+  )
+    return next();
 
   const token = process.env.ADMIN_TOKEN?.trim();
   if (!token) {
