@@ -71,6 +71,7 @@ Scopes selected on the Shopify side must match `SHOPIFY_SCOPES` exactly.
 - `/#/` Overview
 - `/#/setup` Setup (Shopify OAuth + Jomashop session test)
 - `/#/mapping` Field mapping per category
+- `/#/portal-styles` Vendor Portal reconciliation (import export, see live status)
 - `/#/products` Shopify → Jomashop product mapping preview
 - `/#/inventory` Bulk inventory CSV preview
 - `/#/orders` New orders preview
@@ -94,6 +95,11 @@ Scopes selected on the Shopify side must match `SHOPIFY_SCOPES` exactly.
 | POST   | `/api/sync/preview-products`                    | Shopify product → Jomashop payload mapping       |
 | GET    | `/api/sync/inventory-preview`                   | Bulk inventory CSV preview                       |
 | GET    | `/api/sync/orders-preview`                      | Orders + fulfill payload preview                 |
+| POST   | `/api/portal/import`                            | Import a Vendor Portal export (CSV/XLSX upload, or JSON `{rows}`/`{csv}`) |
+| GET    | `/api/portal/styles`                            | Reconciled portal styles (recomputed vs. cache)  |
+| GET    | `/api/portal/summary`                           | Reconciliation counts + portal-missing list      |
+| GET    | `/api/portal/inventory-eligibility`             | Push-eligibility guard (all, or `?sku=`)         |
+| GET    | `/api/portal/order-match-preview`               | Match imported-order lines to confirmed styles   |
 | GET    | `/api/stores`, `/api/sku-mappings`, `/api/category-mappings`, `/api/sync-jobs`, `/api/logs`, `/api/imported-orders` | DB read endpoints used by the UI |
 
 The Jomashop client (`server/jomashop.ts`) handles:
@@ -109,6 +115,68 @@ The Jomashop client (`server/jomashop.ts`) handles:
 
 ---
 
+## Vendor Portal reconciliation (`/#/portal-styles`)
+
+The Jomashop **Vendor Portal** ("Manage Inventory") is the source of truth for
+what is actually live on Jomashop. It has no public API, so this feature is
+**import/export driven** — no scraping, no portal credentials. Export the
+Manage Inventory list to CSV/XLSX (or copy the rows), import it here, and the
+app reconciles each style against the cached Shopify catalog.
+
+### Expected columns
+
+Headers are matched loosely (case/spacing/punctuation insensitive). The portal
+export typically includes:
+
+| Column                 | Maps to        | Notes                                         |
+| ---------------------- | -------------- | --------------------------------------------- |
+| `Status`               | portal status  | `Active` / `Inactive`                         |
+| `Joma Status`          | live status    | `Live` ⇒ confirmed live on Jomashop           |
+| `SKU`                  | vendor SKU     | **required** — rows without a SKU are skipped  |
+| `Jomashop SKU`         | jomashop SKU   | secondary match key                            |
+| `Name`                 | title          | brand+title fallback match                     |
+| `Category`             | category       | informational                                  |
+| `Qty`                  | quantity       | integer                                        |
+| `Price (USD)`          | price          | stored as integer cents                        |
+| `MSRP (USD)`           | msrp           | stored as integer cents                        |
+| `Date Created`         | dateCreated    | kept as text                                   |
+| `Date Updated`         | dateUpdated    | kept as text                                   |
+| `Product ID` / `UPC`   | productId      | UPC/barcode/GTIN match key (if present)        |
+
+Extra columns are preserved in a raw-row JSON snapshot.
+
+### Match keys & statuses
+
+Each portal row is matched to a Shopify product/variant in descending trust
+order: **Exact SKU → Jomashop SKU → UPC/Product ID → Style/Parent SKU
+(manufacturer #) → Brand+Title**. The resulting **reconciliation status**:
+
+- **Confirmed Live** — matched and `Joma Status = Live`
+- **Active in Portal** — matched and `Status = Active`
+- **Inactive in Portal** — matched and `Status = Inactive`
+- **Needs Review** — matched only by Brand+Title (low confidence) or status unknown
+- **Unmatched Portal Row** — no catalog match
+- **Portal Missing** — a product pushed to Jomashop that has **no** portal row
+  (surfaced separately as a gap to investigate)
+
+### Guardrails
+
+- **Inventory pushes** should be gated on
+  `GET /api/portal/inventory-eligibility?sku=…` — only **Confirmed Live** and
+  **Active in Portal** styles are `eligible`. The UI shows an Eligible/Blocked
+  badge per row.
+- **Order pulls**: `GET /api/portal/order-match-preview` matches imported-order
+  line SKUs against confirmed-live styles and flags `unmatched` /
+  `portal_unconfirmed` lines so you don't fulfill against an unverified mapping.
+
+### Workflow
+
+1. In the Vendor Portal, export Manage Inventory (CSV/XLSX).
+2. Open `/#/portal-styles`, **Upload CSV / XLSX** (or paste rows). Import
+   replaces the prior snapshot by default (`replace=false` to append).
+3. Review the reconciliation table — filter by status, check matched Shopify
+   SKU/product and confidence, and confirm inventory eligibility before pushing.
+
 ## Data model
 
 SQLite + Drizzle ORM. Tables (`shared/schema.ts`):
@@ -119,6 +187,7 @@ SQLite + Drizzle ORM. Tables (`shared/schema.ts`):
 - `category_mappings` — Shopify product type → Jomashop category
 - `sync_jobs` + `sync_logs` — operation history
 - `imported_orders` — JSON snapshots of orders pulled from Jomashop
+- `portal_styles` — imported Vendor Portal rows + computed match status/confidence
 
 DB file is `data.db` in the project root. Add it to `.gitignore` for production
 (already ignored).

@@ -65,6 +65,7 @@ import {
 } from "./jomashop_product_field_excel";
 import { registerInlineFieldRepairRoutes } from "./inline_field_repair";
 import { registerMappingMemoryRoutes } from "./mapping_memory";
+import { registerPortalRoutes } from "./portal_reconcile";
 import { pushInventoryUpdate, registerWebhookRoutes, registerShopifyWebhooks } from "./webhooks";
 import { heapMb, logMemory, rssMb } from "./memlog";
 import { lockStatus, releaseLock, withLockOr409 } from "./stability";
@@ -3220,6 +3221,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   // ---------- Mapping memory + auto-fill suggestions + write-back preview ----------
   registerMappingMemoryRoutes(app);
+
+  // ---------- Vendor Portal reconciliation (import/export based) ----------
+  registerPortalRoutes(app);
 
   // Debug + dashboard: walks the cached product preview and aggregates every
   // required enum field that is currently unresolved (no live option list AND

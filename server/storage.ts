@@ -12,6 +12,7 @@ import {
   pushStatuses,
   productCache,
   webhookEvents,
+  portalStyles,
 } from "@shared/schema";
 import type {
   Store,
@@ -40,6 +41,8 @@ import type {
   InsertProductCache,
   WebhookEvent,
   InsertWebhookEvent,
+  PortalStyle,
+  InsertPortalStyle,
 } from "@shared/schema";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import Database from "better-sqlite3";
@@ -226,6 +229,31 @@ sqlite.exec(`
     details_json TEXT,
     received_at INTEGER NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS portal_styles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    vendor_sku TEXT NOT NULL UNIQUE,
+    jomashop_sku TEXT,
+    name TEXT,
+    brand TEXT,
+    category TEXT,
+    status TEXT,
+    joma_status TEXT,
+    qty INTEGER,
+    price INTEGER,
+    msrp INTEGER,
+    date_created TEXT,
+    date_updated TEXT,
+    source TEXT NOT NULL DEFAULT 'portal-import',
+    imported_at INTEGER NOT NULL,
+    raw_json TEXT,
+    match_status TEXT,
+    match_confidence TEXT,
+    matched_shopify_product_id TEXT,
+    matched_shopify_variant_id TEXT,
+    matched_shopify_sku TEXT,
+    updated_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS portal_styles_jomashop_sku_idx ON portal_styles (jomashop_sku);
 `);
 
 // Lightweight migration: add access_token_enc to stores if it's missing
@@ -345,6 +373,12 @@ export interface IStorage {
   // Webhook events
   appendWebhookEvent(input: InsertWebhookEvent): WebhookEvent;
   listWebhookEvents(limit?: number): WebhookEvent[];
+
+  // Portal styles (Jomashop Vendor Portal reconciliation)
+  listPortalStyles(): PortalStyle[];
+  getPortalStyleBySku(vendorSku: string): PortalStyle | undefined;
+  upsertPortalStyle(input: InsertPortalStyle): PortalStyle;
+  clearPortalStyles(): number;
 }
 
 export class DatabaseStorage implements IStorage {
@@ -636,6 +670,30 @@ export class DatabaseStorage implements IStorage {
       .orderBy(desc(webhookEvents.receivedAt))
       .limit(limit)
       .all();
+  }
+
+  listPortalStyles(): PortalStyle[] {
+    return db.select().from(portalStyles).orderBy(desc(portalStyles.updatedAt)).all();
+  }
+  getPortalStyleBySku(vendorSku: string): PortalStyle | undefined {
+    return db.select().from(portalStyles).where(eq(portalStyles.vendorSku, vendorSku)).get();
+  }
+  upsertPortalStyle(input: InsertPortalStyle): PortalStyle {
+    const existing = this.getPortalStyleBySku(input.vendorSku);
+    if (existing) {
+      return db
+        .update(portalStyles)
+        .set({ ...input })
+        .where(eq(portalStyles.id, existing.id))
+        .returning()
+        .get();
+    }
+    return db.insert(portalStyles).values(input).returning().get();
+  }
+  clearPortalStyles(): number {
+    const before = db.select().from(portalStyles).all().length;
+    db.delete(portalStyles).run();
+    return before;
   }
 }
 

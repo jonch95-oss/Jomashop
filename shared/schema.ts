@@ -232,6 +232,66 @@ export const importedOrders = sqliteTable("imported_orders", {
   updatedAt: integer("updated_at").notNull(),
 });
 
+// ---------- Portal styles (reconciliation against the Jomashop Vendor Portal) ----------
+// One row per style/SKU imported from a Jomashop Vendor Portal "Manage
+// Inventory" export (CSV/XLSX/JSON). The portal is the source of truth for
+// what is actually LIVE on Jomashop; this table lets the app reconcile that
+// truth against the cached Shopify catalog so inventory updates and order
+// pulls only act on confirmed-live styles. The raw export row is kept verbatim
+// in `rawJson` so we never lose a column the matcher didn't model. Match
+// results (status + confidence + the Shopify identifiers we resolved) are
+// stored alongside so the UI and inventory/order guards can read them without
+// recomputing.
+export const portalStyles = sqliteTable("portal_styles", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  vendorSku: text("vendor_sku").notNull().unique(), // portal "SKU" column (e.g. 3102Y378-M)
+  jomashopSku: text("jomashop_sku"), // portal "Jomashop SKU" (e.g. Y-A7C4T)
+  name: text("name"),
+  brand: text("brand"),
+  category: text("category"),
+  // Portal "Status" filter value: Active | Inactive (free text — kept as-is).
+  status: text("status"),
+  // Portal "Joma Status" column (e.g. "Live"). The live-on-Jomashop signal.
+  jomaStatus: text("joma_status"),
+  qty: integer("qty"),
+  price: integer("price"), // stored as cents to avoid float drift
+  msrp: integer("msrp"), // stored as cents
+  dateCreated: text("date_created"), // portal date strings, kept verbatim
+  dateUpdated: text("date_updated"),
+  source: text("source").notNull().default("portal-import"),
+  importedAt: integer("imported_at").notNull(),
+  rawJson: text("raw_json"),
+  // Reconciliation result (recomputed on import and on demand).
+  matchStatus: text("match_status"), // see PORTAL_MATCH_STATUSES
+  matchConfidence: text("match_confidence"), // see PORTAL_MATCH_CONFIDENCES
+  matchedShopifyProductId: text("matched_shopify_product_id"),
+  matchedShopifyVariantId: text("matched_shopify_variant_id"),
+  matchedShopifySku: text("matched_shopify_sku"),
+  updatedAt: integer("updated_at").notNull(),
+});
+
+// Reconciliation status assigned to each portal row (and to catalog gaps).
+export const PORTAL_MATCH_STATUSES = [
+  "Confirmed Live",
+  "Active in Portal",
+  "Inactive in Portal",
+  "Portal Missing",
+  "Needs Review",
+  "Unmatched Portal Row",
+] as const;
+export type PortalMatchStatus = (typeof PORTAL_MATCH_STATUSES)[number];
+
+// Confidence label describing WHICH key produced the Shopify match.
+export const PORTAL_MATCH_CONFIDENCES = [
+  "Exact SKU",
+  "Jomashop SKU",
+  "UPC/Product ID",
+  "Style/Parent SKU",
+  "Brand+Title",
+  "Needs Review",
+] as const;
+export type PortalMatchConfidence = (typeof PORTAL_MATCH_CONFIDENCES)[number];
+
 // ---------- Insert schemas ----------
 export const insertStoreSchema = createInsertSchema(stores).omit({ id: true });
 export const insertCredentialStatusSchema = createInsertSchema(credentialStatus).omit({ id: true });
@@ -246,6 +306,7 @@ export const insertImportedOrderSchema = createInsertSchema(importedOrders).omit
 export const insertPushStatusSchema = createInsertSchema(pushStatuses).omit({ id: true });
 export const insertProductCacheSchema = createInsertSchema(productCache).omit({ id: true });
 export const insertWebhookEventSchema = createInsertSchema(webhookEvents).omit({ id: true });
+export const insertPortalStyleSchema = createInsertSchema(portalStyles).omit({ id: true });
 
 // ---------- Types ----------
 export type Store = typeof stores.$inferSelect;
@@ -274,6 +335,8 @@ export type ProductCache = typeof productCache.$inferSelect;
 export type InsertProductCache = z.infer<typeof insertProductCacheSchema>;
 export type WebhookEvent = typeof webhookEvents.$inferSelect;
 export type InsertWebhookEvent = z.infer<typeof insertWebhookEventSchema>;
+export type PortalStyle = typeof portalStyles.$inferSelect;
+export type InsertPortalStyle = z.infer<typeof insertPortalStyleSchema>;
 
 // ---------- Shared domain constants ----------
 // SupportedCategory enumerates every Jomashop top-level category this app

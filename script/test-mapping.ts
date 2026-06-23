@@ -90,6 +90,20 @@ import {
   jomashopRequest,
   __resetSessionPathForTest,
 } from "../server/jomashop";
+import {
+  parsePortalCsv,
+  tableToRecords,
+  coercePortalRecord,
+  headerToField,
+  dollarsToCents,
+  buildCatalogIndex,
+  catalogEntriesFromProducts,
+  matchPortalStyle,
+  reconcileStatus,
+  isInventoryPushEligible,
+  extractOrderLineSkus,
+  type CatalogEntry,
+} from "../server/portal_reconcile";
 
 // Pure (storage-free) enum override resolver that mimics the production
 // lookupEnumOverride for tests. Mirrors the strict trust gate used in
@@ -7159,6 +7173,162 @@ async function runJomashopSessionEndpointFallback() {
 }
 
 await runJomashopSessionEndpointFallback();
+
+function runPortalReconcileTests() {
+  console.log("\nPortal reconciliation:");
+
+  // --- CSV parsing + header mapping + record coercion ---
+  const csv = [
+    "Status,Joma Status,SKU,Jomashop SKU,Name,Category,Qty,Price (USD),MSRP (USD)",
+    "Active,Live,3102Y378-M,Y-A7C4T,Cavalli Class Navy Shirt,Apparel,5,129.00,299.00",
+    'Inactive,,3103K61-4,Y-A7C4U,"Some, Quoted Name",Apparel,0,49.50,99.00',
+  ].join("\n");
+  const table = parsePortalCsv(csv);
+  assert(table.length === 3, "parsePortalCsv: header + 2 data rows");
+  const records = tableToRecords(table);
+  assert(records.length === 2, "tableToRecords: 2 object records");
+  assert(records[1]["Name"] === "Some, Quoted Name", "CSV: quoted comma preserved");
+
+  assert(headerToField("Jomashop SKU") === "jomashopSku", "headerToField: Jomashop SKU");
+  assert(headerToField("Joma Status") === "jomaStatus", "headerToField: Joma Status");
+  assert(headerToField("SKU") === "vendorSku", "headerToField: vendor SKU");
+  assert(headerToField("Price (USD)") === "price", "headerToField: price");
+  assert(headerToField("MSRP (USD)") === "msrp", "headerToField: msrp");
+  assert(headerToField("Product ID") === "productId", "headerToField: Product ID");
+  assert(headerToField("UPC") === "productId", "headerToField: UPC → productId");
+
+  assert(dollarsToCents("$1,299.00") === 129900, "dollarsToCents: $1,299.00 → 129900");
+  assert(dollarsToCents("49.5") === 4950, "dollarsToCents: 49.5 → 4950");
+  assert(dollarsToCents("") === null, "dollarsToCents: blank → null");
+
+  const row0 = coercePortalRecord(records[0]);
+  assert(!!row0 && row0!.vendorSku === "3102Y378-M", "coerce: vendor SKU");
+  assert(row0!.jomashopSku === "Y-A7C4T", "coerce: jomashop SKU");
+  assert(row0!.priceCents === 12900, "coerce: price cents");
+  assert(row0!.msrpCents === 29900, "coerce: msrp cents");
+  assert(row0!.qty === 5, "coerce: qty");
+  assert(row0!.jomaStatus === "Live" && row0!.status === "Active", "coerce: status fields");
+  const noSku = coercePortalRecord({ Name: "No SKU here" });
+  assert(noSku === null, "coerce: row without SKU rejected");
+
+  // --- Matching engine against a synthetic catalog ---
+  const catalog: CatalogEntry[] = [
+    {
+      shopifyProductId: "gid-1",
+      shopifyVariantId: "v-1",
+      sku: "3102Y378-M",
+      vendorSku: "3102Y378-M",
+      jomashopSku: "Y-A7C4T",
+      manufacturerNumber: "MFG-100",
+      brand: "Cavalli Class",
+      name: "Navy Shirt",
+      upcs: ["190000000001"],
+      pushState: "pushed",
+    },
+    {
+      shopifyProductId: "gid-2",
+      shopifyVariantId: "v-2",
+      sku: "OTHER-1",
+      vendorSku: "OTHER-1",
+      jomashopSku: "Y-ZZZ",
+      manufacturerNumber: "STYLE-XYZ",
+      brand: "Gucci",
+      name: "Belt",
+      upcs: [],
+      pushState: "pushed",
+    },
+  ];
+  const index = buildCatalogIndex(catalog);
+
+  const mkRow = (o: Record<string, any> & { vendorSku: string }) => ({
+    vendorSku: o.vendorSku,
+    jomashopSku: o.jomashopSku ?? null,
+    name: o.name ?? null,
+    brand: o.brand ?? null,
+    category: null,
+    status: o.status ?? null,
+    jomaStatus: o.jomaStatus ?? null,
+    qty: null,
+    priceCents: null,
+    msrpCents: null,
+    dateCreated: null,
+    dateUpdated: null,
+    productId: o.productId ?? null,
+    raw: {},
+  });
+
+  const mExact = matchPortalStyle(mkRow({ vendorSku: "3102Y378-M" }), index);
+  assert(mExact.confidence === "Exact SKU" && mExact.entry?.shopifyProductId === "gid-1", "match: exact vendor SKU");
+
+  const mJoma = matchPortalStyle(mkRow({ vendorSku: "UNKNOWN", jomashopSku: "Y-ZZZ" }), index);
+  assert(mJoma.confidence === "Jomashop SKU" && mJoma.entry?.shopifyProductId === "gid-2", "match: Jomashop SKU fallback");
+
+  const mUpc = matchPortalStyle(mkRow({ vendorSku: "UNKNOWN", productId: "190000000001" }), index);
+  assert(mUpc.confidence === "UPC/Product ID", "match: UPC/Product ID fallback");
+
+  const mStyle = matchPortalStyle(mkRow({ vendorSku: "STYLE-XYZ" }), index);
+  assert(mStyle.confidence === "Style/Parent SKU", "match: style/parent (manufacturer #)");
+
+  const mBT = matchPortalStyle(mkRow({ vendorSku: "UNKNOWN", brand: "Gucci", name: "Belt" }), index);
+  assert(mBT.confidence === "Brand+Title", "match: brand+title fallback");
+
+  const mNone = matchPortalStyle(mkRow({ vendorSku: "NOPE" }), index);
+  assert(mNone.confidence === "Needs Review" && mNone.entry === null, "match: unmatched → Needs Review");
+
+  // --- Status derivation ---
+  assert(
+    reconcileStatus(mkRow({ vendorSku: "3102Y378-M", jomaStatus: "Live" }), mExact) === "Confirmed Live",
+    "status: matched + Joma Live → Confirmed Live",
+  );
+  assert(
+    reconcileStatus(mkRow({ vendorSku: "3102Y378-M", status: "Active" }), mExact) === "Active in Portal",
+    "status: matched + Active → Active in Portal",
+  );
+  assert(
+    reconcileStatus(mkRow({ vendorSku: "3102Y378-M", status: "Inactive" }), mExact) === "Inactive in Portal",
+    "status: matched + Inactive → Inactive in Portal",
+  );
+  assert(
+    reconcileStatus(mkRow({ vendorSku: "NOPE" }), mNone) === "Unmatched Portal Row",
+    "status: no match → Unmatched Portal Row",
+  );
+  assert(
+    reconcileStatus(mkRow({ vendorSku: "UNKNOWN", brand: "Gucci", name: "Belt" }), mBT) === "Needs Review",
+    "status: brand+title match → Needs Review",
+  );
+
+  // --- Inventory eligibility guard ---
+  assert(isInventoryPushEligible("Confirmed Live"), "eligibility: Confirmed Live → eligible");
+  assert(isInventoryPushEligible("Active in Portal"), "eligibility: Active in Portal → eligible");
+  assert(!isInventoryPushEligible("Inactive in Portal"), "eligibility: Inactive → blocked");
+  assert(!isInventoryPushEligible("Unmatched Portal Row"), "eligibility: Unmatched → blocked");
+  assert(!isInventoryPushEligible(null), "eligibility: null → blocked");
+
+  // --- catalogEntriesFromProducts (compact product shape) ---
+  const compact = catalogEntriesFromProducts([
+    {
+      sku: "P-1",
+      vendor_sku: "P-1",
+      jomashop_sku: "J-1",
+      brand: "Prada",
+      name: "Bag",
+      push_state: "pushed",
+      source: { shopify_product_id: "gid-9", shopify_variant_ids: ["vv-1"] },
+      properties: { UPC: "012345678905" },
+    },
+  ]);
+  assert(compact.length === 1, "catalogEntriesFromProducts: 1 entry");
+  assert(compact[0].upcs.includes("012345678905"), "catalogEntriesFromProducts: UPC extracted from properties");
+
+  // --- Order line SKU extraction ---
+  const skus = extractOrderLineSkus({
+    items: [{ sku: "A-1", qty: 2 }, { vendor_sku: "B-2" }],
+    nested: { line: { "Jomashop SKU": "J-3" } },
+  });
+  assert(skus.includes("A-1") && skus.includes("B-2") && skus.includes("J-3"), "extractOrderLineSkus: nested SKUs found");
+}
+
+runPortalReconcileTests();
 
 if (failures > 0) {
   console.error(`\n${failures} assertion(s) failed.`);

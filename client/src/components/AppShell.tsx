@@ -11,6 +11,7 @@ import {
   ShieldAlert,
   ListChecks,
   Brain,
+  Store,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { AdminTokenGate } from "./AdminTokenGate";
@@ -22,6 +23,7 @@ const NAV: Array<{ href: string; label: string; icon: React.ComponentType<{ clas
   { href: "/products", label: "Products", icon: PackageSearch, group: "Catalog" },
   { href: "/queue", label: "Review Queue", icon: ListChecks, group: "Catalog" },
   { href: "/mapping-memory", label: "Mapping Memory", icon: Brain, group: "Catalog" },
+  { href: "/portal-styles", label: "Portal Styles", icon: Store, group: "Catalog" },
   { href: "/inventory", label: "Inventory", icon: Boxes, group: "Catalog" },
   { href: "/orders", label: "Orders", icon: ClipboardList, group: "Fulfill" },
   { href: "/fulfillment", label: "Fulfillment", icon: Truck, group: "Fulfill" },

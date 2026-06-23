@@ -13,6 +13,7 @@ import Mapping from "@/pages/Mapping";
 import Products from "@/pages/Products";
 import Queue from "@/pages/Queue";
 import MappingMemory from "@/pages/MappingMemory";
+import PortalStyles from "@/pages/PortalStyles";
 import Inventory from "@/pages/Inventory";
 import Orders from "@/pages/Orders";
 import Fulfillment from "@/pages/Fulfillment";
@@ -29,6 +30,7 @@ function AppRouter() {
           <Route path="/products" component={Products} />
           <Route path="/queue" component={Queue} />
           <Route path="/mapping-memory" component={MappingMemory} />
+          <Route path="/portal-styles" component={PortalStyles} />
           <Route path="/inventory" component={Inventory} />
           <Route path="/orders" component={Orders} />
           <Route path="/fulfillment" component={Fulfillment} />
