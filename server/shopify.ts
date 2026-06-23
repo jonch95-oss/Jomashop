@@ -28,11 +28,21 @@ export const MAPPER_VERSION = 5;
 // ---------- AES-GCM helpers ----------
 
 function deriveKey(): Buffer {
-  const secret =
-    process.env.SESSION_SECRET ||
-    process.env.SHOPIFY_CLIENT_SECRET ||
-    "shopify-token-fallback-key-change-me";
-  return crypto.createHash("sha256").update(secret).digest();
+  const configured = process.env.SESSION_SECRET || process.env.SHOPIFY_CLIENT_SECRET;
+  if (!configured) {
+    // In production, refuse to encrypt access tokens with a publicly known
+    // hardcoded key — anyone reading the source could decrypt the DB. Fail
+    // loudly so the operator sets SESSION_SECRET before tokens are persisted.
+    if (process.env.NODE_ENV === "production") {
+      throw new Error(
+        "Refusing to encrypt Shopify tokens with the hardcoded fallback key in production. " +
+          "Set SESSION_SECRET (or SHOPIFY_CLIENT_SECRET) to a random 32+ char value.",
+      );
+    }
+    // Local dev convenience only.
+    return crypto.createHash("sha256").update("shopify-token-fallback-key-change-me").digest();
+  }
+  return crypto.createHash("sha256").update(configured).digest();
 }
 
 export function encryptToken(plaintext: string): string {

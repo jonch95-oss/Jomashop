@@ -64,6 +64,7 @@ import {
   registerJomashopProductFieldExcelRoutes,
 } from "./jomashop_product_field_excel";
 import { registerInlineFieldRepairRoutes } from "./inline_field_repair";
+import { registerMappingMemoryRoutes } from "./mapping_memory";
 import { pushInventoryUpdate, registerWebhookRoutes, registerShopifyWebhooks } from "./webhooks";
 import { heapMb, logMemory, rssMb } from "./memlog";
 import { lockStatus, releaseLock, withLockOr409 } from "./stability";
@@ -2358,7 +2359,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       pushInventory?: boolean;
       forcedCategory?: SupportedCategory;
       overrides?: PushOverrides;
+      /** When true, run the full preflight + payload build and return the
+       *  would-be Jomashop payload WITHOUT calling the Jomashop API. Lets the
+       *  operator safely validate a product before any live mutation. */
+      dryRun?: boolean;
     };
+    const dryRun = body.dryRun === true;
 
     if (!body.confirm) {
       return res.status(400).json({
@@ -2927,6 +2933,45 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       });
     }
 
+    // Dry-run / validate-only: all preflight checks have passed and the
+    // payload is fully built. Return the would-be payload + envelope without
+    // calling the Jomashop API so the operator can preview a clean push.
+    if (dryRun) {
+      storage.updateSyncJob(job.id, {
+        status: "success",
+        finishedAt: Date.now(),
+        successItems: 1,
+        summary: `Dry-run validate-only OK for ${mapped.vendor_sku} (${mapped.category})`,
+      });
+      storage.appendLog({
+        jobId: job.id,
+        level: "info",
+        message: `Dry-run validate-only passed for ${mapped.vendor_sku} (${mapped.category}) — no data sent to Jomashop`,
+        detailsJson: JSON.stringify({ schemaSource: liveSchemaSource, vendorSku: payload.vendor_sku }),
+        createdAt: Date.now(),
+      });
+      return res.json({
+        ok: true,
+        dryRun: true,
+        validation: {
+          passed: true,
+          missingRequired,
+          missingTopLevel,
+          invalidEnums: pushDebug.invalidEnums,
+          unverifiedRequiredOptions: pushDebug.unverifiedRequiredOptions || [],
+          omittedOptionalFields: pushDebug.omittedOptionalFields,
+        },
+        payloadPreview: payload,
+        envelopePreview: buildI1ProductEnvelope(payload, variant),
+        brandResolution: manufacturerResolution,
+        categoryResolution,
+        warnings: mapped.warnings,
+        mapped,
+        pushDebug,
+        schemaSource: liveSchemaSource,
+      });
+    }
+
     storage.appendLog({
       jobId: job.id,
       level: "info",
@@ -3172,6 +3217,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   // ---------- Enum mapping workflow (source value → exact Jomashop option) ----------
   registerEnumMappingRoutes(app);
+
+  // ---------- Mapping memory + auto-fill suggestions + write-back preview ----------
+  registerMappingMemoryRoutes(app);
 
   // Debug + dashboard: walks the cached product preview and aggregates every
   // required enum field that is currently unresolved (no live option list AND

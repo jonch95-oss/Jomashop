@@ -207,9 +207,16 @@ export async function pushInventoryUpdate(opts: {
       message: `SKU ${shopifySku} has not been pushed to Jomashop yet — skipping inventory update`,
     };
   }
-  const stored = lookup.lastPayloadJson
-    ? (JSON.parse(lookup.lastPayloadJson) as PushStatusPayload)
-    : null;
+  let stored: PushStatusPayload | null = null;
+  if (lookup.lastPayloadJson) {
+    try {
+      stored = JSON.parse(lookup.lastPayloadJson) as PushStatusPayload;
+    } catch {
+      // Corrupt/legacy payload JSON — proceed without the snapshot rather than
+      // crashing the webhook handler. quantity falls back to the webhook value.
+      stored = null;
+    }
+  }
   const variantSnapshot = stored?.variants?.find((v) => v.vendor_sku === shopifySku);
   const qty = quantity ?? variantSnapshot?.quantity ?? 0;
   const visibility = await syncShopifyProductVisibilityForInventory({

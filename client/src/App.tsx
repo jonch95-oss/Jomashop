@@ -11,6 +11,8 @@ import Overview from "@/pages/Overview";
 import Setup from "@/pages/Setup";
 import Mapping from "@/pages/Mapping";
 import Products from "@/pages/Products";
+import Queue from "@/pages/Queue";
+import MappingMemory from "@/pages/MappingMemory";
 import Inventory from "@/pages/Inventory";
 import Orders from "@/pages/Orders";
 import Fulfillment from "@/pages/Fulfillment";
@@ -25,6 +27,8 @@ function AppRouter() {
           <Route path="/setup" component={Setup} />
           <Route path="/mapping" component={Mapping} />
           <Route path="/products" component={Products} />
+          <Route path="/queue" component={Queue} />
+          <Route path="/mapping-memory" component={MappingMemory} />
           <Route path="/inventory" component={Inventory} />
           <Route path="/orders" component={Orders} />
           <Route path="/fulfillment" component={Fulfillment} />
