@@ -45,6 +45,7 @@ import {
   type SchemaPropertyDescriptor,
 } from "./mapping";
 import { getActiveShopifyConnection } from "./shopify";
+import { deriveReadinessFromMapping } from "./compact_mapped";
 import {
   MAX_IMPORT_ROWS,
   rejectIfTooManyRows,
@@ -1020,6 +1021,111 @@ export type ParseProductFieldUploadResult = {
   perCategoryWarnings: string[];
 };
 
+// ---------- Internal persistence (cache splice) ----------
+
+/** Trailing numeric id from a Shopify gid or raw id string, for matching. */
+function normProductId(s: string | number | undefined | null): string {
+  const str = String(s ?? "");
+  const m = str.match(/(\d+)\s*$/);
+  return m ? m[1] : str.trim();
+}
+
+/**
+ * Merge operator-supplied field values + MSRP from uploaded rows into the
+ * cached compact products, recompute the missing/invalid lists and readiness,
+ * and return the updated array. Pure (no DB / network) so it is unit-testable;
+ * the apply route persists the result.
+ *
+ * This is what makes uploaded "missing info" values actually populate after an
+ * import: previously the apply step only wrote metafields (when a live Shopify
+ * connection existed) and cleared the cache, so with no connection — the common
+ * scaffold state — filled values vanished and the next refresh re-derived the
+ * same fields as still missing.
+ */
+export function applyFieldValuesToCachedProducts(
+  mapped: any[],
+  rows: Array<{ shopifyProductId: string; fieldValues: Record<string, string>; msrp?: string }>,
+): { mapped: any[]; productsUpdated: number; fieldsApplied: number } {
+  // Aggregate rows by normalized product id; a product can appear on several
+  // rows (e.g. per-variant) — merge their non-blank filled values + MSRP.
+  const byProduct = new Map<string, { fieldValues: Record<string, string>; msrp: string }>();
+  for (const row of rows) {
+    const pid = normProductId(row.shopifyProductId);
+    if (!pid) continue;
+    const entry = byProduct.get(pid) ?? { fieldValues: {}, msrp: "" };
+    for (const [k, v] of Object.entries(row.fieldValues ?? {})) {
+      const val = typeof v === "string" ? v.trim() : v;
+      if (val !== "" && val != null) entry.fieldValues[k] = String(val);
+    }
+    if (typeof row.msrp === "string" && row.msrp.trim() !== "") entry.msrp = row.msrp.trim();
+    byProduct.set(pid, entry);
+  }
+
+  let productsUpdated = 0;
+  let fieldsApplied = 0;
+
+  const nextMapped = mapped.map((m: any) => {
+    const pid = normProductId(m?.source?.shopify_product_id);
+    const update = pid ? byProduct.get(pid) : undefined;
+    if (!update) return m;
+
+    const filledNames = Object.keys(update.fieldValues);
+    const hasMsrp = update.msrp !== "";
+    if (filledNames.length === 0 && !hasMsrp) return m;
+
+    const lowerFilled = new Set(filledNames.map((n) => n.toLowerCase()));
+
+    const properties: Record<string, string | number | boolean> = {
+      ...(m.properties && typeof m.properties === "object" ? m.properties : {}),
+    };
+    for (const [k, v] of Object.entries(update.fieldValues)) properties[k] = v;
+
+    // MSRP is a top-level system column (dollars in the sheet). Keep it as a
+    // number when parseable so downstream readiness/price logic stays happy.
+    let msrp = m.msrp ?? null;
+    if (hasMsrp) {
+      const parsed = Number(update.msrp.replace(/[^0-9.\-]/g, ""));
+      msrp = Number.isFinite(parsed) ? parsed : m.msrp ?? null;
+    }
+
+    const missing_required = (Array.isArray(m.missing_required) ? m.missing_required : []).filter(
+      (f: string) => !lowerFilled.has(String(f).toLowerCase()),
+    );
+    const invalid_enums = (Array.isArray(m.invalid_enums) ? m.invalid_enums : []).filter(
+      (e: any) => !lowerFilled.has(String(e?.field ?? "").toLowerCase()),
+    );
+    const missing_top_level = (Array.isArray(m.missing_top_level) ? m.missing_top_level : []).filter(
+      (f: string) => {
+        const lf = String(f).toLowerCase();
+        if (lf === "msrp" && hasMsrp) return false;
+        return !lowerFilled.has(lf);
+      },
+    );
+
+    const has_undefined_property = Object.values(properties).some((v) => v === undefined);
+
+    const readiness = deriveReadinessFromMapping({
+      is_sample: m.is_sample,
+      push_state: m.push_state,
+      schemaLoaded: m.schema_source ? m.schema_source !== "none" : true,
+      ambiguous_category: m.ambiguous_category,
+      missing_top_level,
+      missing_required,
+      invalid_enums,
+      vendor_sku: m.vendor_sku,
+      category: m.category,
+      has_undefined_property,
+    });
+
+    productsUpdated += 1;
+    fieldsApplied += filledNames.length + (hasMsrp ? 1 : 0);
+
+    return { ...m, properties, msrp, missing_required, invalid_enums, missing_top_level, readiness };
+  });
+
+  return { mapped: nextMapped, productsUpdated, fieldsApplied };
+}
+
 export type ParseProductFieldUploadOptions = {
   /**
    * When true, every row that has at least one filled editable field value
@@ -1929,13 +2035,53 @@ export function registerJomashopProductFieldExcelRoutes(app: Express): void {
       }
     }
 
-    // Invalidate cached preview so the next refresh re-derives the
-    // properties from the freshly-written metafields.
+    // Persist the operator-supplied values into the cached preview so the
+    // changes populate immediately — even when there is no live Shopify
+    // connection to write metafields to. We splice the filled field values +
+    // MSRP into the matching cached products, recompute readiness, and write
+    // the cache back (preserving mapperVersion + cache metadata). If no cache
+    // exists / nothing matched, fall back to clearing so the next refresh
+    // re-derives from source.
+    let internalUpdate = { productsUpdated: 0, fieldsApplied: 0 };
     if (shopDomain) {
       try {
-        storage.clearProductCache(shopDomain);
+        const existing = storage.getProductCache(shopDomain);
+        let payload: any = null;
+        if (existing) {
+          try { payload = JSON.parse(existing.payloadJson); } catch { payload = null; }
+        }
+        if (existing && payload && Array.isArray(payload.mapped)) {
+          const applied = applyFieldValuesToCachedProducts(
+            payload.mapped,
+            validRows.map((r) => ({
+              shopifyProductId: r.shopifyProductId,
+              fieldValues: r.fieldValues,
+              msrp: r.msrp,
+            })),
+          );
+          if (applied.productsUpdated > 0) {
+            payload.mapped = applied.mapped;
+            storage.upsertProductCache({
+              shopDomain,
+              fetchedCount: existing.fetchedCount,
+              pageCount: existing.pageCount,
+              hasMore: existing.hasMore,
+              payloadJson: JSON.stringify(payload),
+              fetchedAt: Date.now(),
+            });
+            internalUpdate = {
+              productsUpdated: applied.productsUpdated,
+              fieldsApplied: applied.fieldsApplied,
+            };
+          } else {
+            storage.clearProductCache(shopDomain);
+          }
+        } else {
+          storage.clearProductCache(shopDomain);
+        }
       } catch {
-        // non-fatal
+        // non-fatal — fall back to clearing so the next refresh re-derives.
+        try { storage.clearProductCache(shopDomain); } catch { /* ignore */ }
       }
     }
 
@@ -1950,6 +2096,8 @@ export function registerJomashopProductFieldExcelRoutes(app: Express): void {
         writeAttempted: attempted,
         writeSucceeded: succeeded,
         writeFailed: failed,
+        internalProductsUpdated: internalUpdate.productsUpdated,
+        internalFieldsApplied: internalUpdate.fieldsApplied,
       }),
       createdAt: Date.now(),
     });
@@ -1965,6 +2113,9 @@ export function registerJomashopProductFieldExcelRoutes(app: Express): void {
       forceWriteback,
       metafieldWriteSummary: { attempted, succeeded, failed },
       metafieldWrites: writes,
+      // Filled values spliced into the cached preview so they populate
+      // immediately, independent of any live Shopify metafield write.
+      internalUpdate,
       // Rows that successfully wrote at least one metafield are now
       // candidates for a Jomashop push. The UI / orchestrator decides
       // whether to actually push; we do NOT push from this route unless
@@ -1974,9 +2125,12 @@ export function registerJomashopProductFieldExcelRoutes(app: Express): void {
       warnings: !conn
         ? ["No connected Shopify store — metafield writes were skipped."]
         : [],
-      note: shopDomain
-        ? "Applied. Click Refresh from Shopify on the Products page to recompute readiness with the new metafields."
-        : "Applied.",
+      note:
+        internalUpdate.productsUpdated > 0
+          ? `Applied. ${internalUpdate.fieldsApplied} value(s) across ${internalUpdate.productsUpdated} product(s) saved to the preview — changes are visible now. ${conn ? "Metafields were also written back to Shopify." : "Connect Shopify and re-apply to write these back as metafields."}`
+          : shopDomain
+          ? "Applied. Click Refresh from Shopify on the Products page to recompute readiness with the new metafields."
+          : "Applied.",
     });
   });
 

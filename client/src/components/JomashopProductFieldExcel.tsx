@@ -26,7 +26,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { apiRequest } from "@/lib/queryClient";
+import { apiRequest, queryClient } from "@/lib/queryClient";
 import { authHeaders } from "@/lib/adminToken";
 
 type PreviewRow = {
@@ -84,6 +84,7 @@ type ApplyResponse = {
     error: string | null;
   }>;
   warnings: string[];
+  internalUpdate?: { productsUpdated: number; fieldsApplied: number };
   note: string;
 };
 
@@ -228,7 +229,14 @@ export function JomashopProductFieldExcelCard() {
       });
       return (await res.json()) as ApplyResponse;
     },
-    onSuccess: (r) => setApplyResult(r),
+    onSuccess: (r) => {
+      setApplyResult(r);
+      // Filled values are now spliced into the cached preview server-side, so
+      // refetch the product cache (and push statuses) to surface the changes
+      // on the Products / Review pages without a manual refresh.
+      queryClient.invalidateQueries({ queryKey: ["/api/products/cache"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/push-statuses"] });
+    },
   });
 
   function onFileChange(e: React.ChangeEvent<HTMLInputElement>) {

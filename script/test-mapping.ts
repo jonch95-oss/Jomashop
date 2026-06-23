@@ -76,6 +76,7 @@ import {
   fieldIsVariantTargeted,
   buildOptionsRangeName,
   resolveSheetCategory,
+  applyFieldValuesToCachedProducts,
   type ProductFieldExportResult,
 } from "../server/jomashop_product_field_excel";
 import {
@@ -7329,6 +7330,83 @@ function runPortalReconcileTests() {
 }
 
 runPortalReconcileTests();
+
+// --- applyFieldValuesToCachedProducts (Excel "missing info" splice) ---
+function runApplyFieldValuesTests() {
+  const baseProduct = () => ({
+    category: "Shoes",
+    is_sample: false,
+    vendor_sku: "SKU-1",
+    schema_source: "live-i1" as const,
+    properties: { Brand: "Nike" } as Record<string, string | number | boolean>,
+    msrp: null as number | null,
+    missing_required: ["Color", "Material"],
+    missing_top_level: ["msrp"],
+    invalid_enums: [{ field: "Color", value: "rainbow", options: ["Red", "Blue"] }],
+    readiness: "missing",
+    source: { shopify_product_id: "gid://shopify/Product/12345", shopify_variant_ids: ["v1"] },
+  });
+
+  // Fill one of two missing required fields + MSRP: that field leaves
+  // missing_required, its invalid_enum is dropped, msrp leaves missing_top_level.
+  {
+    const { mapped, productsUpdated, fieldsApplied } = applyFieldValuesToCachedProducts(
+      [baseProduct()],
+      [{ shopifyProductId: "12345", fieldValues: { Color: "Red" }, msrp: "$250" }],
+    );
+    const m = mapped[0];
+    assert(productsUpdated === 1, "applyFieldValues: 1 product updated");
+    assert(fieldsApplied === 2, "applyFieldValues: 2 fields applied (Color + MSRP)");
+    assert(m.properties.Color === "Red", "applyFieldValues: Color written to properties");
+    assert(m.msrp === 250, "applyFieldValues: MSRP parsed to number");
+    assert(!m.missing_required.includes("Color"), "applyFieldValues: Color cleared from missing_required");
+    assert(m.missing_required.includes("Material"), "applyFieldValues: Material still missing");
+    assert(m.invalid_enums.length === 0, "applyFieldValues: Color invalid_enum dropped");
+    assert(!m.missing_top_level.includes("msrp"), "applyFieldValues: msrp cleared from missing_top_level");
+    assert(m.readiness === "missing", "applyFieldValues: still missing (Material outstanding)");
+  }
+
+  // Fill ALL missing fields + MSRP: readiness flips to "ready".
+  {
+    const { mapped } = applyFieldValuesToCachedProducts(
+      [baseProduct()],
+      [{ shopifyProductId: "12345", fieldValues: { Color: "Red", Material: "Leather" }, msrp: "300" }],
+    );
+    const m = mapped[0];
+    assert(m.missing_required.length === 0, "applyFieldValues: all required cleared");
+    assert(m.readiness === "ready", "applyFieldValues: readiness flips to ready");
+  }
+
+  // gid-normalized matching: raw id on the row matches gid on the product.
+  {
+    const { productsUpdated } = applyFieldValuesToCachedProducts(
+      [baseProduct()],
+      [{ shopifyProductId: "gid://shopify/Product/12345", fieldValues: { Color: "Red" } }],
+    );
+    assert(productsUpdated === 1, "applyFieldValues: gid<->raw id match");
+  }
+
+  // No matching product id: nothing updated, original untouched.
+  {
+    const { mapped, productsUpdated } = applyFieldValuesToCachedProducts(
+      [baseProduct()],
+      [{ shopifyProductId: "99999", fieldValues: { Color: "Red" } }],
+    );
+    assert(productsUpdated === 0, "applyFieldValues: no match -> 0 updated");
+    assert(mapped[0].missing_required.includes("Color"), "applyFieldValues: untouched when no match");
+  }
+
+  // Blank cells are ignored (no spurious field application).
+  {
+    const { productsUpdated, fieldsApplied } = applyFieldValuesToCachedProducts(
+      [baseProduct()],
+      [{ shopifyProductId: "12345", fieldValues: { Color: "   " }, msrp: "" }],
+    );
+    assert(productsUpdated === 0 && fieldsApplied === 0, "applyFieldValues: blank cells ignored");
+  }
+}
+
+runApplyFieldValuesTests();
 
 if (failures > 0) {
   console.error(`\n${failures} assertion(s) failed.`);
