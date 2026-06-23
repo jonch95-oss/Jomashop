@@ -98,9 +98,13 @@ Scopes selected on the Shopify side must match `SHOPIFY_SCOPES` exactly.
 
 The Jomashop client (`server/jomashop.ts`) handles:
 
-- Login via `POST /v1/session` reading JWT from the **Authorization** response header
-- Refresh via `PUT /v1/session` before the 5-day TTL expires
-- Automatic re-login on **401** at any time
+- Login reading JWT from the **Authorization** response header. The vendor API
+  has shipped the session endpoint as both `/v1/sessions` (plural) and
+  `/v1/session` (singular); the client tries `/v1/sessions` first and falls back
+  to `/v1/session` on a **404**, then remembers whichever answered. Set
+  `JOMASHOP_SESSION_PATH` to pin one path and skip the probe.
+- Refresh via `PUT` on the resolved session path before the 5-day TTL expires
+- Automatic re-login on **401** (and re-probe on **404**) at any time
 - Single-flight refresh: concurrent requests share one in-flight refresh promise
 
 ---

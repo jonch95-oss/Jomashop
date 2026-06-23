@@ -86,6 +86,10 @@ import {
   compactifyMapped,
   deriveReadinessFromMapping,
 } from "../server/compact_mapped";
+import {
+  jomashopRequest,
+  __resetSessionPathForTest,
+} from "../server/jomashop";
 
 // Pure (storage-free) enum override resolver that mimics the production
 // lookupEnumOverride for tests. Mirrors the strict trust gate used in
@@ -7054,6 +7058,107 @@ runFootwearVariationColorYesNo();
 runFootwearGenderWomenToLadies();
 runFootwearShoeCategoryMuleSandal();
 runInlineRepairRecognizesPerVariantSize();
+
+// ---- Jomashop session endpoint 404 fallback ----
+// The vendor API has shipped the auth endpoint as both `/v1/sessions` (plural)
+// and `/v1/session` (singular). A 404 on the first must transparently fall back
+// to the second; a non-404 error (e.g. 401 bad creds) must surface immediately.
+async function runJomashopSessionEndpointFallback() {
+  console.log("\n[Jomashop session endpoint 404 fallback]");
+  const realFetch = globalThis.fetch;
+  const prevEmail = process.env.JOMASHOP_EMAIL;
+  const prevPassword = process.env.JOMASHOP_PASSWORD;
+  const prevBase = process.env.JOMASHOP_API_BASE_URL;
+  const prevSessionPath = process.env.JOMASHOP_SESSION_PATH;
+  process.env.JOMASHOP_EMAIL = "test@example.com";
+  process.env.JOMASHOP_PASSWORD = "secret";
+  process.env.JOMASHOP_API_BASE_URL = "https://api.vendor.jomashop.test";
+  delete process.env.JOMASHOP_SESSION_PATH;
+
+  function mockFetch(handler: (url: string, init?: RequestInit) => Response) {
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      return handler(url, init);
+    }) as typeof fetch;
+  }
+  const jwtHeader = () => new Headers({ authorization: "Bearer fake.jwt.token" });
+
+  try {
+    // Case 1: plural 404s, singular succeeds → login falls back and the
+    // subsequent request carries the bearer token.
+    __resetSessionPathForTest();
+    const hits: string[] = [];
+    mockFetch((url, init) => {
+      if (url.includes("/v1/sessions")) {
+        hits.push("POST /v1/sessions");
+        return new Response("Not Found", { status: 404 });
+      }
+      if (url.includes("/v1/session")) {
+        hits.push("POST /v1/session");
+        return new Response("", { status: 200, headers: jwtHeader() });
+      }
+      if (url.includes("/v1/categories")) {
+        hits.push("GET /v1/categories");
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      }
+      return new Response("unexpected", { status: 500 });
+    });
+    const r1 = await jomashopRequest({ path: "/v1/categories" });
+    assert(r1.ok, "404 on /v1/sessions falls back to /v1/session and request succeeds");
+    assert(
+      hits.includes("POST /v1/sessions") && hits.includes("POST /v1/session"),
+      "both session paths are probed when the first 404s",
+    );
+
+    // Case 2: a non-404 error (bad credentials) on the default path must NOT be
+    // masked by the fallback — it surfaces immediately.
+    __resetSessionPathForTest();
+    let singularTried = false;
+    mockFetch((url) => {
+      if (url.includes("/v1/sessions")) return new Response("Unauthorized", { status: 401 });
+      if (url.includes("/v1/session")) {
+        singularTried = true;
+        return new Response("", { status: 200, headers: jwtHeader() });
+      }
+      return new Response("unexpected", { status: 500 });
+    });
+    const r2 = await jomashopRequest({ path: "/v1/categories" });
+    assert(!r2.ok && /401/.test(r2.error || ""), "401 on session login surfaces immediately (not masked by fallback)");
+    assert(!singularTried, "fallback path is NOT tried after a non-404 login error");
+
+    // Case 3: JOMASHOP_SESSION_PATH override pins the path (no probing).
+    __resetSessionPathForTest();
+    process.env.JOMASHOP_SESSION_PATH = "/v1/session";
+    const overrideHits: string[] = [];
+    mockFetch((url) => {
+      if (url.endsWith("/v1/sessions")) {
+        overrideHits.push("POST /v1/sessions");
+        return new Response("Not Found", { status: 404 });
+      }
+      if (url.endsWith("/v1/session")) {
+        overrideHits.push("POST /v1/session");
+        return new Response("", { status: 200, headers: jwtHeader() });
+      }
+      if (url.includes("/v1/categories")) return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      return new Response("unexpected", { status: 500 });
+    });
+    const r3 = await jomashopRequest({ path: "/v1/categories" });
+    assert(r3.ok, "JOMASHOP_SESSION_PATH override logs in successfully");
+    assert(
+      !overrideHits.includes("POST /v1/sessions") && overrideHits.includes("POST /v1/session"),
+      "override skips probing the non-configured session path",
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+    __resetSessionPathForTest();
+    if (prevEmail === undefined) delete process.env.JOMASHOP_EMAIL; else process.env.JOMASHOP_EMAIL = prevEmail;
+    if (prevPassword === undefined) delete process.env.JOMASHOP_PASSWORD; else process.env.JOMASHOP_PASSWORD = prevPassword;
+    if (prevBase === undefined) delete process.env.JOMASHOP_API_BASE_URL; else process.env.JOMASHOP_API_BASE_URL = prevBase;
+    if (prevSessionPath === undefined) delete process.env.JOMASHOP_SESSION_PATH; else process.env.JOMASHOP_SESSION_PATH = prevSessionPath;
+  }
+}
+
+await runJomashopSessionEndpointFallback();
 
 if (failures > 0) {
   console.error(`\n${failures} assertion(s) failed.`);

@@ -26,6 +26,31 @@ let refreshInFlight: Promise<void> | null = null;
 const FIVE_DAYS_MS = 5 * 24 * 60 * 60 * 1000;
 const REFRESH_LEEWAY_MS = 6 * 60 * 60 * 1000; // refresh 6h early
 
+// The vendor API has shipped the session endpoint as both `/v1/sessions`
+// (plural, what the client historically called) and `/v1/session` (singular,
+// what the README/vendor prose documents). A 404 on one must not block login
+// when the other is correct, so we try them in order and remember whichever
+// answers. An operator can pin the path with JOMASHOP_SESSION_PATH to skip the
+// probe entirely.
+const DEFAULT_SESSION_PATHS = ["/v1/sessions", "/v1/session"] as const;
+let resolvedSessionPath: string | null = null;
+
+function sessionPathCandidates(): string[] {
+  const override = process.env.JOMASHOP_SESSION_PATH?.trim();
+  if (override) return [override];
+  if (resolvedSessionPath) {
+    // Try the known-good path first, then the rest as a safety net.
+    return [resolvedSessionPath, ...DEFAULT_SESSION_PATHS.filter((p) => p !== resolvedSessionPath)];
+  }
+  return [...DEFAULT_SESSION_PATHS];
+}
+
+// Test-only: reset the cached session path so a fetch-mocked test starts clean.
+export function __resetSessionPathForTest(): void {
+  resolvedSessionPath = null;
+  token = null;
+}
+
 export function getJomashopConfig(): JomashopConfig | null {
   const baseUrl = process.env.JOMASHOP_API_BASE_URL || "https://api.vendor.jomashop.com";
   const email = process.env.JOMASHOP_EMAIL;
@@ -47,35 +72,58 @@ export function clearToken(): void {
 }
 
 async function loginInternal(cfg: JomashopConfig): Promise<void> {
-  const res = await fetch(`${cfg.baseUrl}/v1/sessions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ user: { email: cfg.email, password: cfg.password } }),
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`Jomashop login failed (${res.status}): ${text || res.statusText}`);
+  const candidates = sessionPathCandidates();
+  const attempts: string[] = [];
+  for (const path of candidates) {
+    const res = await fetch(`${cfg.baseUrl}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user: { email: cfg.email, password: cfg.password } }),
+    });
+    // A 404 means this path doesn't exist on the live API — try the alternate.
+    // Any other non-OK status (401 bad creds, 5xx, etc.) is a real failure and
+    // must surface immediately rather than being masked by the fallback.
+    if (res.status === 404) {
+      attempts.push(`${path} -> 404`);
+      continue;
+    }
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`Jomashop login failed (${res.status}) at ${path}: ${text || res.statusText}`);
+    }
+    // JWT is returned in the Authorization response header.
+    const auth = res.headers.get("authorization") || res.headers.get("Authorization");
+    if (!auth) {
+      throw new Error(`Jomashop login at ${path}: missing Authorization response header`);
+    }
+    const jwt = auth.replace(/^Bearer\s+/i, "").trim();
+    token = { jwt, expiresAt: Date.now() + FIVE_DAYS_MS };
+    if (resolvedSessionPath !== path) {
+      resolvedSessionPath = path;
+      console.log(`[jomashop] session endpoint resolved to ${path}`);
+    }
+    return;
   }
-  // JWT is returned in the Authorization response header.
-  const auth = res.headers.get("authorization") || res.headers.get("Authorization");
-  if (!auth) {
-    throw new Error("Jomashop login: missing Authorization response header");
-  }
-  const jwt = auth.replace(/^Bearer\s+/i, "").trim();
-  token = { jwt, expiresAt: Date.now() + FIVE_DAYS_MS };
+  throw new Error(
+    `Jomashop login failed: no session endpoint responded (tried ${attempts.join(", ") || candidates.join(", ")})`,
+  );
 }
 
 async function refreshInternal(cfg: JomashopConfig): Promise<void> {
   if (!token) return loginInternal(cfg);
-  const res = await fetch(`${cfg.baseUrl}/v1/sessions`, {
+  // Refresh against the resolved (or first-candidate) session path. If we never
+  // resolved one, fall straight back to a full login which runs the full probe.
+  const path = resolvedSessionPath || sessionPathCandidates()[0];
+  const res = await fetch(`${cfg.baseUrl}${path}`, {
     method: "PUT",
     headers: {
       Authorization: `Bearer ${token.jwt}`,
       "Content-Type": "application/json",
     },
   });
-  if (res.status === 401) {
-    // Refresh failed, do a full login.
+  if (res.status === 401 || res.status === 404) {
+    // Refresh failed (expired token, or this path no longer answers) — do a
+    // full login, which re-probes the session endpoints.
     token = null;
     return loginInternal(cfg);
   }
