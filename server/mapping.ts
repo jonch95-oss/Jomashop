@@ -2484,6 +2484,31 @@ export function buildJomashopProductPayload(
       }
     }
   }
+  // Measurement sanitation. Jomashop validates dimension/weight fields
+  // numerically ("Size length is not a number" → INVALID_PARAMS). Shopify
+  // metafields often carry unit-suffixed strings ('4.25"') or size tokens
+  // ("OS" for one-size) in these fields. Coerce parseable values to plain
+  // numbers and OMIT unparseable ones — these fields are optional, and
+  // omitting beats a guaranteed Invalid Record rejection.
+  const MEASUREMENT_UNIT_KEY_RE = /\((inches|inch|in|cm|mm|lbs?|oz|grams?|kg)\.?\)\s*$/i;
+  const MEASUREMENT_NAME_RE = /^(size\s*(length|width|height)|product\s*net\s*weight|case\s*(diameter|thickness)|band\s*width|strap\s*drop|handle\s*drop|heel\s*height|platform\s*height|drop\s*length)\b/i;
+  const omittedNonNumeric: string[] = [];
+  for (const [k, v] of Object.entries(properties)) {
+    if (typeof v === "number") continue;
+    if (!MEASUREMENT_UNIT_KEY_RE.test(k) && !MEASUREMENT_NAME_RE.test(k)) continue;
+    const firstToken = String(v)
+      .replace(/[^\d.\-]+/g, " ")
+      .trim()
+      .split(/\s+/)[0];
+    const num = firstToken ? Number.parseFloat(firstToken) : Number.NaN;
+    if (Number.isFinite(num)) {
+      properties[k] = num;
+    } else {
+      delete properties[k];
+      omittedNonNumeric.push(`${k} (source value "${String(v)}" is not numeric)`);
+    }
+  }
+
   const propertiesUseLiveLabels = schemaUsesExactLabels(
     Object.keys(properties).map((field) => ({ field })),
   );
@@ -2559,7 +2584,7 @@ export function buildJomashopProductPayload(
   }
 
   const invalidEnums = mapped.invalid_enums || [];
-  const omittedOptionalFields = mapped.omitted_optional_fields || [];
+  const omittedOptionalFields = [...(mapped.omitted_optional_fields || []), ...omittedNonNumeric];
   const unverifiedRequiredOptions = mapped.unverified_required_options || [];
   const autoResolvedEnums = mapped.auto_resolved_enums || [];
 

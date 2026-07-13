@@ -7408,6 +7408,58 @@ function runApplyFieldValuesTests() {
 
 runApplyFieldValuesTests();
 
+// ---------------------------------------------------------------------------
+// Measurement sanitation: numeric-unit fields are coerced to numbers when
+// parseable and OMITTED when not (e.g. "OS" one-size tokens), preventing
+// Jomashop "Size length is not a number" Invalid Record rejections.
+// ---------------------------------------------------------------------------
+function runMeasurementSanitationTests() {
+  console.log("\n--- measurement sanitation (numeric dimension fields) ---");
+  const mapped = {
+    category: "Accessories",
+    is_sample: false,
+    vendor_sku: "TEST-1",
+    sku: "TEST-1",
+    manufacturer_number: "TEST1",
+    name: "Test Wallet",
+    brand: "Gucci",
+    price: 100,
+    msrp: 120,
+    jomashop_price: 80,
+    images: [],
+    description: "test",
+    properties: {
+      "Size Length (Inches)": "OS",
+      "Size Width (Inches)": '4.25"',
+      "Size Height (Inches)": 3,
+      "Color": "Black",
+    },
+    variants: [],
+    warnings: [],
+    missing_required: [],
+    missing_top_level: [],
+    invalid_enums: [],
+    omitted_optional_fields: [],
+    unverified_required_options: [],
+    auto_resolved_enums: [],
+  } as any;
+  const { payload, omittedOptionalFields } = buildJomashopProductPayload(mapped, undefined, {
+    manufacturer_id: 42,
+    category_id: 43,
+  });
+  const props = payload.properties as Record<string, unknown>;
+  assert(!("Size Length (Inches)" in props), 'non-numeric "OS" size length omitted');
+  assert(props["Size Width (Inches)"] === 4.25, 'unit-suffixed size width coerced to 4.25');
+  assert(props["Size Height (Inches)"] === 3, "already-numeric size height untouched");
+  assert(props["Color"] === "Black", "non-measurement fields untouched");
+  assert(
+    omittedOptionalFields.some((s: string) => s.includes("Size Length (Inches)")),
+    "omission surfaced in omittedOptionalFields",
+  );
+}
+
+runMeasurementSanitationTests();
+
 if (failures > 0) {
   console.error(`\n${failures} assertion(s) failed.`);
   process.exit(1);
