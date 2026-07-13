@@ -1,15 +1,17 @@
 // Embedded Shopify admin (App Bridge) bootstrap.
 //
 // When the dashboard is loaded inside the Shopify admin iframe, Shopify
-// appends ?host=...&shop=...&embedded=1 to the App URL. We detect that,
-// lazily load App Bridge from the Shopify CDN (keyed by the app's public
-// client id, fetched from /api/public/embedded-config), and then attach a
-// fresh session token (window.shopify.idToken()) to every API request in
-// place of the manual ADMIN_TOKEN.
+// appends ?host=...&shop=...&embedded=1 to the App URL. The SERVER detects
+// those params and splices the App Bridge script tag into index.html as the
+// first <script> in <head> (App Bridge v4 hard-requires being a static,
+// non-async, first script tag — dynamic injection aborts). By the time this
+// module runs, window.shopify is already available in embedded mode, and we
+// attach a fresh session token (window.shopify.idToken()) to every API
+// request in place of the manual ADMIN_TOKEN.
 //
-// Standalone (Render) mode is untouched: none of this activates without the
-// Shopify iframe query params, and the ADMIN_TOKEN header remains the
-// fallback everywhere.
+// Standalone (Render) mode is untouched: the server never injects App Bridge
+// without the Shopify iframe query params, and the ADMIN_TOKEN header
+// remains the fallback everywhere.
 
 declare global {
   interface Window {
@@ -72,31 +74,26 @@ export function isEmbeddedCandidate(): boolean {
   return false;
 }
 
-/** True once App Bridge has loaded and can mint session tokens. */
+/** True once App Bridge is available and can mint session tokens. */
 export function isEmbeddedActive(): boolean {
   return embeddedActive;
 }
 
-function loadAppBridgeScript(apiKey: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (window.shopify && typeof window.shopify.idToken === "function") {
-      resolve();
-      return;
-    }
-    const existing = document.querySelector<HTMLScriptElement>(
-      'script[src^="https://cdn.shopify.com/shopifycloud/app-bridge.js"]',
-    );
-    if (existing) {
-      existing.addEventListener("load", () => resolve());
-      existing.addEventListener("error", () => reject(new Error("App Bridge failed to load")));
-      return;
-    }
-    const s = document.createElement("script");
-    s.src = "https://cdn.shopify.com/shopifycloud/app-bridge.js";
-    s.setAttribute("data-api-key", apiKey);
-    s.onload = () => resolve();
-    s.onerror = () => reject(new Error("App Bridge failed to load"));
-    document.head.appendChild(s);
+/**
+ * Wait for window.shopify.idToken to appear. The App Bridge script tag is a
+ * classic (non-module) script injected server-side before the app bundle, so
+ * it normally executes first and this resolves immediately — the polling is
+ * only a safety net for slow CDN responses.
+ */
+function waitForAppBridge(timeoutMs = 5000): Promise<boolean> {
+  return new Promise((resolve) => {
+    const started = Date.now();
+    const tick = () => {
+      if (typeof window.shopify?.idToken === "function") return resolve(true);
+      if (Date.now() - started >= timeoutMs) return resolve(false);
+      setTimeout(tick, 100);
+    };
+    tick();
   });
 }
 
@@ -110,23 +107,14 @@ export function initEmbedded(): Promise<boolean> {
   if (initPromise) return initPromise;
   initPromise = (async () => {
     if (!isEmbeddedCandidate()) return false;
-    try {
-      const res = await fetch("/api/public/embedded-config");
-      if (!res.ok) return false;
-      const cfg = (await res.json()) as { embeddedEnabled?: boolean; apiKey?: string };
-      if (!cfg?.embeddedEnabled || !cfg?.apiKey) return false;
-      await loadAppBridgeScript(cfg.apiKey);
-      embeddedActive = typeof window.shopify?.idToken === "function";
-      if (embeddedActive) {
-        await refreshCachedToken();
-        if (refreshTimer === null) {
-          refreshTimer = window.setInterval(refreshCachedToken, 30_000);
-        }
+    embeddedActive = await waitForAppBridge();
+    if (embeddedActive) {
+      await refreshCachedToken();
+      if (refreshTimer === null) {
+        refreshTimer = window.setInterval(refreshCachedToken, 30_000);
       }
-      return embeddedActive;
-    } catch {
-      return false;
     }
+    return embeddedActive;
   })();
   return initPromise;
 }
@@ -134,7 +122,7 @@ export function initEmbedded(): Promise<boolean> {
 /**
  * Return an Authorization header carrying a fresh Shopify session token, or
  * null when not embedded / App Bridge unavailable. Session tokens expire
- * after ~60s, so we fetch one per request rather than caching.
+ * after ~60s, so we mint one per request rather than reusing the cache.
  */
 export async function getEmbeddedAuthHeader(): Promise<Record<string, string> | null> {
   if (!isEmbeddedCandidate()) return null;

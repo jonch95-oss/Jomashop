@@ -125,3 +125,31 @@ export function bearerFromAuthorization(header: string | undefined): string | nu
 export function looksLikeJwt(bearer: string | null): boolean {
   return Boolean(bearer && bearer.split(".").length === 3);
 }
+
+/**
+ * Inject the Shopify App Bridge script into an index.html payload for
+ * embedded requests.
+ *
+ * App Bridge v4 HARD-REQUIRES being a static, non-async, non-module script
+ * loaded from Shopify's CDN as the FIRST <script> tag — dynamically injected
+ * script tags abort with "must be included as the first <script> tag".
+ * So the server splices the tag into the HTML right after <head> (before the
+ * app bundle) — but ONLY when the request carries Shopify's embedded params
+ * (host/embedded/shop). Standalone (Render) page loads get untouched HTML
+ * and never load App Bridge.
+ */
+export function injectAppBridgeScript(html: string, query: Record<string, unknown>): string {
+  const apiKey = process.env.SHOPIFY_CLIENT_ID?.trim();
+  if (!apiKey) return html;
+  const hasEmbedHint =
+    typeof query.host === "string" ||
+    typeof query.embedded === "string" ||
+    typeof query.shop === "string";
+  if (!hasEmbedHint) return html;
+  if (html.includes("shopifycloud/app-bridge.js")) return html;
+  const tag = `<script src="https://cdn.shopify.com/shopifycloud/app-bridge.js" data-api-key="${apiKey}"></script>`;
+  const headIdx = html.search(/<head[^>]*>/i);
+  if (headIdx === -1) return html;
+  const headEnd = html.indexOf(">", headIdx) + 1;
+  return html.slice(0, headEnd) + "\n    " + tag + html.slice(headEnd);
+}

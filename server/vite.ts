@@ -5,6 +5,7 @@ import viteConfig from "../vite.config";
 import fs from "node:fs";
 import path from "node:path";
 import { nanoid } from "nanoid";
+import { injectAppBridgeScript } from "./embedded_auth";
 
 const viteLogger = createLogger();
 
@@ -49,7 +50,10 @@ export async function setupVite(server: Server, app: Express) {
         `src="/src/main.tsx?v=${nanoid()}"`,
       );
       const page = await vite.transformIndexHtml(url, template);
-      res.status(200).set({ "Content-Type": "text/html" }).end(page);
+      res
+        .status(200)
+        .set({ "Content-Type": "text/html" })
+        .end(injectAppBridgeScript(page, req.query as Record<string, unknown>));
     } catch (e) {
       vite.ssrFixStacktrace(e as Error);
       next(e);

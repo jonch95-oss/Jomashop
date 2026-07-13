@@ -2,6 +2,7 @@ import express from 'express';
 import type { Express } from 'express';
 import fs from "node:fs";
 import path from "node:path";
+import { injectAppBridgeScript } from "./embedded_auth";
 
 export function serveStatic(app: Express) {
   // Try a couple of likely locations so the bundled cjs and a tsx run from
@@ -34,10 +35,21 @@ export function serveStatic(app: Express) {
     return;
   }
 
-  app.use(express.static(distPath));
+  // index:false so "/" falls through to the handler below — the embedded
+  // Shopify admin needs App Bridge spliced into index.html per-request.
+  app.use(express.static(distPath, { index: false }));
 
   // fall through to index.html if the file doesn't exist
-  app.use("/{*path}", (_req, res) => {
-    res.sendFile(path.resolve(distPath, "index.html"));
+  app.use("/{*path}", (req, res) => {
+    const indexPath = path.resolve(distPath, "index.html");
+    fs.readFile(indexPath, "utf-8", (err, html) => {
+      if (err) {
+        return res.status(500).json({ ok: false, error: "index.html missing from build." });
+      }
+      res
+        .status(200)
+        .set({ "Content-Type": "text/html" })
+        .end(injectAppBridgeScript(html, req.query as Record<string, unknown>));
+    });
   });
 }
