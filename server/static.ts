@@ -45,10 +45,13 @@ export function serveStatic(app: Express) {
     // addresses sub-pages by PATH (App URL + /setup, /products, ...). Bounce
     // any non-asset path to the hash route, preserving the query string so
     // App Bridge params survive.
-    if (req.path !== "/" && !req.path.includes(".")) {
-      const qIdx = req.originalUrl.indexOf("?");
+    // NOTE: app.use("/{*path}") strips the matched mount path, so req.path is
+    // "/" here — derive the real path from originalUrl instead.
+    const qIdx = req.originalUrl.indexOf("?");
+    const rawPath = qIdx >= 0 ? req.originalUrl.slice(0, qIdx) : req.originalUrl;
+    if (rawPath !== "/" && rawPath !== "" && !rawPath.includes(".")) {
       const qs = qIdx >= 0 ? req.originalUrl.slice(qIdx).split("#")[0] : "";
-      return res.redirect(302, `/${qs}#${req.path}`);
+      return res.redirect(302, `/${qs}#${rawPath}`);
     }
     const indexPath = path.resolve(distPath, "index.html");
     fs.readFile(indexPath, "utf-8", (err, html) => {
