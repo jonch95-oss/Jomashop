@@ -41,6 +41,15 @@ export function serveStatic(app: Express) {
 
   // fall through to index.html if the file doesn't exist
   app.use("/{*path}", (req, res) => {
+    // Deep links: the SPA is hash-routed, but the embedded Shopify admin
+    // addresses sub-pages by PATH (App URL + /setup, /products, ...). Bounce
+    // any non-asset path to the hash route, preserving the query string so
+    // App Bridge params survive.
+    if (req.path !== "/" && !req.path.includes(".")) {
+      const qIdx = req.originalUrl.indexOf("?");
+      const qs = qIdx >= 0 ? req.originalUrl.slice(qIdx).split("#")[0] : "";
+      return res.redirect(302, `/${qs}#${req.path}`);
+    }
     const indexPath = path.resolve(distPath, "index.html");
     fs.readFile(indexPath, "utf-8", (err, html) => {
       if (err) {
