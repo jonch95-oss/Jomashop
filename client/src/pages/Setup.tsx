@@ -215,6 +215,35 @@ export default function Setup() {
                 {!cfg.data.shopify.clientIdConfigured && (
                   <p className="text-xs text-muted-foreground">Set <code className="font-mono">SHOPIFY_CLIENT_ID</code> and restart to enable.</p>
                 )}
+                <Button
+                  variant="outline"
+                  data-testid="button-copy-offline-token"
+                  onClick={async () => {
+                    try {
+                      const res = await apiRequest("POST", "/api/shopify/reveal-offline-token", { confirm: true });
+                      const body = (await res.json()) as { ok: boolean; accessToken?: string; shopDomain?: string; error?: string };
+                      if (!body.ok || !body.accessToken) {
+                        toast({ title: "No token available", description: body.error ?? "Run Begin install first." });
+                        return;
+                      }
+                      await navigator.clipboard.writeText(body.accessToken);
+                      toast({
+                        title: "Access token copied",
+                        description: `Paste it into your host's env as SHOPIFY_ADMIN_ACCESS_TOKEN (with SHOPIFY_SHOP_DOMAIN=${body.shopDomain}). It is never displayed on screen.`,
+                      });
+                    } catch (err) {
+                      toast({ title: "Copy failed", description: (err as Error).message });
+                    }
+                  }}
+                >
+                  <Copy className="mr-2 h-3.5 w-3.5" /> Copy access token for env persistence
+                </Button>
+                <p className="text-xs text-muted-foreground">
+                  Copies the offline Admin API token to your clipboard (never shown on screen). Save it as{" "}
+                  <code className="font-mono">SHOPIFY_ADMIN_ACCESS_TOKEN</code> +{" "}
+                  <code className="font-mono">SHOPIFY_SHOP_DOMAIN</code> in your host's environment so the
+                  connection survives restarts/redeploys — same idea as a legacy custom app's revealed token.
+                </p>
               </div>
             </div>
 

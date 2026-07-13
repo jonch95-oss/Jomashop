@@ -718,6 +718,38 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  // ---------- Offline-token persistence helper ----------
+  // POST /api/shopify/reveal-offline-token { confirm: true }
+  //
+  // Returns the decrypted offline Admin API access token for the connected
+  // store so the operator can persist it as SHOPIFY_ADMIN_ACCESS_TOKEN in
+  // the hosting platform's env (the SQLite row is wiped on ephemeral-disk
+  // redeploys; env vars survive). Equivalent to "reveal token" on a legacy
+  // Shopify custom app. Admin/session gated like every /api route, requires
+  // an explicit confirm flag, and the reveal is audit-logged.
+  app.post("/api/shopify/reveal-offline-token", (req, res) => {
+    if (req.body?.confirm !== true) {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing confirmation. Set confirm: true to reveal the access token.",
+      });
+    }
+    const conn = getActiveShopifyConnection();
+    if (!conn) {
+      return res.status(404).json({
+        ok: false,
+        error: "No connected Shopify store. Run Begin install first.",
+      });
+    }
+    storage.appendLog({
+      level: "warn",
+      message: `Offline Shopify access token revealed for ${conn.shopDomain} (for env persistence)`,
+      detailsJson: null,
+      createdAt: Date.now(),
+    });
+    res.json({ ok: true, shopDomain: conn.shopDomain, accessToken: conn.accessToken });
+  });
+
   // ---------- Jomashop ----------
   app.get("/api/jomashop/session/test", async (_req, res) => {
     if (!jomashopConfigured()) {
