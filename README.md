@@ -244,3 +244,41 @@ npm start        # production server
 - **Field mapping editor.** The UI currently shows the live (or fallback)
   schema in read-only form. Backend already has an `upsertCategoryMapping`
   storage method — wire a form when needed.
+
+---
+
+## Embedded Shopify admin app
+
+The dashboard can now run **inside the Shopify admin** (App Bridge session-token
+auth, no manual token) while the standalone Render dashboard keeps working with
+`ADMIN_TOKEN`. Setup steps (App URL, callback URL, scopes, embedded=true) are in
+[docs/SHOPIFY_EMBEDDED_SETUP.md](docs/SHOPIFY_EMBEDDED_SETUP.md); `shopify.app.toml`
+mirrors the Dev Dashboard configuration.
+
+## Automation (auto-sync foundation)
+
+A Farfetch-style scheduler (see the **Automation** page in the UI) adds:
+
+- **Inventory sync (Shopify → Jomashop)** for styles confirmed live/active by
+  the Portal Styles reconciliation only, with a per-SKU `MAX_INVENTORY_DELTA`
+  guard.
+- **Order pull (Jomashop → preview)** that matches order lines to Shopify
+  variants via SKU / Jomashop SKU / portal reconciliation and flags unmatched
+  lines. The scheduler **never creates Shopify orders** — live import stays
+  behind `POST /api/jomashop/orders/import-to-shopify { confirm: true }`.
+
+Everything defaults to **disabled + dry-run**:
+
+```
+AUTO_SYNC_ENABLED=false
+AUTO_SYNC_DRY_RUN=true
+INVENTORY_SYNC_INTERVAL_MINUTES=30
+ORDER_PULL_INTERVAL_MINUTES=15
+MAX_INVENTORY_DELTA=25
+ORDER_IMPORT_ENABLED=false
+```
+
+Manual dry-runs: `POST /api/automation/inventory-sync-now`,
+`POST /api/automation/pull-orders-now`; status + audit:
+`GET /api/automation/status`, `GET /api/automation/audit`. Every run is
+recorded in `sync_jobs` / `sync_logs`.

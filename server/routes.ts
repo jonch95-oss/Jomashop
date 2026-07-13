@@ -42,6 +42,7 @@ import {
   encryptToken,
   fetchShopifyProductImages,
   fetchShopifyProducts,
+  streamShopifyProducts,
   getActiveShopifyConnection,
   MAPPER_VERSION,
 } from "./shopify";
@@ -66,6 +67,7 @@ import {
 import { registerInlineFieldRepairRoutes } from "./inline_field_repair";
 import { registerMappingMemoryRoutes } from "./mapping_memory";
 import { registerPortalRoutes } from "./portal_reconcile";
+import { registerAutoSyncRoutes, startAutoSyncScheduler } from "./auto_sync";
 import { pushInventoryUpdate, registerWebhookRoutes, registerShopifyWebhooks } from "./webhooks";
 import { heapMb, logMemory, rssMb } from "./memlog";
 import { lockStatus, releaseLock, withLockOr409 } from "./stability";
@@ -102,6 +104,34 @@ function clampOffset(raw: unknown): number {
   if (!Number.isFinite(n) || n < 0) return 0;
   return n;
 }
+
+/**
+ * Live progress of the most recent "Refresh from Shopify" build. Exposed via
+ * GET /api/products/refresh-progress so the UI can show real feedback while
+ * a multi-thousand-product catalog is fetched + mapped (previously the only
+ * signal was a spinner and server logs).
+ */
+const refreshProgress: {
+  active: boolean;
+  phase: "idle" | "starting" | "fetching" | "resolving-schemas" | "mapping" | "done" | "failed";
+  startedAt: number | null;
+  finishedAt: number | null;
+  fetchedProducts: number;
+  pages: number;
+  mappedProducts: number;
+  totalProducts: number | null;
+  lastError: string | null;
+} = {
+  active: false,
+  phase: "idle",
+  startedAt: null,
+  finishedAt: null,
+  fetchedProducts: 0,
+  pages: 0,
+  mappedProducts: 0,
+  totalProducts: null,
+  lastError: null,
+};
 
 /**
  * Build a vendor-sku → live push-status overlay so cached rows reflect the
@@ -463,6 +493,19 @@ async function createShopifyOrderFromJomashop(
 
 export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
   refreshCredentialStatus();
+
+  // ---------- Public embedded-app config ----------
+  // Unauthenticated ON PURPOSE (exempted in requireAdminToken): the client
+  // needs the App Bridge api key BEFORE it can mint a session token. Only
+  // the public client id is exposed - never the secret.
+  app.get("/api/public/embedded-config", (_req, res) => {
+    const apiKey = process.env.SHOPIFY_CLIENT_ID?.trim() || "";
+    const secretSet = Boolean(process.env.SHOPIFY_CLIENT_SECRET?.trim());
+    res.json({
+      embeddedEnabled: Boolean(apiKey && secretSet),
+      apiKey,
+    });
+  });
 
   // ---------- Config status (never exposes raw secrets) ----------
   app.get("/api/config/status", (req, res) => {
@@ -1247,6 +1290,15 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     maxProducts: number | undefined;
   }) {
     const { suppliedProducts, forceRefresh, pageSize, maxProducts } = opts;
+    refreshProgress.active = true;
+    refreshProgress.phase = "starting";
+    refreshProgress.startedAt = Date.now();
+    refreshProgress.finishedAt = null;
+    refreshProgress.fetchedProducts = 0;
+    refreshProgress.pages = 0;
+    refreshProgress.mappedProducts = 0;
+    refreshProgress.totalProducts = null;
+    refreshProgress.lastError = null;
     const conn = getActiveShopifyConnection();
     const storesList = storage.listStores();
     const connectedStore = storesList.find(
@@ -1268,7 +1320,31 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       dataSource = "live";
       fetchedCount = suppliedProducts.length;
     } else if (conn) {
-      const result = await fetchShopifyProducts({ pageSize, maxProducts });
+      // Stream page-by-page (rather than the buffered fetchShopifyProducts)
+      // so the refresh-progress endpoint can report live page/product counts
+      // while a multi-thousand-product catalog is being pulled.
+      refreshProgress.phase = "fetching";
+      const collected: ShopifyProduct[] = [];
+      const stream = await streamShopifyProducts(
+        (pageProducts, pageIndex) => {
+          for (const p of pageProducts) collected.push(p);
+          refreshProgress.fetchedProducts = collected.length;
+          refreshProgress.pages = pageIndex + 1;
+        },
+        { pageSize, maxProducts },
+      );
+      const result = stream.ok
+        ? {
+            ok: true as const,
+            products: collected,
+            shopDomain: stream.shopDomain,
+            count: collected.length,
+            pageCount: stream.pageCount,
+            hasMore: stream.hasMore,
+            partialError: stream.partialError,
+            partialStatus: stream.partialStatus,
+          }
+        : stream;
       if (result.ok && result.products.length > 0) {
         products = result.products;
         dataSource = "live";
@@ -1322,10 +1398,21 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     // Resolve live category schemas + the canonical category-name list so we
     // can label readiness ("Needs category verification" when the live list
     // isn't available, "Rejected" when previously failed).
+    //
+    // Perf: schema lookups are independent network calls - resolve them in
+    // parallel instead of serially awaiting each supported category. On a
+    // cold schema cache this cuts several sequential round-trips out of
+    // every refresh.
+    refreshProgress.phase = "resolving-schemas";
     const schemas: Partial<Record<SupportedCategory, any>> = {};
-    for (const cat of SUPPORTED_CATEGORIES) {
-      const { source, schema } = await resolveCategorySchema(cat);
-      schemas[cat] = { source, schema };
+    const schemaResults = await Promise.all(
+      SUPPORTED_CATEGORIES.map(async (cat) => {
+        const { source, schema } = await resolveCategorySchema(cat);
+        return { cat, source, schema };
+      }),
+    );
+    for (const r of schemaResults) {
+      schemas[r.cat] = { source: r.source, schema: r.schema };
     }
     const liveCategoriesResult = await getCategories();
     const liveCategoryNames: string[] | null = (() => {
@@ -1432,8 +1519,11 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     // set bounded — each iteration releases its temporaries before the next.
     const mapped: any[] = [];
     let mappedIndex = 0;
+    refreshProgress.phase = "mapping";
+    refreshProgress.totalProducts = products.length;
     for (const p of products) {
       mappedIndex += 1;
+      refreshProgress.mappedProducts = mappedIndex;
       if (mappedIndex % 500 === 0) {
         logMemory("buildPreview.mapped", { done: mappedIndex, total: products.length });
       }
@@ -1709,6 +1799,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       })(p);
       mapped.push(mappedRow);
     }
+
+    refreshProgress.phase = "done";
+    refreshProgress.finishedAt = Date.now();
+    refreshProgress.active = false;
 
     const usingSamples = dataSource === "sample";
     return {
@@ -2009,6 +2103,13 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   // Force a full Shopify pagination + cache overwrite. The Products page
   // wires this to the "Refresh from Shopify" button.
+  // Live progress for the Products page: poll while a refresh is running to
+  // render "fetched X products across Y pages / mapped Z of N" instead of a
+  // bare spinner.
+  app.get("/api/products/refresh-progress", (_req, res) => {
+    res.json({ ok: true, ...refreshProgress });
+  });
+
   app.post("/api/products/refresh", async (req, res) => {
     const rawLimit = req.body?.limit;
     const maxProducts =
@@ -2043,6 +2144,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         });
       } catch (err) {
         logMemory("products-refresh.failed", { message: (err as Error)?.message });
+        refreshProgress.phase = "failed";
+        refreshProgress.active = false;
+        refreshProgress.finishedAt = Date.now();
+        refreshProgress.lastError = (err as Error)?.message ?? "Refresh failed";
         return res
           .status(500)
           .json({ ok: false, error: (err as Error).message || "Refresh failed" });
@@ -3505,6 +3610,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.get("/api/stores", (_req, res) => res.json(storage.listStores()));
   app.get("/api/push-statuses", (_req, res) => res.json(storage.listPushStatuses()));
   app.get("/api/webhook-events", (_req, res) => res.json(storage.listWebhookEvents()));
+
+  // ---------- Automation / auto-sync (default disabled + dry-run) ----------
+  registerAutoSyncRoutes(app);
+  startAutoSyncScheduler();
 
   return httpServer;
 }

@@ -16,6 +16,7 @@ import MappingMemory from "@/pages/MappingMemory";
 import PortalStyles from "@/pages/PortalStyles";
 import Inventory from "@/pages/Inventory";
 import Orders from "@/pages/Orders";
+import Automation from "@/pages/Automation";
 import Fulfillment from "@/pages/Fulfillment";
 import Logs from "@/pages/Logs";
 
@@ -33,6 +34,7 @@ function AppRouter() {
           <Route path="/portal-styles" component={PortalStyles} />
           <Route path="/inventory" component={Inventory} />
           <Route path="/orders" component={Orders} />
+          <Route path="/automation" component={Automation} />
           <Route path="/fulfillment" component={Fulfillment} />
           <Route path="/logs" component={Logs} />
           <Route component={NotFound} />

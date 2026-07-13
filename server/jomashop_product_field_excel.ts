@@ -305,6 +305,56 @@ export async function loadLiveSchemaForCategory(category: string): Promise<{
  */
 export const MAX_EXPORT_ROWS = 12000;
 
+/**
+ * Live progress of the most recent product-field export. The export can take
+ * a while on multi-thousand-row catalogs; the UI polls
+ * GET /api/jomashop-product-fields/export-progress to show which phase and
+ * sheet the build is on instead of a bare spinner.
+ */
+export const exportProgress: {
+  active: boolean;
+  phase: "idle" | "aggregating" | "building" | "done" | "failed";
+  startedAt: number | null;
+  finishedAt: number | null;
+  currentSheet: string | null;
+  sheetsDone: number;
+  sheetsTotal: number;
+  rowsDone: number;
+  rowsTotal: number;
+  lastError: string | null;
+} = {
+  active: false,
+  phase: "idle",
+  startedAt: null,
+  finishedAt: null,
+  currentSheet: null,
+  sheetsDone: 0,
+  sheetsTotal: 0,
+  rowsDone: 0,
+  rowsTotal: 0,
+  lastError: null,
+};
+
+function resetExportProgress(phase: "aggregating"): void {
+  exportProgress.active = true;
+  exportProgress.phase = phase;
+  exportProgress.startedAt = Date.now();
+  exportProgress.finishedAt = null;
+  exportProgress.currentSheet = null;
+  exportProgress.sheetsDone = 0;
+  exportProgress.sheetsTotal = 0;
+  exportProgress.rowsDone = 0;
+  exportProgress.rowsTotal = 0;
+  exportProgress.lastError = null;
+}
+
+function finishExportProgress(phase: "done" | "failed", error?: string): void {
+  exportProgress.active = false;
+  exportProgress.phase = phase;
+  exportProgress.finishedAt = Date.now();
+  if (error) exportProgress.lastError = error;
+}
+
 export async function aggregateProductFieldRows(opts: {
   includeAll?: boolean;
   /** Optional filter — restrict to one Jomashop category. Case-insensitive
@@ -747,7 +797,12 @@ export async function buildProductFieldWorkbook(
   // disappears on the first new row.
   const VALIDATION_ROW_PAD = 50;
 
+  exportProgress.phase = "building";
+  exportProgress.sheetsTotal = agg.categories.length;
+  exportProgress.rowsTotal = agg.categories.reduce((acc, c) => acc + c.rows.length, 0);
+
   for (const cat of agg.categories) {
+    exportProgress.currentSheet = cat.category;
     const ws = wb.addWorksheet(sanitizeSheetName(cat.category), {
       views: [{ state: "frozen", ySplit: 1 }],
     });
@@ -863,6 +918,37 @@ export async function buildProductFieldWorkbook(
     // hidden _Options sheet via a workbook-level defined name — works for
     // any length of accepted-values list (Excel's ~255-char inline list
     // cap doesn't apply).
+    //
+    // PERF: validations are applied to the whole column RANGE in one call
+    // (sheet.dataValidations.add) instead of assigning cell.dataValidation
+    // row-by-row. The old per-cell loop materialized `rows × fields` cell
+    // objects each carrying its own copy of the validation — on a 10k-row
+    // export with 20 fields that alone was 200k cell objects and the main
+    // reason exports took minutes. One shared validation per column keeps
+    // the workbook model small and the xlsx writer fast.
+    const applyColumnValidation = (
+      colLetter: string,
+      validation: Record<string, unknown>,
+    ): void => {
+      const range = `${colLetter}2:${colLetter}${dataRowCount + 1}`;
+      const dv = (ws as unknown as { dataValidations?: { add?: (r: string, v: unknown) => void } })
+        .dataValidations;
+      if (dv && typeof dv.add === "function") {
+        dv.add(range, validation);
+        return;
+      }
+      // Fallback for exceljs builds without the range API — old behavior.
+      for (let r = 0; r < dataRowCount; r++) {
+        (ws.getCell(`${colLetter}${r + 2}`) as { dataValidation: unknown }).dataValidation =
+          validation;
+      }
+    };
+
+    // Highlight cap: tinting required cells is per-cell work, so on very
+    // large sheets we keep the tint for the first N data rows only. The
+    // header color-coding (yellow = required) still marks the column.
+    const TINT_ROW_CAP = 1500;
+
     const identityCount = IDENTITY_COLUMNS.length;
     for (let i = 0; i < cat.fields.length; i++) {
       const f = cat.fields[i];
@@ -871,9 +957,12 @@ export async function buildProductFieldWorkbook(
       const oc = optionColByKey.get(`${cat.category}::${f.field}`);
 
       // Highlight required body cells with a faint yellow tint so they
-      // visually stand out from optional columns.
+      // visually stand out from optional columns. Only real data rows are
+      // tinted (the drag-fill validation pad doesn't need color), capped so
+      // giant exports don't spend seconds on fills alone.
       if (f.required) {
-        for (let r = 0; r < dataRowCount; r++) {
+        const tintRows = Math.min(cat.rows.length, TINT_ROW_CAP);
+        for (let r = 0; r < tintRows; r++) {
           const cell = ws.getCell(`${colLetter}${r + 2}`);
           if (!cell.fill || (cell.fill as { type?: string }).type !== "pattern") {
             cell.fill = {
@@ -893,49 +982,43 @@ export async function buildProductFieldWorkbook(
         // comma-separated values; upload validation enforces each token.
         const formula = `=${oc.rangeName}`;
         if (f.multiple === true) {
-          for (let r = 0; r < dataRowCount; r++) {
-            ws.getCell(`${colLetter}${r + 2}`).dataValidation = {
-              type: "list",
-              allowBlank: true,
-              showInputMessage: true,
-              prompt:
-                "Enter comma-separated values. Each token must be one of the listed accepted values.",
-              promptTitle: `${f.field} (multi-select)`,
-              formulae: [formula],
-            };
-          }
+          applyColumnValidation(colLetter, {
+            type: "list",
+            allowBlank: true,
+            showInputMessage: true,
+            prompt:
+              "Enter comma-separated values. Each token must be one of the listed accepted values.",
+            promptTitle: `${f.field} (multi-select)`,
+            formulae: [formula],
+          });
         } else {
-          for (let r = 0; r < dataRowCount; r++) {
-            ws.getCell(`${colLetter}${r + 2}`).dataValidation = {
-              type: "list",
-              allowBlank: !f.required,
-              showErrorMessage: true,
-              errorStyle: "stop",
-              errorTitle: `Invalid ${f.field}`,
-              error: `Value must be one of the Jomashop-accepted options for "${f.field}".`,
-              formulae: [formula],
-            };
-          }
+          applyColumnValidation(colLetter, {
+            type: "list",
+            allowBlank: !f.required,
+            showErrorMessage: true,
+            errorStyle: "stop",
+            errorTitle: `Invalid ${f.field}`,
+            error: `Value must be one of the Jomashop-accepted options for "${f.field}".`,
+            formulae: [formula],
+          });
         }
       } else if (f.type === "number" || f.type === "integer" || f.only_integer) {
         // Numeric data validation — bounds when known.
         const isInt = f.only_integer === true || f.type === "integer";
-        for (let r = 0; r < dataRowCount; r++) {
-          ws.getCell(`${colLetter}${r + 2}`).dataValidation = {
-            type: isInt ? "whole" : "decimal",
-            allowBlank: !f.required,
-            operator: "between",
-            formulae: [
-              typeof f.min_value === "number" ? String(f.min_value) : "-1E308",
-              typeof f.max_value === "number" ? String(f.max_value) : "1E308",
-            ],
-            errorStyle: "stop",
-            errorTitle: `Invalid ${f.field}`,
-            error: isInt
-              ? `Enter an integer${typeof f.min_value === "number" || typeof f.max_value === "number" ? ` between ${f.min_value ?? "-∞"} and ${f.max_value ?? "∞"}` : ""}.`
-              : `Enter a number${typeof f.min_value === "number" || typeof f.max_value === "number" ? ` between ${f.min_value ?? "-∞"} and ${f.max_value ?? "∞"}` : ""}.`,
-          };
-        }
+        applyColumnValidation(colLetter, {
+          type: isInt ? "whole" : "decimal",
+          allowBlank: !f.required,
+          operator: "between",
+          formulae: [
+            typeof f.min_value === "number" ? String(f.min_value) : "-1E308",
+            typeof f.max_value === "number" ? String(f.max_value) : "1E308",
+          ],
+          errorStyle: "stop",
+          errorTitle: `Invalid ${f.field}`,
+          error: isInt
+            ? `Enter an integer${typeof f.min_value === "number" || typeof f.max_value === "number" ? ` between ${f.min_value ?? "-∞"} and ${f.max_value ?? "∞"}` : ""}.`
+            : `Enter a number${typeof f.min_value === "number" || typeof f.max_value === "number" ? ` between ${f.min_value ?? "-∞"} and ${f.max_value ?? "∞"}` : ""}.`,
+        });
       } else if (
         (f.type === "string" || !f.type) &&
         (typeof f.max_length === "number" || typeof f.min_length === "number")
@@ -943,30 +1026,26 @@ export async function buildProductFieldWorkbook(
         // Free-text fields with length hints — apply textLength validation.
         const min = typeof f.min_length === "number" ? f.min_length : 0;
         const max = typeof f.max_length === "number" ? f.max_length : 1000;
-        for (let r = 0; r < dataRowCount; r++) {
-          ws.getCell(`${colLetter}${r + 2}`).dataValidation = {
-            type: "textLength",
-            allowBlank: !f.required,
-            operator: "between",
-            formulae: [String(min), String(max)],
-            errorStyle: "stop",
-            errorTitle: `Invalid ${f.field}`,
-            error: `Text length must be between ${min} and ${max} characters.`,
-          };
-        }
+        applyColumnValidation(colLetter, {
+          type: "textLength",
+          allowBlank: !f.required,
+          operator: "between",
+          formulae: [String(min), String(max)],
+          errorStyle: "stop",
+          errorTitle: `Invalid ${f.field}`,
+          error: `Text length must be between ${min} and ${max} characters.`,
+        });
       }
     }
 
     // Write Back? as Yes/No dropdown.
     const writeBackColIdx = identityCount + cat.fields.length + 1; // first trailing column
     const wbLetter = columnLetter(writeBackColIdx);
-    for (let r = 0; r < dataRowCount; r++) {
-      ws.getCell(`${wbLetter}${r + 2}`).dataValidation = {
-        type: "list",
-        allowBlank: true,
-        formulae: ['"Yes,No"'],
-      };
-    }
+    applyColumnValidation(wbLetter, {
+      type: "list",
+      allowBlank: true,
+      formulae: ['"Yes,No"'],
+    });
 
     if (cat.rows.length > 0) {
       ws.autoFilter = {
@@ -988,6 +1067,9 @@ export async function buildProductFieldWorkbook(
         options: opts.join("\n"),
       });
     }
+
+    exportProgress.sheetsDone += 1;
+    exportProgress.rowsDone += cat.rows.length;
   }
 
   const buf = await wb.xlsx.writeBuffer();
@@ -1664,10 +1746,16 @@ export function registerJomashopProductFieldExcelRoutes(app: Express): void {
   //   - rejects with 413 when the resulting row count would exceed
   //     MAX_EXPORT_ROWS, asking the operator to add ?category=X;
   //   - releases the row + workbook buffers to GC before responding.
+  // Live progress for the export above — poll while an export is running.
+  app.get("/api/jomashop-product-fields/export-progress", (_req, res) => {
+    res.json({ ok: true, ...exportProgress });
+  });
+
   app.get("/api/jomashop-product-fields/export.xlsx", async (req, res) => {
     const includeAll = String(req.query.all ?? "") === "1" || String(req.query.all ?? "") === "true";
     const categoryFilter = typeof req.query.category === "string" ? req.query.category.trim() : "";
     if (!withLockOr409(res, "productFieldExport")) return;
+    resetExportProgress("aggregating");
     try {
       logMemory("productFieldExport.start", { includeAll, categoryFilter });
       // First pass: count rows under the safety cap. If the operator asked
@@ -1681,6 +1769,7 @@ export function registerJomashopProductFieldExcelRoutes(app: Express): void {
       if (!agg.shopDomain) {
         // No store at all (never installed, or all rows deleted). Surface
         // a clear reconnect CTA the UI can render as a button.
+        finishExportProgress("failed", "No Shopify store on file.");
         return res.status(503).json({
           ok: false,
           error:
@@ -1689,6 +1778,7 @@ export function registerJomashopProductFieldExcelRoutes(app: Express): void {
         });
       }
       if (!agg.fromCache) {
+        finishExportProgress("failed", "No cached product preview.");
         return res.status(409).json({
           ok: false,
           error:
@@ -1698,6 +1788,7 @@ export function registerJomashopProductFieldExcelRoutes(app: Express): void {
       }
       const rowCount = agg.categories.reduce((acc, c) => acc + c.rows.length, 0);
       if (rowCount > MAX_EXPORT_ROWS) {
+        finishExportProgress("failed", `Export would exceed ${MAX_EXPORT_ROWS} rows.`);
         return res.status(413).json({
           ok: false,
           error:
@@ -1756,10 +1847,12 @@ export function registerJomashopProductFieldExcelRoutes(app: Express): void {
       // Drop the aggregation reference before sending the buffer so its
       // backing arrays can be released while we stream the response.
       (agg as any).categories = null;
+      finishExportProgress("done");
       res.end(buf);
       logMemory("productFieldExport.responded", { bytes: buf.length });
     } catch (err) {
       const msg = (err as Error).message;
+      finishExportProgress("failed", msg);
       logMemory("productFieldExport.failed", { message: msg });
       storage.appendLog({
         level: "error",

@@ -6,6 +6,12 @@ import { serveStatic } from "./static";
 import { createServer } from "node:http";
 import { logMemory } from "./memlog";
 import { installProcessHandlers, handleMulterError } from "./stability";
+import {
+  bearerFromAuthorization,
+  embeddedAuthConfigured,
+  looksLikeJwt,
+  verifyShopifySessionToken,
+} from "./embedded_auth";
 
 installProcessHandlers();
 
@@ -45,29 +51,82 @@ app.use(
 
 app.use(express.urlencoded({ extended: false }));
 
+// ---------- Embedded Shopify admin support ----------
+//
+// When the app is loaded inside the Shopify admin iframe, Shopify appends
+// ?embedded=1&host=...&shop=... to the App URL. Shopify REQUIRES a
+// Content-Security-Policy frame-ancestors header on those responses that
+// allows the specific shop + admin.shopify.com. Standalone (Render)
+// requests carry none of those params and get no CSP header, so existing
+// behavior is unchanged.
+app.use((req, res, next) => {
+  const shop = typeof req.query.shop === "string" ? req.query.shop : "";
+  const hasEmbedHint =
+    typeof req.query.host === "string" ||
+    typeof req.query.embedded === "string" ||
+    Boolean(shop);
+  if (hasEmbedHint) {
+    if (/^[a-z0-9][a-z0-9-]*\.myshopify\.com$/i.test(shop)) {
+      res.setHeader(
+        "Content-Security-Policy",
+        `frame-ancestors https://${shop} https://admin.shopify.com;`,
+      );
+    } else {
+      res.setHeader(
+        "Content-Security-Policy",
+        "frame-ancestors https://admin.shopify.com https://*.myshopify.com;",
+      );
+    }
+    res.removeHeader("X-Frame-Options");
+  }
+  next();
+});
+
+// The Shopify admin exposes the app under /apps/{handle}[/...]. Our SPA is
+// hash-routed from "/", so bounce any such path back to the root while
+// preserving the query string (host/shop/embedded params must survive the
+// redirect for App Bridge to boot).
+app.get(/^\/apps\/[^/]+(?:\/.*)?$/, (req, res) => {
+  const qIdx = req.originalUrl.indexOf("?");
+  const qs = qIdx >= 0 ? req.originalUrl.slice(qIdx) : "";
+  res.redirect(302, `/${qs}`);
+});
+
 function requireAdminToken(req: Request, res: Response, next: NextFunction) {
   // Express strips the mount path when this is attached via app.use("/api", ...),
   // so req.path is e.g. "/health" not "/api/health". Match both for safety
   // (this middleware is also called from /api/health directly above as a
   // belt-and-braces guard).
   if (req.path === "/api/health" || req.path === "/health") return next();
+  // Public, non-sensitive config (e.g. the App Bridge api key) needed BEFORE
+  // the client can authenticate.
+  if (req.path.startsWith("/api/public/") || req.path.startsWith("/public/")) return next();
 
   const token = process.env.ADMIN_TOKEN?.trim();
+  const bearer = bearerFromAuthorization(req.headers.authorization);
+
+  // 1) Standalone mode: exact ADMIN_TOKEN match (existing behavior).
+  if (token && bearer === token) return next();
+
+  // 2) Embedded mode: a valid Shopify App Bridge session token (JWT signed
+  //    with SHOPIFY_CLIENT_SECRET) is accepted in place of ADMIN_TOKEN.
+  if (embeddedAuthConfigured() && looksLikeJwt(bearer)) {
+    const check = verifyShopifySessionToken(bearer);
+    if (check.ok) return next();
+  }
+
   if (!token) {
     if (process.env.NODE_ENV === "production") {
       return res.status(503).json({
         error: "Admin API disabled",
-        message: "Set ADMIN_TOKEN to enable dashboard API routes in production.",
+        message:
+          "Set ADMIN_TOKEN to enable dashboard API routes in production (or load the app inside the Shopify admin with embedded session auth configured).",
       });
     }
     return next();
   }
 
-  if (req.headers.authorization !== `Bearer ${token}`) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-
-  return next();
+  return res.status(401).json({ error: "Unauthorized" });
 }
 
 app.use("/api", requireAdminToken);

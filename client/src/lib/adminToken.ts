@@ -1,3 +1,5 @@
+import { getCachedEmbeddedToken } from "./embedded";
+
 const STORAGE_KEY = "admin_token";
 const EVENT_NAME = "admin-token-required";
 
@@ -38,6 +40,10 @@ export function onAdminTokenChanged(handler: () => void): () => void {
 }
 
 export function authHeaders(): Record<string, string> {
+  // Embedded Shopify admin: prefer the App Bridge session token (kept fresh
+  // by a 30s refresh loop in lib/embedded.ts). Standalone: manual ADMIN_TOKEN.
+  const embedded = getCachedEmbeddedToken();
+  if (embedded) return { Authorization: `Bearer ${embedded}` };
   const token = getAdminToken();
   return token ? { Authorization: `Bearer ${token}` } : {};
 }

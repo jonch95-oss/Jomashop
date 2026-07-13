@@ -1,0 +1,36 @@
+# Shopify app configuration for the LuxeSupply × Jomashop integration.
+#
+# This file makes the app deployable/linkable with the Shopify CLI
+# (`shopify app config link` / `shopify app deploy`) and documents the
+# exact values that must match the Shopify Dev Dashboard.
+#
+# Replace the placeholder client_id and URLs with your real values
+# (client_id is public — the SECRET stays in env vars only).
+
+client_id = "REPLACE_WITH_SHOPIFY_CLIENT_ID"
+name = "LuxeSupply Jomashop Sync"
+handle = "luxesupply-jomashop-sync"
+# Must exactly match APP_URL / SHOPIFY_APP_URL in .env and the App URL in
+# the Dev Dashboard. HTTPS required in production (e.g. the Render URL).
+application_url = "https://your-deployed-app.example.com"
+# Embedded admin experience (App Bridge). Standalone Render mode keeps
+# working — embedded is detected at runtime from the ?host/?embedded params.
+embedded = true
+
+[build]
+include_config_on_deploy = true
+
+[access_scopes]
+# Keep in sync with SHOPIFY_SCOPES in .env.
+scopes = "read_products,write_products,read_inventory,write_inventory,read_orders,write_orders,read_locations,read_fulfillments,write_fulfillments,read_assigned_fulfillment_orders,write_assigned_fulfillment_orders"
+
+[auth]
+redirect_urls = [
+  "https://your-deployed-app.example.com/auth/shopify/callback",
+]
+
+[webhooks]
+api_version = "2024-10"
+
+[pos]
+embedded = false

@@ -19,12 +19,16 @@ import {
   onAdminTokenRequired,
   setAdminToken,
 } from "@/lib/adminToken";
+import { isEmbeddedCandidate } from "@/lib/embedded";
 
 export function AdminTokenGate() {
   const queryClient = useQueryClient();
   const [open, setOpen] = useState(false);
   const [value, setValue] = useState("");
   const [hasToken, setHasToken] = useState(() => Boolean(getAdminToken()));
+  // Inside the Shopify admin iframe, auth is handled by App Bridge session
+  // tokens - the manual token modal/buttons are bypassed entirely.
+  const embedded = isEmbeddedCandidate();
 
   useEffect(() => {
     const off1 = onAdminTokenRequired(() => {
@@ -53,6 +57,8 @@ export function AdminTokenGate() {
     clearAdminToken();
     queryClient.clear();
   }
+
+  if (embedded) return null;
 
   return (
     <>

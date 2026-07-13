@@ -12,6 +12,7 @@ import {
   ListChecks,
   Brain,
   Store,
+  Zap,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { AdminTokenGate } from "./AdminTokenGate";
@@ -26,6 +27,7 @@ const NAV: Array<{ href: string; label: string; icon: React.ComponentType<{ clas
   { href: "/portal-styles", label: "Portal Styles", icon: Store, group: "Catalog" },
   { href: "/inventory", label: "Inventory", icon: Boxes, group: "Catalog" },
   { href: "/orders", label: "Orders", icon: ClipboardList, group: "Fulfill" },
+  { href: "/automation", label: "Automation", icon: Zap, group: "Fulfill" },
   { href: "/fulfillment", label: "Fulfillment", icon: Truck, group: "Fulfill" },
   { href: "/logs", label: "Logs", icon: ScrollText, group: "Diagnose" },
 ];
