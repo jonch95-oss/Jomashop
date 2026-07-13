@@ -113,6 +113,12 @@ function requireAdminToken(req: Request, res: Response, next: NextFunction) {
   if (embeddedAuthConfigured() && looksLikeJwt(bearer)) {
     const check = verifyShopifySessionToken(bearer);
     if (check.ok) return next();
+    // Deliberately logged (reason only, never the token) so embedded-auth
+    // misconfigurations (secret mismatch, clock skew, wrong aud) are
+    // diagnosable from platform logs.
+    console.warn(`[embedded-auth] session token rejected: ${check.reason} (path=${req.path})`);
+  } else if (!bearer) {
+    console.warn(`[embedded-auth] no Authorization bearer on ${req.path}`);
   }
 
   if (!token) {
