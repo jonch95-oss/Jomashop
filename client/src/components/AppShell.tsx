@@ -128,6 +128,29 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           <Logo />
           <AdminTokenGate />
         </header>
+        {/* Mobile / narrow-iframe nav (the sidebar is hidden below md; the
+            embedded Shopify admin iframe is often narrower than that, so
+            this strip is the only navigation there) */}
+        <nav
+          className="sticky top-12 z-10 flex gap-1 overflow-x-auto border-b border-border bg-background/95 px-2 py-1.5 backdrop-blur md:hidden"
+          style={{ overscrollBehavior: "contain" }}
+        >
+          {NAV.map((item) => (
+            <Link
+              key={item.href}
+              href={item.href}
+              data-testid={`mobilenav-${item.label.toLowerCase().replace(/\s+/g, "-")}`}
+              className={cn(
+                "whitespace-nowrap rounded-md px-2.5 py-1.5 text-xs transition-colors",
+                location === item.href
+                  ? "bg-sidebar-accent text-sidebar-accent-foreground"
+                  : "text-muted-foreground hover:text-foreground",
+              )}
+            >
+              {item.label}
+            </Link>
+          ))}
+        </nav>
         {/* Desktop top bar */}
         <div className="sticky top-0 z-10 hidden h-12 items-center justify-end border-b border-border bg-background/95 px-8 backdrop-blur md:flex">
           <AdminTokenGate />
