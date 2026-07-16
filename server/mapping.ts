@@ -1754,7 +1754,23 @@ export function buildSchemaProperties(
         });
       }
     } else {
-      properties[outKey] = value;
+      // Enforce the schema's max_length on free-text fields (e.g. Jomashop
+      // caps "Detailed Description" — an over-long value is rejected with
+      // "is too long"). Truncate at a word boundary when possible.
+      if (
+        typeof value === "string" &&
+        typeof prop.max_length === "number" &&
+        prop.max_length > 0 &&
+        value.length > prop.max_length &&
+        (!Array.isArray(prop.options) || prop.options.length === 0)
+      ) {
+        let t = value.slice(0, prop.max_length);
+        const lastSpace = t.lastIndexOf(" ");
+        if (lastSpace > prop.max_length * 0.6) t = t.slice(0, lastSpace);
+        properties[outKey] = t.trim();
+      } else {
+        properties[outKey] = value;
+      }
     }
   }
   return {
