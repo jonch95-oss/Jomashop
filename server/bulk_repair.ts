@@ -939,6 +939,278 @@ export function registerBulkRepairRoutes(app: Express): void {
     },
   );
 
+  // ---------- Server-side autofill (no spreadsheet round-trip) ----------
+  //
+  // POST /api/products/missing/autofill
+  //   body: {
+  //     rates?: Record<string, number>   // brand (lowercase) -> discount %
+  //     marginFloor?: number             // default 50: payout >= 2x cost
+  //     brandFixes?: boolean             // default true: LuxeSupply/ORLBROWN -> real brand from title
+  //   }
+  //
+  // Regenerates the missing-fields rows, derives color/gender/size_system
+  // from titles/variants, fills commercial_discount from the per-brand rate
+  // map (falling back to a margin-guarded cost-based discount using
+  // inventoryItem.unitCost), and stages everything as a normal import
+  // session. NOTHING is written — the response returns a sessionId +
+  // preview identical to import-preview; writes happen via the existing
+  // POST /api/products/missing/apply-shopify { sessionId, confirm: true }.
+  app.post("/api/products/missing/autofill", async (req, res) => {
+    gcSessions();
+    if (!withLockOr409(res, "import.bulk-repair")) return;
+    try {
+      const body = (req.body ?? {}) as {
+        rates?: Record<string, number>;
+        marginFloor?: number;
+        brandFixes?: boolean;
+      };
+      const rates: Record<string, number> = {};
+      for (const [k, v] of Object.entries(body.rates ?? {})) {
+        const n = Number(v);
+        if (Number.isFinite(n) && n >= 0 && n <= 95) rates[k.trim().toLowerCase()] = Math.round(n);
+      }
+      const marginFloor = Number.isFinite(Number(body.marginFloor))
+        ? Math.min(Math.max(Number(body.marginFloor), 0), 90)
+        : 50;
+      // payout >= price*(1-d) must be >= cost/(1-marginFloor%) — for the
+      // default 50% gross margin that is payout >= 2x cost.
+      const costMultiplier = 1 / (1 - marginFloor / 100);
+      const doBrandFixes = body.brandFixes !== false;
+
+      const BRAND_ALIAS: Record<string, string> = {
+        TODS: "Tods", TOMFORD: "Tom Ford", ISAIA: "Isaia", OFFWHITE: "Off White",
+        "OFF WHITE": "Off White", "SCOTCH&SO": "Scotch & Soda", TODDSNYDE: "Todd Snyder",
+        ROGERVIVI: "Roger Vivier", "PALM ANGELS": "Palm Angels", PALMANGEL: "Palm Angels",
+        ORLBROWN: "Orlebar Brown",
+      };
+      const COLOR_MAP: Record<string, string> = {
+        black: "Black", white: "White", navy: "Navy", blue: "Blue", red: "Red", green: "Green",
+        brown: "Brown", beige: "Beige", grey: "Grey", gray: "Grey", pink: "Pink", purple: "Purple",
+        yellow: "Yellow", orange: "Orange", multicolor: "Multicolor", multicolored: "Multicolor",
+        cream: "Cream", tan: "Tan", gold: "Gold", silver: "Silver", burgundy: "Burgundy",
+        khaki: "Khaki", olive: "Olive", ivory: "Ivory", camel: "Camel", teal: "Teal",
+        indigo: "Blue", ink: "Navy", sand: "Beige", rose: "Pink", vermillion: "Orange",
+        shadow: "Grey", cloud: "White", charcoal: "Grey", natural: "Beige", ecru: "Beige", taupe: "Taupe",
+      };
+      const normBrand = (b: string): string => BRAND_ALIAS[b] ?? BRAND_ALIAS[b.toUpperCase()] ?? b;
+      const brandFromTitle = (t: string): string => {
+        for (const b of ["Orlebar Brown", "Fleurdum", "Fay"]) {
+          if (t.trim().toLowerCase().startsWith(b.toLowerCase())) return b;
+        }
+        const m = t.match(/^(.*?)\s+(Mens|Men's|Womens|Women's|Kids|Unisex)\b/i);
+        return m ? m[1].trim() : "";
+      };
+      const colorFromTitle = (title: string, brand: string): string => {
+        let t = title;
+        if (brand && t.toLowerCase().startsWith(brand.toLowerCase())) t = t.slice(brand.length);
+        t = t.replace(/\b(mens|men's|womens|women's|kids|unisex|infant|baby)\b/gi, " ");
+        const tl = ` ${t.toLowerCase()} `;
+        if (t.includes("/") && Object.keys(COLOR_MAP).some((c) => tl.includes(c))) return "Multicolor";
+        if (tl.includes("light blue")) return "Light Blue";
+        for (const [k, v] of Object.entries(COLOR_MAP)) {
+          if (tl.includes(` ${k} `) || tl.includes(` ${k}/`)) return v;
+        }
+        return "";
+      };
+      const genderFromTitle = (t: string): string => {
+        const l = t.toLowerCase();
+        if (/\bwomen'?s?\b/.test(l)) return "Women";
+        if (/\b(kids?|infant|baby|toddler)\b/.test(l)) return "Kids";
+        if (/\bmen'?s?\b/.test(l)) return "Men";
+        if (l.includes("unisex")) return "Unisex";
+        return "";
+      };
+      const sizeSystemFor = (tok: string, category: string): string => {
+        const s = String(tok || "").toUpperCase().replace("SIZE:", "").trim();
+        if (!s || s === "OS") return "";
+        if (/^X{0,3}[SML]$|^XL$|^XXL$|^XXXL$|^[0-9]+X[SL]$/.test(s)) return "US";
+        if (/\d+\s*-\s*\d+M/.test(s)) return "US";
+        const m = s.match(/^(\d+(?:\.\d+)?)$/);
+        if (m) {
+          const n = parseFloat(m[1]);
+          if (/shoe/i.test(category)) {
+            if (n >= 3 && n <= 15) return "US";
+            if (n >= 33 && n <= 50) return "EU";
+          } else {
+            if (n >= 44 && n <= 62 && n % 2 === 0) return "IT";
+            if (n >= 0 && n <= 43) return "US";
+          }
+        }
+        return "";
+      };
+      const normalizeDiscount = (raw: string): string => {
+        const f = parseFloat(String(raw).replace("%", ""));
+        if (!Number.isFinite(f)) return "";
+        return String(Math.round(f > 0 && f <= 1 ? f * 100 : f));
+      };
+
+      const exportBuild = await buildMissingExportRows({ rowLimit: MAX_IMPORT_ROWS });
+      const exportRows = exportBuild.rows;
+
+      // Fetch unit costs for rows that will need the margin fallback.
+      const conn = getActiveShopifyConnection();
+      const needCost: string[] = [];
+      for (const r of exportRows) {
+        const b = normBrand(doBrandFixes && (r.current_brand === "LuxeSupply" || r.current_brand === "ORLBROWN")
+          ? brandFromTitle(r.product_title) || "Orlebar Brown"
+          : r.current_brand);
+        if (rates[b.toLowerCase()] === undefined && !r.commercial_discount && r.shopify_variant_id) {
+          needCost.push(r.shopify_variant_id);
+        }
+      }
+      const unitCost = new Map<string, number>();
+      if (conn && needCost.length > 0) {
+        const uniq = Array.from(new Set(needCost));
+        for (let i = 0; i < uniq.length; i += 200) {
+          const ids = uniq.slice(i, i + 200).map((n) => `gid://shopify/ProductVariant/${n}`);
+          const q = `query C($ids: [ID!]!) { nodes(ids: $ids) { ... on ProductVariant { id inventoryItem { unitCost { amount } } } } }`;
+          const resp = await shopifyGraphQL<{ nodes?: Array<{ id?: string; inventoryItem?: { unitCost?: { amount?: string } | null } | null } | null> }>(conn, q, { ids });
+          if (resp.ok) {
+            for (const n of resp.data.nodes ?? []) {
+              const id = n?.id?.match(/(\d+)$/)?.[1];
+              const amt = n?.inventoryItem?.unitCost?.amount;
+              if (id && amt) unitCost.set(id, Number(amt));
+            }
+          }
+        }
+      }
+
+      const stats = {
+        color: 0, gender: 0, size_system: 0, discount_brand: 0, discount_cost: 0,
+        discount_normalized: 0, brand_fixes: 0, needs_review: 0, ready: 0,
+      };
+      const rows: ParsedRow[] = exportRows.map((r, i) => {
+        const notes: string[] = [];
+        let brandOut = "";
+        let brandNorm = normBrand(r.current_brand);
+        if (doBrandFixes && (r.current_brand === "LuxeSupply" || r.current_brand === "ORLBROWN")) {
+          brandOut = brandFromTitle(r.product_title) || "Orlebar Brown";
+          brandNorm = brandOut;
+          stats.brand_fixes += 1;
+          notes.push(`brand fixed to ${brandOut}`);
+        }
+        let color = r.color;
+        if (!color) {
+          color = colorFromTitle(r.product_title, brandNorm);
+          if (color) stats.color += 1;
+        }
+        let gender = r.gender;
+        if (!gender) {
+          gender = genderFromTitle(r.product_title);
+          if (gender) stats.gender += 1;
+        }
+        let sizeSystem = r.size_system;
+        if (!sizeSystem) {
+          const tok = r.variant_title || (r.sku.includes("-") ? r.sku.split("-").pop() ?? "" : "");
+          sizeSystem = sizeSystemFor(tok, r.current_category);
+          if (sizeSystem) stats.size_system += 1;
+        }
+        let discount = "";
+        if (r.commercial_discount) {
+          discount = normalizeDiscount(r.commercial_discount);
+          if (discount !== String(Math.round(parseFloat(r.commercial_discount) || 0))) stats.discount_normalized += 1;
+        } else {
+          const rate = rates[brandNorm.toLowerCase()];
+          if (rate !== undefined) {
+            discount = String(rate);
+            stats.discount_brand += 1;
+            notes.push(`discount ${rate}% (brand rate)`);
+          } else {
+            const cost = unitCost.get(r.shopify_variant_id);
+            const price = parseFloat(r.jomashop_price || "0");
+            if (cost && price > costMultiplier * cost) {
+              const d = Math.max(Math.min(Math.floor((1 - (costMultiplier * cost) / price) * 100), 90), 0);
+              if (d >= 5) {
+                discount = String(d);
+                stats.discount_cost += 1;
+                notes.push(`discount ${d}% (cost-based, ${marginFloor}%+ margin)`);
+              } else {
+                notes.push("margin too thin for a meaningful discount");
+              }
+            } else {
+              notes.push(cost ? "price below margin floor at any discount" : "no unit cost in Shopify");
+            }
+          }
+        }
+        const blocked = !discount || (r.missing_fields.includes("Color") && !color);
+        if (blocked) stats.needs_review += 1; else stats.ready += 1;
+
+        const parsed: ParsedRow = {
+          rowNumber: i + 2,
+          shop_domain: r.shop_domain,
+          shopify_product_id: r.shopify_product_id,
+          shopify_variant_id: r.shopify_variant_id,
+          product_title: r.product_title,
+          variant_title: r.variant_title,
+          sku: r.sku,
+          vendor_sku: r.vendor_sku,
+          current_brand: r.current_brand,
+          current_category: r.current_category,
+          missing_fields: r.missing_fields,
+          jomashop_price: r.jomashop_price,
+          commercial_discount: discount,
+          brand: brandOut,
+          category: "",
+          color,
+          material: "",
+          gender,
+          size: "",
+          size_system: sizeSystem,
+          country_of_origin: r.country_of_origin ?? "",
+          manufacturer_number: r.manufacturer_number ?? "",
+          ff_sku: r.ff_sku ?? "",
+          ff_designer_id: r.ff_designer_id ?? "",
+          upc: r.upc ?? "",
+          composition: r.composition ?? "",
+          collection: r.collection ?? "",
+          season: r.season ?? "",
+          row_status: blocked ? "needs-review" : "ready",
+          notes: notes.join("; "),
+          has_changes: false,
+          changed_fields: [],
+          errors: [],
+        };
+        const changed: EditableField[] = [];
+        for (const f of EDITABLE_FIELDS) {
+          if (parsed[f] && parsed[f].trim() !== "") changed.push(f);
+        }
+        parsed.changed_fields = changed;
+        parsed.has_changes = changed.length > 0;
+        return parsed;
+      });
+
+      const validRows = rows.filter((r) => r.has_changes);
+      const fieldUpdateCounts: Record<string, number> = {};
+      for (const r of validRows) {
+        for (const f of r.changed_fields) fieldUpdateCounts[f] = (fieldUpdateCounts[f] ?? 0) + 1;
+      }
+      const sessionId = newSessionId();
+      SESSIONS.set(sessionId, { id: sessionId, createdAt: Date.now(), rows, shopifyApplied: false, shopifyResults: [] });
+      storage.appendLog({
+        level: "info",
+        message: `Bulk-repair AUTOFILL staged ${rows.length} row(s) (${validRows.length} with changes) — no writes yet`,
+        detailsJson: JSON.stringify({ sessionId, stats, marginFloor, rateBrands: Object.keys(rates) }),
+        createdAt: Date.now(),
+      });
+      res.json({
+        ok: true,
+        sessionId,
+        stats,
+        totals: { total: rows.length, withChanges: validRows.length, needsReview: stats.needs_review, ready: stats.ready },
+        fieldUpdateCounts,
+        sample: rows.slice(0, 5).map((r) => ({
+          title: r.product_title, brand: r.brand || r.current_brand, color: r.color, gender: r.gender,
+          size_system: r.size_system, commercial_discount: r.commercial_discount, row_status: r.row_status, notes: r.notes,
+        })),
+        note: "Nothing written. Apply with POST /api/products/missing/apply-shopify { sessionId, confirm: true }.",
+      });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: (err as Error).message });
+    } finally {
+      releaseLock("import.bulk-repair");
+    }
+  });
+
   // ---------- Apply to Shopify ----------
   app.post("/api/products/missing/apply-shopify", async (req, res) => {
     gcSessions();
