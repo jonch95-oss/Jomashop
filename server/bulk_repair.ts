@@ -39,6 +39,7 @@ const MAX_MISSING_EXPORT_ROWS = 12000;
 // ---------- Editable column model ----------
 
 export const EDITABLE_FIELDS = [
+  "commercial_discount",
   "brand",
   "category",
   "color",
@@ -63,6 +64,9 @@ export type EditableField = (typeof EDITABLE_FIELDS)[number];
 // "luxe"/"custom" continue to work via the read path; new writes consolidate
 // under "jomashop" so Shopify remains the source of truth for Jomashop data.
 const METAFIELD_TARGET: Record<EditableField, { namespace: string; key: string; type: string } | null> = {
+  // Percentage number as plain text, e.g. "60". The mapper's metafield
+  // candidates list has jomashop.commercial_discount first.
+  commercial_discount: { namespace: "jomashop", key: "commercial_discount", type: "single_line_text_field" },
   brand: null, // top-level: written via product update (vendor), not metafield
   category: null, // top-level: written via product update (productType)
   color: { namespace: "jomashop", key: "color", type: "single_line_text_field" },
@@ -91,7 +95,6 @@ const IDENTIFIER_COLUMNS = [
   "current_brand",
   "current_category",
   "missing_fields",
-  "commercial_discount",
   "jomashop_price",
 ] as const;
 

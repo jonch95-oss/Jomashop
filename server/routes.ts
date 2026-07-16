@@ -750,6 +750,167 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.json({ ok: true, shopDomain: conn.shopDomain, accessToken: conn.accessToken });
   });
 
+  // ---------- Variant costs (for margin-based discount planning) ----------
+  // POST /api/shopify/variant-costs { variantIds: string[] }
+  // Returns unit costs (inventoryItem.unitCost) for up to 250 variants so
+  // operators/tools can compute margin-safe commercial discounts.
+  app.post("/api/shopify/variant-costs", async (req, res) => {
+    const conn = getActiveShopifyConnection();
+    if (!conn) return res.status(503).json({ ok: false, error: "No connected Shopify store." });
+    const raw = Array.isArray(req.body?.variantIds) ? req.body.variantIds : [];
+    const ids = raw
+      .map((v: unknown) => String(v).match(/(\d+)$/)?.[1])
+      .filter((v: string | undefined): v is string => Boolean(v))
+      .slice(0, 250)
+      .map((n: string) => `gid://shopify/ProductVariant/${n}`);
+    if (ids.length === 0) return res.status(400).json({ ok: false, error: "variantIds required" });
+    const q = `
+      query Costs($ids: [ID!]!) {
+        nodes(ids: $ids) {
+          ... on ProductVariant {
+            id
+            sku
+            inventoryItem { unitCost { amount currencyCode } }
+          }
+        }
+      }
+    `;
+    try {
+      const resp = await fetch(`https://${conn.shopDomain}/admin/api/2024-10/graphql.json`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": conn.accessToken },
+        body: JSON.stringify({ query: q, variables: { ids } }),
+      });
+      const body = (await resp.json()) as {
+        data?: { nodes?: Array<{ id?: string; sku?: string; inventoryItem?: { unitCost?: { amount?: string } | null } | null } | null> };
+        errors?: Array<{ message: string }>;
+      };
+      if (body.errors?.length) {
+        return res.status(502).json({ ok: false, error: body.errors.map((e) => e.message).join("; ") });
+      }
+      const costs = (body.data?.nodes ?? [])
+        .filter((n): n is NonNullable<typeof n> => Boolean(n && n.id))
+        .map((n) => ({
+          variantId: String(n.id).match(/(\d+)$/)?.[1] ?? n.id,
+          sku: n.sku ?? null,
+          unitCost: n.inventoryItem?.unitCost?.amount ? Number(n.inventoryItem.unitCost.amount) : null,
+        }));
+      res.json({ ok: true, costs });
+    } catch (err) {
+      res.status(502).json({ ok: false, error: (err as Error).message });
+    }
+  });
+
+  // ---------- Description backfill ----------
+  // POST /api/products/backfill-descriptions { confirm?, dryRun?, limit? }
+  // Generates a short brand/item/color description (matching the catalog's
+  // existing copy style) for cached products whose description is missing or
+  // trivially short, and writes it to Shopify descriptionHtml. Dry-run by
+  // default; live writes require confirm: true AND dryRun: false.
+  app.post("/api/products/backfill-descriptions", async (req, res) => {
+    const dryRun = req.body?.dryRun !== false || req.body?.confirm !== true;
+    const limit = Math.min(Math.max(parseInt(String(req.body?.limit ?? "1000"), 10) || 1000, 1), 2000);
+    const conn = getActiveShopifyConnection();
+    if (!conn) return res.status(503).json({ ok: false, error: "No connected Shopify store." });
+    const cache = storage.getProductCache(conn.shopDomain);
+    if (!cache) return res.status(409).json({ ok: false, error: "No product cache. Refresh from Shopify first." });
+    let payload: any;
+    try {
+      payload = JSON.parse(cache.payloadJson);
+    } catch {
+      return res.status(500).json({ ok: false, error: "Corrupt product cache." });
+    }
+    const mapped: any[] = Array.isArray(payload?.mapped) ? payload.mapped : [];
+
+    const OPENERS = [
+      "Sleek and stylish",
+      "Refined and versatile",
+      "Timeless and modern",
+      "Elegant and effortless",
+      "Classic and contemporary",
+    ];
+    const CLOSERS = [
+      "offers both sophistication and everyday practicality.",
+      "brings polished style to any wardrobe.",
+      "combines premium craftsmanship with effortless wearability.",
+      "delivers understated luxury with versatile appeal.",
+      "pairs refined design with day-to-day comfort.",
+    ];
+    const genderWord = (g: string): string =>
+      /women/i.test(g) ? "women's" : /kid|child|infant|baby/i.test(g) ? "kids'" : /men/i.test(g) ? "men's" : "";
+
+    const candidates: Array<{ id: string; title: string; text: string }> = [];
+    for (const m of mapped) {
+      if (candidates.length >= limit) break;
+      const desc = String(m?.description ?? "").trim();
+      if (desc.length >= 40) continue;
+      const pid = m?.source?.shopify_product_id;
+      const name = String(m?.name ?? "").trim();
+      if (!pid || !name) continue;
+      const brand = String(m?.brand ?? "").trim();
+      // Item noun: title minus brand prefix; fall back to full title.
+      let noun = name;
+      if (brand && noun.toLowerCase().startsWith(brand.toLowerCase())) {
+        noun = noun.slice(brand.length).trim();
+      }
+      noun = noun.replace(/\b(mens|men's|womens|women's|kids|unisex)\b/gi, "").replace(/\s+/g, " ").trim() || "piece";
+      const gw = genderWord(name);
+      const i = candidates.length;
+      const opener = OPENERS[i % OPENERS.length];
+      const closer = CLOSERS[i % CLOSERS.length];
+      const text =
+        `${opener}, this ${noun.toLowerCase()} from ${brand || "our collection"} ${closer}` +
+        (gw ? ` A refined addition to any ${gw} wardrobe.` : "");
+      candidates.push({ id: String(pid), title: name, text });
+    }
+
+    if (dryRun) {
+      return res.json({
+        ok: true,
+        dryRun: true,
+        wouldUpdate: candidates.length,
+        sample: candidates.slice(0, 10),
+        note: "Dry run — nothing written. POST with { confirm: true, dryRun: false } to apply.",
+      });
+    }
+
+    let updated = 0;
+    const errors: Array<{ id: string; error: string }> = [];
+    for (const c of candidates) {
+      const q = `
+        mutation Upd($input: ProductInput!) {
+          productUpdate(input: $input) { userErrors { message } }
+        }
+      `;
+      try {
+        const resp = await fetch(`https://${conn.shopDomain}/admin/api/2024-10/graphql.json`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": conn.accessToken },
+          body: JSON.stringify({
+            query: q,
+            variables: { input: { id: `gid://shopify/Product/${c.id}`, descriptionHtml: `<p>${c.text}</p>` } },
+          }),
+        });
+        const body = (await resp.json()) as { data?: { productUpdate?: { userErrors?: Array<{ message: string }> } }; errors?: Array<{ message: string }> };
+        const ue = body.data?.productUpdate?.userErrors ?? [];
+        if (body.errors?.length || ue.length) {
+          errors.push({ id: c.id, error: [...(body.errors ?? []), ...ue].map((e) => e.message).join("; ") });
+        } else {
+          updated += 1;
+        }
+      } catch (err) {
+        errors.push({ id: c.id, error: (err as Error).message });
+      }
+    }
+    storage.appendLog({
+      level: errors.length > 0 ? "warn" : "info",
+      message: `Description backfill: ${updated} updated / ${errors.length} failed (of ${candidates.length})`,
+      detailsJson: JSON.stringify({ errors: errors.slice(0, 20) }),
+      createdAt: Date.now(),
+    });
+    res.json({ ok: errors.length === 0, dryRun: false, updated, failed: errors.length, errors: errors.slice(0, 20) });
+  });
+
   // ---------- Jomashop ----------
   app.get("/api/jomashop/session/test", async (_req, res) => {
     if (!jomashopConfigured()) {
