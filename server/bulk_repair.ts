@@ -983,15 +983,33 @@ export function registerBulkRepairRoutes(app: Express): void {
         ROGERVIVI: "Roger Vivier", "PALM ANGELS": "Palm Angels", PALMANGEL: "Palm Angels",
         ORLBROWN: "Orlebar Brown",
       };
+      // Canonical values from Jomashop's LIVE Apparel color list (note:
+      // "Multi-Color", no Cream/Khaki/Olive/Ivory/Camel/Teal — those map to
+      // their nearest accepted color). Operator-confirmed 2026-07-16.
       const COLOR_MAP: Record<string, string> = {
         black: "Black", white: "White", navy: "Navy", blue: "Blue", red: "Red", green: "Green",
         brown: "Brown", beige: "Beige", grey: "Grey", gray: "Grey", pink: "Pink", purple: "Purple",
-        yellow: "Yellow", orange: "Orange", multicolor: "Multicolor", multicolored: "Multicolor",
-        cream: "Cream", tan: "Tan", gold: "Gold", silver: "Silver", burgundy: "Burgundy",
-        khaki: "Khaki", olive: "Olive", ivory: "Ivory", camel: "Camel", teal: "Teal",
+        yellow: "Yellow", orange: "Orange", multicolor: "Multi-Color", multicolored: "Multi-Color",
+        cream: "White", tan: "Tan", gold: "Gold-tone", silver: "Silver-tone", burgundy: "Burgundy",
+        khaki: "Tan", olive: "Green", ivory: "White", camel: "Tan", teal: "Blue",
         indigo: "Blue", ink: "Navy", sand: "Beige", rose: "Pink", vermillion: "Orange",
-        shadow: "Grey", cloud: "White", charcoal: "Grey", natural: "Beige", ecru: "Beige", taupe: "Taupe",
+        shadow: "Grey", cloud: "White", charcoal: "Grey", natural: "Beige", ecru: "Beige", taupe: "Tan",
+        chalk: "White", nero: "Black", nude: "Beige", wine: "Burgundy", maroon: "Burgundy",
+        fuchsia: "Pink", fuxia: "Pink", magenta: "Pink", raspberry: "Pink", peach: "Pink",
+        coral: "Pink", watermelon: "Pink", powder: "Pink", violet: "Purple", lilac: "Purple",
+        lavender: "Purple", plum: "Purple", military: "Green", mint: "Green", peacock: "Green",
+        midnight: "Navy", sky: "Blue", aqua: "Blue", ocean: "Blue", cobalt: "Blue", petrol: "Blue",
+        caramel: "Tan", tobacco: "Tan", mud: "Brown", walnut: "Brown", chestnut: "Brown",
+        chocolate: "Brown", rust: "Orange", terracotta: "Orange", terrecotta: "Orange",
+        butter: "Yellow", lemon: "Yellow", anthracite: "Grey", smoke: "Grey",
+        pearl: "White", alabaster: "White", offwhite: "White", carmine: "Red", ruby: "Red",
+        rosegold: "Rose Gold-tone", copper: "Copper", bronze: "Bronze", amber: "Amber",
+        mercury: "Silver-tone", palladium: "Silver-tone", havana: "Tortoise", tortoise: "Tortoise",
+        ombre: "Two-tone", leopard: "Leopard", zebra: "Zebra", gunmetal: "Gunmetal",
       };
+      // Live accepted color values — used to normalize previously-written
+      // values (e.g. "Cream"/"Multicolor") to the accepted spelling.
+      const LIVE_COLORS = new Set(["Amber","Beige","Black","Blue","Bronze","Brown","Burgundy","Chrome","Copper","Gold-tone","Green","Grey","Gunmetal","Leopard","Metallic","Mirrored","Mother of Pearl","Multi-Color","Orange","Navy","Pattern","Pink","Purple","Red","Rose Gold-tone","Silver-tone","Tan","Tortoise","Tri-color","Two-tone","White","Yellow","Zebra"]);
       const normBrand = (b: string): string => BRAND_ALIAS[b] ?? BRAND_ALIAS[b.toUpperCase()] ?? b;
       const brandFromTitle = (t: string): string => {
         for (const b of ["Orlebar Brown", "Fleurdum", "Fay"]) {
@@ -1021,15 +1039,20 @@ export function registerBulkRepairRoutes(app: Express): void {
         return "";
       };
       const sizeSystemFor = (tok: string, category: string): string => {
-        const s = String(tok || "").toUpperCase().replace("SIZE:", "").trim();
-        if (!s || s === "OS") return "";
+        let s = String(tok || "").toUpperCase().replace("SIZE:", "").trim();
+        // One-size and no-variant products default to US (operator-confirmed).
+        if (!s || s === "OS" || s === "DEFAULT TITLE" || s === "ONE SIZE") return "US";
         if (/^X{0,3}[SML]$|^XL$|^XXL$|^XXXL$|^[0-9]+X[SL]$/.test(s)) return "US";
-        if (/\d+\s*-\s*\d+M/.test(s)) return "US";
+        if (/\d+\s*[-\/]\s*\d+M?$/.test(s)) return "US"; // infant ranges 6-12M / 6/12
+        // Suit sizes with fit suffix (38R, 52R, 56L …): strip and treat numeric.
+        const suit = s.match(/^(\d{2})[RSL]$/);
+        if (suit) s = suit[1];
         const m = s.match(/^(\d+(?:\.\d+)?)$/);
         if (m) {
           const n = parseFloat(m[1]);
           if (/shoe/i.test(category)) {
             if (n >= 3 && n <= 15) return "US";
+            if (n >= 16 && n <= 32) return "EU"; // kids EU shoe sizes
             if (n >= 33 && n <= 50) return "EU";
           } else {
             if (n >= 44 && n <= 62 && n % 2 === 0) return "IT";
@@ -1093,6 +1116,15 @@ export function registerBulkRepairRoutes(app: Express): void {
         if (!color) {
           color = colorFromTitle(r.product_title, brandNorm);
           if (color) stats.color += 1;
+        } else if (!LIVE_COLORS.has(color)) {
+          // Normalize legacy/invalid values ("Cream", "Multicolor", …) to the
+          // live accepted spelling; leave unknowns for the enum validator.
+          const norm = COLOR_MAP[color.toLowerCase().replace(/[^a-z]/g, "")] ?? COLOR_MAP[color.toLowerCase()];
+          if (norm && norm !== color) {
+            color = norm;
+            stats.color += 1;
+            notes.push("color normalized to Jomashop value");
+          }
         }
         let gender = r.gender;
         if (!gender) {

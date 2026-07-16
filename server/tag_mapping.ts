@@ -121,8 +121,10 @@ export const TAG_MAPPINGS: Record<string, Entry> = {
   CLTH: HB("Clutch"),
   TOPH: HB("Top Handle Bag"),
   // ---- Eyewear ----
-  SUNG: { category: "Eyewear", props: { eyewearsubclass: "Sunglasses" } },
-  OPTI: { category: "Eyewear", props: { eyewearsubclass: "Eyeglass Frames" } },
+  SUNG: { category: "Eyewear", props: { eyewearsubclass: "Sunglasses", framestyle: "Square" } },
+  OPTI: { category: "Eyewear", props: { eyewearsubclass: "Eyeglass Frames", framestyle: "Square" } },
+  // Luggage (Ted Baker spinner sets typed "Clothing" by the feed).
+  LUGG: { category: "Handbags", props: { handbagstyle: "Luggage", gender: "Unisex" } },
 };
 
 /** Codes deliberately unmapped per operator review (jewelry, home goods,
@@ -185,6 +187,7 @@ const TITLE_KEYWORDS: Array<[RegExp, string]> = [
   [/shoulder bag/i, "SHLD"],
   [/pouch/i, "POUC"],
   [/top handle/i, "TOPH"],
+  [/luggage|spinner|suitcase|pc set \(\d{2}/i, "LUGG"],
   [/handbag|\bbag\b/i, "BAGS"],
   [/wallet/i, "WALL"],
   [/keychain/i, "KCHN"],

@@ -1919,7 +1919,10 @@ export function mapShopifyToJomashop(
     sizeToken: tmSizeTok,
   });
 
-  const category = forcedCategory || inferCategory(product) || tagDefaults?.category || "Clothing";
+  // Operator-confirmed tags OUTRANK inferCategory: the feed writes wrong
+  // product Types (e.g. cardigans typed "Accessories"), while the tag
+  // vocabulary is operator-maintained truth.
+  const category = forcedCategory || tagDefaults?.category || inferCategory(product) || "Clothing";
   // Display name for human-facing warnings/messages. Legacy alias categories
   // (e.g. "Clothing") are surfaced as their canonical Jomashop name
   // ("Apparel") so the warning list, inline repair panel, and product card
@@ -2225,6 +2228,35 @@ export function mapShopifyToJomashop(
       if (mi >= 0) missingRequiredProps.splice(mi, 1);
       const wi = warnings.findIndex((w) => w.startsWith("Missing required") && w.includes('"' + prop.field + '"'));
       if (wi >= 0) warnings.splice(wi, 1);
+    }
+  }
+
+  // One-size handling (operator-confirmed): OS / no-variant products default
+  // to size type US and size "One Size" when those required fields are blank.
+  {
+    const tok = String(tmSizeTok ?? "").toUpperCase().trim();
+    const isOneSize = tok === "" || tok === "OS" || tok === "DEFAULT TITLE" || tok === "ONE SIZE";
+    if (isOneSize) {
+      for (const prop of schemaProperties) {
+        if (!prop || typeof prop.field !== "string") continue;
+        const t = labelToken(prop.field);
+        const cur = properties[prop.field];
+        const blank = cur === null || cur === undefined || String(cur).trim() === "";
+        if (!blank) continue;
+        if (t === "apparelsizetype" || t === "shoesizetype") {
+          properties[prop.field] = "US";
+          const mi = missingRequiredProps.indexOf(prop.field);
+          if (mi >= 0) missingRequiredProps.splice(mi, 1);
+          const wi = warnings.findIndex((w) => w.startsWith("Missing required") && w.includes('"' + prop.field + '"'));
+          if (wi >= 0) warnings.splice(wi, 1);
+        } else if (t === "apparelsize") {
+          properties[prop.field] = "One Size";
+          const mi = missingRequiredProps.indexOf(prop.field);
+          if (mi >= 0) missingRequiredProps.splice(mi, 1);
+          const wi = warnings.findIndex((w) => w.startsWith("Missing required") && w.includes('"' + prop.field + '"'));
+          if (wi >= 0) warnings.splice(wi, 1);
+        }
+      }
     }
   }
 
