@@ -34,6 +34,8 @@ import {
   isAmbiguousCategoryCode,
   lookupBuiltInCategoryDefault,
   mapShopifyToJomashop,
+  charmPrice,
+  charmRetailWithMarginFloor,
   normalizeCategoryCode,
   normalizeI1CategorySchema,
   normalizeV1CategorySchema,
@@ -7516,6 +7518,29 @@ function runTagMappingTests() {
 }
 
 runTagMappingTests();
+
+function runCharmPricingTests() {
+  console.log("\n--- charm pricing (X9.99) ---");
+  assert(charmPrice(180.60) === 179.99, "180.60 -> 179.99");
+  assert(charmPrice(142.40) === 139.99, "142.40 -> 139.99");
+  assert(charmPrice(1330) === 1329.99, "1330 -> 1329.99");
+  assert(charmPrice(185) === 189.99, "185 -> 189.99 (rounds up to 190 bucket)");
+  assert(charmPrice(7.30) === 9.99, "7.30 -> 9.99 (nearest 10 bucket)");
+  assert(charmPrice(0) === null, "0 -> null");
+  // margin floor: charming down must not break 50% margin -> steps up
+  // retail 200, cost 95, payoutRatio 1 (price IS payout). 50% floor needs
+  // payout >= 190. charm(200)=199.99 -> payout 199.99 >= 190 OK.
+  assert(charmRetailWithMarginFloor({ retail: 200, cost: 95, payoutRatio: 1 }) === 199.99, "charm keeps margin when already safe");
+  // retail 200, cost 99 -> floor payout 198. charm(200)=199.99 OK.
+  assert(charmRetailWithMarginFloor({ retail: 200, cost: 99, payoutRatio: 1 }) === 199.99, "charm 199.99 clears 198 floor");
+  // retail 182, cost 90 -> charm(182)=179.99, floor payout 180. 179.99 < 180
+  // so bump up to 189.99.
+  assert(charmRetailWithMarginFloor({ retail: 182, cost: 90, payoutRatio: 1 }) === 189.99, "charm bumps up to keep 50% margin");
+  // no cost -> plain charm
+  assert(charmRetailWithMarginFloor({ retail: 182, cost: null, payoutRatio: 1 }) === 179.99, "no cost -> plain charm");
+}
+
+runCharmPricingTests();
 
 if (failures > 0) {
   console.error(`\n${failures} assertion(s) failed.`);

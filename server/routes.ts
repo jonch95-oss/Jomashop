@@ -30,6 +30,8 @@ import {
   mapShopifyToJomashop,
   buildJomashopProductPayload,
   buildI1ProductEnvelope,
+  charmPrice,
+  charmRetailWithMarginFloor,
   isSampleProduct,
   normalizeCategoryCode,
   normalizeI1CategorySchema,
@@ -3097,6 +3099,54 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       ({ payload, variant, missingRequired, missingTopLevel, pushDebug } =
         buildJomashopProductPayload(mapped, body.variantSku, overrides));
       liveSchemaSource = "fallback";
+    }
+
+    // ---- Charm pricing (X9.99) with 50% margin guard ----
+    // Beautify the outbound Jomashop price to an X9.99 ending. Because the
+    // portal "price" is the payout, charming DOWN could break margin, so we
+    // fetch the variant unit cost and bump the charmed price UP to the next
+    // X9.99 that preserves >=50% gross margin. MSRP/list is charmed
+    // cosmetically (no guard). Set CHARM_PRICING=off to disable.
+    if (process.env.CHARM_PRICING !== "off") {
+      try {
+        const rawPrice = typeof payload.price === "number" ? payload.price : Number(payload.price);
+        if (Number.isFinite(rawPrice) && rawPrice > 0) {
+          // Fetch this variant's unit cost for the margin guard.
+          let unitCost: number | null = null;
+          const vid =
+            (variant && body.product.variants?.find((v) => v.sku === variant.vendor_sku)?.id) ??
+            mapped.source.shopify_variant_ids?.[0];
+          if (vid !== undefined && vid !== null && String(vid).trim() !== "") {
+            const conn2 = getActiveShopifyConnection();
+            if (conn2) {
+              const q = `query C($id: ID!) { node(id: $id) { ... on ProductVariant { inventoryItem { unitCost { amount } } } } }`;
+              const resp = await fetch(`https://${conn2.shopDomain}/admin/api/2024-10/graphql.json`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": conn2.accessToken },
+                body: JSON.stringify({ query: q, variables: { id: `gid://shopify/ProductVariant/${String(vid).match(/(\d+)$/)?.[1] ?? vid}` } }),
+              });
+              const jb = (await resp.json()) as { data?: { node?: { inventoryItem?: { unitCost?: { amount?: string } | null } | null } } };
+              const amt = jb.data?.node?.inventoryItem?.unitCost?.amount;
+              if (amt) unitCost = Number(amt);
+            }
+          }
+          const charmed = charmRetailWithMarginFloor({
+            retail: rawPrice,
+            cost: unitCost,
+            payoutRatio: 1, // payload.price IS the payout
+            marginFloor: 0.5,
+          });
+          (payload as any).__originalPrice = rawPrice;
+          (payload as any).__unitCost = unitCost;
+          payload.price = charmed;
+          if (payload.msrp !== undefined && payload.msrp !== null && Number.isFinite(Number(payload.msrp))) {
+            payload.msrp = charmPrice(Number(payload.msrp)) ?? payload.msrp;
+          }
+          (pushDebug as any).charm = { from: rawPrice, to: charmed, unitCost, marginFloor: 0.5 };
+        }
+      } catch {
+        // non-fatal — push with the un-charmed price rather than fail
+      }
     }
 
     const startedAt = Date.now();

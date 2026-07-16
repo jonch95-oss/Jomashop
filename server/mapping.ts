@@ -666,6 +666,51 @@ export function normalizeCommercialDiscount(raw: string | number | null | undefi
   return Math.min(fraction, 1);
 }
 
+/**
+ * Charm-price a value to an attractive X9.99 ending: round to the NEAREST
+ * multiple of 10, then subtract one cent. Operator-confirmed 2026-07-16.
+ *   180.60 -> 179.99   142.40 -> 139.99   1330 -> 1329.99   185 -> 189.99
+ * Values under $10 round to the nearest whole dollar minus a cent (e.g.
+ * 7.30 -> 6.99) but never below 0.99.
+ */
+export function charmPrice(value: number | null | undefined): number | null {
+  if (value === null || value === undefined || !Number.isFinite(value) || value <= 0) return null;
+  const bucket = Math.max(1, Math.round(value / 10)) * 10;
+  return Math.max(0.99, Math.round((bucket - 0.01) * 100) / 100);
+}
+
+/**
+ * Charm-price the outbound Jomashop RETAIL price while preserving a minimum
+ * gross margin on the payout. `payout` is what LuxeSupply receives; `cost`
+ * is unit cost. The charmed retail must keep payout >= cost/(1-marginFloor)
+ * — i.e. margin >= marginFloor. Because payout scales with retail
+ * (payout = retail * payoutRatio), if the nearest X9.99 would drop margin
+ * below the floor we step UP to the next X9.99 (repeatedly) until the floor
+ * is met. Returns the charmed retail price (or the original when no charm
+ * value can satisfy the floor, which shouldn't happen for priced items).
+ */
+export function charmRetailWithMarginFloor(opts: {
+  retail: number;
+  cost: number | null;
+  payoutRatio: number; // payout / retail, e.g. (1 - discount)
+  marginFloor?: number; // default 0.5
+}): number {
+  const { retail } = opts;
+  const marginFloor = typeof opts.marginFloor === "number" ? opts.marginFloor : 0.5;
+  let candidate = charmPrice(retail) ?? retail;
+  // No cost or non-positive ratio → just return the charmed retail.
+  if (!opts.cost || opts.cost <= 0 || opts.payoutRatio <= 0) return candidate;
+  const minPayout = opts.cost / (1 - marginFloor); // payout for target margin
+  // Step up in $10 charm increments until payout clears the floor (cap the
+  // loop so a pathological cost can't spin forever).
+  let guard = 0;
+  while (candidate * opts.payoutRatio < minPayout && guard < 100000) {
+    candidate = Math.round((candidate + 10) * 100) / 100; // next X9.99
+    guard += 1;
+  }
+  return candidate;
+}
+
 /** Compute Jomashop price = shopify_price * (1 - discount), rounded to 2 decimals. */
 export function computeJomashopPrice(shopifyPrice: number | null, discountFraction: number): number | null {
   if (shopifyPrice === null || !Number.isFinite(shopifyPrice)) return null;
