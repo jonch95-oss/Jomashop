@@ -7460,6 +7460,63 @@ function runMeasurementSanitationTests() {
 
 runMeasurementSanitationTests();
 
+// ---------------------------------------------------------------------------
+// Tag-mapping fallback: operator-confirmed garment codes (LOAF/SHIR/HOOD/...)
+// fill required schema enums when metafields are missing, split SHRT by size
+// and DRES by title, and derive a code from titles for untagged products.
+// ---------------------------------------------------------------------------
+function runTagMappingTests() {
+  console.log("\n--- tag-mapping fallback (operator-confirmed codes) ---");
+  const apparelSchema = [
+    { field: "Apparel Type", required: true, type: "enum", options: ["Bottoms", "Dresses", "Outerwear", "Sets", "Swim", "Tops", "Undergarments"] },
+    { field: "Article", required: true, type: "enum", options: ["Active & Lounge", "Dress Shirts", "Hoodies & Sweatshirts", "Shirts & Blouses", "Shorts", "Summer Dresses", "Evening & Formal Gowns", "Cocktail & Party Dresses", "T-Shirts & Henleys"] },
+  ];
+  const base = (over: Record<string, unknown>) => ({
+    id: "1", title: "Palm Angels Mens Black Hoodie", body_html: "x", vendor: "Palm Angels",
+    product_type: "RTW", tags: ["HOOD", "MENS", "RTW"], images: [],
+    options: [{ name: "SIZE", values: ["M"] }],
+    variants: [{ id: "v1", sku: "ABC-M", price: "100", compare_at_price: null, inventory_quantity: 1, barcode: null, option1: "M", option2: null, option3: null }],
+    metafields: [],
+    ...over,
+  }) as any;
+
+  {
+    const m = mapShopifyToJomashop(base({}), apparelSchema as any);
+    assert(m.properties["Article"] === "Hoodies & Sweatshirts", "HOOD tag fills Article");
+    assert(m.properties["Apparel Type"] === "Tops", "HOOD tag fills Apparel Type");
+    assert(!m.missing_required.includes("Article"), "Article no longer missing");
+    assert(m.raw_category === "HOOD", "generic RTW raw_category replaced by tag code");
+  }
+  {
+    const m = mapShopifyToJomashop(base({ title: "Orlebar Brown Mens Blue Shrt", tags: ["SHRT"], options: [{ name: "SIZE", values: ["30"] }], variants: [{ id: "v1", sku: "X-30", price: "100", compare_at_price: null, inventory_quantity: 1, barcode: null, option1: "30", option2: null, option3: null }] }), apparelSchema as any);
+    assert(m.properties["Article"] === "Shorts", "SHRT + waist size 30 -> Shorts");
+  }
+  {
+    const m = mapShopifyToJomashop(base({ title: "Lacoste Mens Black Shrt", tags: ["SHRT"] }), apparelSchema as any);
+    assert(m.properties["Article"] === "Shirts & Blouses", "SHRT + letter size M -> Shirts & Blouses");
+  }
+  {
+    const m = mapShopifyToJomashop(base({ title: "Off White Womens Green Party Mini Dress", tags: ["DRES"] }), apparelSchema as any);
+    assert(m.properties["Article"] === "Cocktail & Party Dresses", "DRES + party title -> Cocktail & Party");
+  }
+  {
+    const m = mapShopifyToJomashop(base({ title: "Off White Womens Floral Dress", tags: ["DRES"] }), apparelSchema as any);
+    assert(m.properties["Article"] === "Summer Dresses", "DRES default -> Summer Dresses");
+  }
+  {
+    // Untagged (MEN-only): title keyword derivation
+    const m = mapShopifyToJomashop(base({ title: "Off White Graphic Tee White", tags: ["MEN"] }), apparelSchema as any);
+    assert(m.properties["Article"] === "T-Shirts & Henleys", "untagged product derives TSHR from title");
+  }
+  {
+    // Ignored/jewelry: no injection
+    const m = mapShopifyToJomashop(base({ title: "Palm Angel Mens Silver Chain", tags: ["NECK"] }), apparelSchema as any);
+    assert(m.missing_required.includes("Article"), "ignored tag leaves Article missing");
+  }
+}
+
+runTagMappingTests();
+
 if (failures > 0) {
   console.error(`\n${failures} assertion(s) failed.`);
   process.exit(1);

@@ -7,6 +7,7 @@ import {
   canonicalJomashopCategory,
   type SupportedCategory,
 } from "@shared/schema";
+import { resolveTagCategoryDefaults } from "./tag_mapping";
 import { resolveCategorySynonym } from "./synonym_resolver";
 
 export type ShopifyVariant = {
@@ -1901,7 +1902,24 @@ export function mapShopifyToJomashop(
     resolveEnumOverride?: EnumOverrideResolver;
   },
 ): MappedProduct {
-  const category = forcedCategory || inferCategory(product) || "Clothing";
+  // Operator-confirmed tag-code mapping (LOAF, SHIR, HOOD, ...) — used as a
+  // fallback for category and, later, for required schema enums that the
+  // wiped metafields can no longer supply.
+  const tmSizeIdx = (product.options || []).findIndex((o) => /size/i.test(o?.name || ""));
+  const tmFirstVar = product.variants?.[0];
+  const tmSizeTok =
+    tmSizeIdx >= 0
+      ? ((tmFirstVar?.[("option" + (tmSizeIdx + 1)) as "option1" | "option2" | "option3"] as string | null) ?? null)
+      : (tmFirstVar?.sku || "").includes("-")
+        ? (tmFirstVar?.sku || "").split("-").pop() ?? null
+        : null;
+  const tagDefaults = resolveTagCategoryDefaults({
+    tags: product.tags,
+    title: product.title,
+    sizeToken: tmSizeTok,
+  });
+
+  const category = forcedCategory || inferCategory(product) || tagDefaults?.category || "Clothing";
   // Display name for human-facing warnings/messages. Legacy alias categories
   // (e.g. "Clothing") are surfaced as their canonical Jomashop name
   // ("Apparel") so the warning list, inline repair panel, and product card
@@ -2167,6 +2185,49 @@ export function mapShopifyToJomashop(
     }
   }
 
+  // Tag-mapping fallback: operator-confirmed garment-code defaults fill any
+  // required schema enums still blank after metafield/option mapping
+  // (Article, Apparel Type, Shoe Category/Style, Accessory Type, ...).
+  if (tagDefaults) {
+    for (const prop of schemaProperties) {
+      if (!prop || typeof prop.field !== "string" || prop.field.trim() === "" || prop.field === "undefined") continue;
+      const dv =
+        tagDefaults.props[labelToken(prop.field)] ??
+        (prop.label ? tagDefaults.props[labelToken(prop.label)] : undefined);
+      if (!dv) continue;
+      const cur = properties[prop.field];
+      const isBlank = cur === null || cur === undefined || String(cur).trim() === "";
+      // Fuzzy synonym auto-resolutions are guesses; the tag map is operator-
+      // confirmed truth and takes precedence over them. Explicit metafield /
+      // option values (not present in autoResolvedEnums) are never touched.
+      const autoIdx = autoResolvedEnums.findIndex((a) => a.field === prop.field);
+      if (!isBlank && autoIdx < 0) continue;
+      if (!isBlank && autoIdx >= 0 && String(cur) === dv) continue;
+      // Only inject values present in the accepted option list (when known).
+      if (Array.isArray(prop.options) && prop.options.length > 0 && !prop.options.some((o) => labelToken(o) === labelToken(dv))) {
+        continue;
+      }
+      properties[prop.field] = dv;
+      const entry = {
+        field: prop.field,
+        chosen: dv,
+        sourceCode: tagDefaults.code,
+        reason: "operator-confirmed tag mapping",
+      };
+      if (autoIdx >= 0) {
+        autoResolvedEnums[autoIdx] = entry;
+        const awi = warnings.findIndex((w) => w.startsWith("Auto-resolved") && w.includes('"' + prop.field + '"'));
+        if (awi >= 0) warnings.splice(awi, 1);
+      } else {
+        autoResolvedEnums.push(entry);
+      }
+      const mi = missingRequiredProps.indexOf(prop.field);
+      if (mi >= 0) missingRequiredProps.splice(mi, 1);
+      const wi = warnings.findIndex((w) => w.startsWith("Missing required") && w.includes('"' + prop.field + '"'));
+      if (wi >= 0) warnings.splice(wi, 1);
+    }
+  }
+
   // Commercial discount: Jomashop price = Shopify price * (1 - discount).
   const discountRaw = readCommercialDiscountRaw(product);
   const commercialDiscount = normalizeCommercialDiscount(discountRaw);
@@ -2211,10 +2272,19 @@ export function mapShopifyToJomashop(
   const shopifyPrice = parsePrice(firstVariant?.price);
   const msrpResolution = resolveMsrp(product, shopifyPrice);
 
-  const rawCategory =
+  let rawCategory =
     readMetafieldAny(product, ["category", "Category", "ff_category"]) ||
     product.product_type ||
     null;
+  // When the category code is missing or generic (RTW / Clothing / Shoes …)
+  // and a confirmed garment tag exists, surface the tag code instead — the
+  // enum auto-resolution and the operator UI both key off this value.
+  {
+    const GENERIC_CODES = new Set(["rtw", "clothing", "apparel", "shoes", "footwear", "handbags", "accessories", "eyewear", "clth"]);
+    if (tagDefaults && (!rawCategory || GENERIC_CODES.has(String(rawCategory).toLowerCase().trim()))) {
+      rawCategory = tagDefaults.code;
+    }
+  }
 
   // Locate the brand for top-level use. When the schema labels are live
   // (e.g. "Brand", "Manufacturer"), properties.brand won't exist — search
