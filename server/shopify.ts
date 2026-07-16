@@ -599,3 +599,74 @@ export async function fetchShopifyProductImages(
     return null;
   }
 }
+
+/**
+ * Fetch a single product's tags, vendor, productType, and jomashop.*
+ * metafields by numeric id. Used by the push flow so server-side re-mapping
+ * sees the REAL product tags (the compact cache row / client payload strips
+ * them) — tag-based category/enum resolution depends on them.
+ */
+export async function fetchShopifyProductContext(
+  productId: string | number,
+): Promise<{
+  tags: string[];
+  vendor: string | null;
+  productType: string | null;
+  metafields: Array<{ namespace: string; key: string; value: string; label: string }>;
+} | null> {
+  const conn = getActiveShopifyConnection();
+  if (!conn) return null;
+  const numericId = String(productId).match(/(\d+)$/)?.[1] ?? String(productId);
+  const gid = `gid://shopify/Product/${numericId}`;
+  const endpoint = `https://${conn.shopDomain}/admin/api/${ADMIN_API_VERSION}/graphql.json`;
+  const query = `
+    query ProductContext($id: ID!) {
+      product(id: $id) {
+        tags
+        vendor
+        productType
+        metafields(first: 100) {
+          edges { node { namespace key value type definition { name } } }
+        }
+      }
+    }
+  `;
+  try {
+    const res = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": conn.accessToken,
+      },
+      body: JSON.stringify({ query, variables: { id: gid } }),
+    });
+    if (!res.ok) return null;
+    const body = (await res.json()) as {
+      data?: {
+        product?: {
+          tags?: string[];
+          vendor?: string | null;
+          productType?: string | null;
+          metafields?: { edges: Array<{ node: { namespace: string; key: string; value: string; definition?: { name: string | null } | null } }> };
+        } | null;
+      };
+      errors?: Array<{ message: string }>;
+    };
+    if (body.errors && body.errors.length > 0) return null;
+    const p = body.data?.product;
+    if (!p) return null;
+    return {
+      tags: Array.isArray(p.tags) ? p.tags : [],
+      vendor: p.vendor ?? null,
+      productType: p.productType ?? null,
+      metafields: (p.metafields?.edges ?? []).map((e) => ({
+        namespace: e.node.namespace,
+        key: e.node.key,
+        value: e.node.value,
+        label: e.node.definition?.name || e.node.key,
+      })),
+    };
+  } catch {
+    return null;
+  }
+}

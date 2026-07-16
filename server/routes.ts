@@ -41,6 +41,7 @@ import {
 import {
   encryptToken,
   fetchShopifyProductImages,
+  fetchShopifyProductContext,
   fetchShopifyProducts,
   streamShopifyProducts,
   getActiveShopifyConnection,
@@ -2753,6 +2754,35 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         }
       } catch (err) {
         imagesFetchError = (err as Error).message;
+      }
+    }
+
+    // Hydrate the REAL product tags + jomashop.* metafields before mapping.
+    // The compact cache row / client payload strips tags, but tag-based
+    // category & required-enum resolution (Article, Apparel Type, Shoe
+    // Style, ...) depends on them. Also merge the app-written jomashop.*
+    // metafields so previously applied color/size/discount values are seen.
+    if (productIdForImages !== undefined && productIdForImages !== null && String(productIdForImages).trim() !== "") {
+      try {
+        const ctx = await fetchShopifyProductContext(String(productIdForImages));
+        if (ctx) {
+          const existingMf = Array.isArray(body.product!.metafields) ? body.product!.metafields : [];
+          const seen = new Set(existingMf.map((m: any) => `${m?.namespace}.${m?.key}`));
+          const mergedMf = [...existingMf];
+          for (const m of ctx.metafields) {
+            const k = `${m.namespace}.${m.key}`;
+            if (!seen.has(k)) { seen.add(k); mergedMf.push({ namespace: m.namespace, key: m.key, value: m.value, label: m.label } as any); }
+          }
+          body.product = {
+            ...body.product!,
+            tags: ctx.tags.length > 0 ? ctx.tags : body.product!.tags,
+            vendor: body.product!.vendor || ctx.vendor || "",
+            product_type: body.product!.product_type || ctx.productType || "",
+            metafields: mergedMf,
+          };
+        }
+      } catch {
+        // best-effort — fall through with the client-supplied payload
       }
     }
 
