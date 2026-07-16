@@ -3346,6 +3346,88 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const errBody = productResp.errorData as
         | { error?: string; errors?: string[]; invalid_params?: string[] }
         | undefined;
+
+      // "Sku has already been taken" (and equivalents) means the product is
+      // ALREADY live on Jomashop from a previous push — not a failure. Treat
+      // it as a successful/already-pushed state so re-runs don't mark live
+      // products as "rejected" and the counts stay honest.
+      const alreadyErr = [
+        errBody?.error,
+        ...(errBody?.errors ?? []),
+        ...(errBody?.invalid_params ?? []),
+      ]
+        .filter(Boolean)
+        .map((s) => String(s).toLowerCase())
+        .join(" ");
+      const skuAlreadyExists =
+        /already been taken|has already been taken|already exists|duplicate/.test(alreadyErr) &&
+        /sku/.test(alreadyErr);
+      if (skuAlreadyExists && mapped.source.shopify_product_id) {
+        const shopDomainForExisting =
+          getActiveShopifyConnection()?.shopDomain ??
+          storage.listStores().find((s) => s.oauthStatus === "connected")?.shopDomain ??
+          "unknown";
+        const variantIdExisting =
+          (variant && body.product.variants?.find((v) => v.sku === variant.vendor_sku)?.id) ??
+          mapped.source.shopify_variant_ids[0];
+        try {
+          storage.upsertPushStatus({
+            shopDomain: shopDomainForExisting,
+            shopifyProductId: String(mapped.source.shopify_product_id),
+            shopifyVariantId: String(variantIdExisting ?? mapped.source.shopify_variant_ids[0] ?? ""),
+            shopifySku: String(variant?.vendor_sku ?? mapped.vendor_sku),
+            jomashopSku: String(payload.vendor_sku ?? mapped.vendor_sku),
+            state: "pushed",
+            lastStatus: productResp.status,
+            lastError: null,
+            lastPayloadJson: JSON.stringify({
+              category: mapped.category,
+              outbound_category: payload.category ?? null,
+              outbound_brand: payload.brand ?? null,
+              price: mapped.jomashop_price,
+              msrp: mapped.msrp,
+              variants: mapped.variants,
+            }),
+            lastInvalidParams: null,
+            lastRejectedCategory: null,
+            lastRejectedBrand: null,
+            lastPushedAt: Date.now(),
+            updatedAt: Date.now(),
+          });
+        } catch {
+          // non-fatal
+        }
+        storage.updateSyncJob(job.id, {
+          status: "success",
+          finishedAt: Date.now(),
+          successItems: 1,
+          summary: `Already on Jomashop (SKU exists) via ${pushPath}`,
+        });
+        // Optionally still push inventory for the existing SKU.
+        let inventoryResultExisting: unknown = null;
+        if (body.pushInventory) {
+          try {
+            inventoryResultExisting = await pushInventoryUpdate({
+              shopifySku: String(variant?.vendor_sku ?? mapped.vendor_sku),
+              quantity: variant?.quantity ?? null,
+              topic: "push-existing",
+              shopDomain: shopDomainForExisting,
+            });
+          } catch {
+            /* non-fatal */
+          }
+        }
+        return res.json({
+          ok: true,
+          alreadyExists: true,
+          note: "Product already exists on Jomashop (SKU taken) — marked as pushed.",
+          stage: "product_post",
+          status: productResp.status,
+          inventory: inventoryResultExisting,
+          sku: String(variant?.vendor_sku ?? mapped.vendor_sku),
+        });
+      }
+
       storage.updateSyncJob(job.id, {
         status: "failed",
         finishedAt: Date.now(),
