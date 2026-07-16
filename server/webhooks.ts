@@ -18,7 +18,8 @@ import crypto from "node:crypto";
 import type { Express, Request, Response } from "express";
 import { storage } from "./storage";
 import { jomashopConfigured, jomashopRequest } from "./jomashop";
-import { getActiveShopifyConnection } from "./shopify";
+import { getActiveShopifyConnection, fetchVariantUnitCost } from "./shopify";
+import { charmRetailWithMarginFloor } from "./mapping";
 
 type RawBodyRequest = Request & { rawBody?: Buffer | string | unknown };
 
@@ -193,8 +194,12 @@ export async function pushInventoryUpdate(opts: {
   quantity: number | null;
   topic: string;
   shopDomain: string | null;
+  /** New Shopify retail price from a products/update webhook. When set, the
+   *  outbound Jomashop price is recomputed from it (stored discount ratio +
+   *  charm + 50% margin guard) so price changes propagate automatically. */
+  newShopifyPrice?: number | null;
 }): Promise<{ status: "applied" | "skipped" | "rejected"; message: string; details?: unknown }> {
-  const { shopifySku, quantity, topic, shopDomain } = opts;
+  const { shopifySku, quantity, topic, shopDomain, newShopifyPrice } = opts;
   if (!shopifySku) {
     return { status: "skipped", message: "Webhook had no SKU to map" };
   }
@@ -231,11 +236,33 @@ export async function pushInventoryUpdate(opts: {
       details: { shopifyVisibility: visibility },
     };
   }
-  const price =
+  let price =
     variantSnapshot?.jomashop_price ??
     variantSnapshot?.price ??
     stored?.price ??
     null;
+  // Live price change from products/update: recompute the outbound Jomashop
+  // price using the stored discount ratio, then charm + 50% margin guard.
+  if (typeof newShopifyPrice === "number" && Number.isFinite(newShopifyPrice) && newShopifyPrice > 0) {
+    const priorShopify =
+      (typeof variantSnapshot?.price === "number" ? variantSnapshot.price : null) ??
+      (typeof stored?.price === "number" ? stored.price : null);
+    const priorPayout =
+      (typeof variantSnapshot?.jomashop_price === "number" ? variantSnapshot.jomashop_price : null) ??
+      (typeof stored?.price === "number" ? stored.price : null);
+    let ratio = 1;
+    if (priorShopify && priorShopify > 0 && priorPayout && priorPayout > 0) {
+      ratio = Math.min(1, Math.max(0, priorPayout / priorShopify));
+    }
+    const rawPayout = newShopifyPrice * ratio;
+    let cost: number | null = null;
+    try {
+      if (lookup.shopifyVariantId) cost = await fetchVariantUnitCost(lookup.shopifyVariantId);
+    } catch {
+      /* best-effort */
+    }
+    price = charmRetailWithMarginFloor({ retail: rawPayout, cost, payoutRatio: 1, marginFloor: 0.5 });
+  }
   const status = inventoryStatusFor(qty);
   const body: Record<string, unknown> = { status, quantity: qty };
   if (price !== null && price !== undefined && Number.isFinite(Number(price))) {
@@ -440,11 +467,13 @@ export function registerWebhookRoutes(app: Express): void {
     for (const v of variants) {
       const sku = (v.sku ?? "").trim();
       if (!sku) continue;
+      const parsedPrice = v.price !== undefined && v.price !== null ? parseFloat(String(v.price)) : NaN;
       const r = await pushInventoryUpdate({
         shopifySku: sku,
         quantity: v.inventory_quantity ?? null,
         topic,
         shopDomain,
+        newShopifyPrice: Number.isFinite(parsedPrice) ? parsedPrice : null,
       });
       results.push({ sku, status: r.status, message: r.message });
     }

@@ -44,6 +44,7 @@ import {
   encryptToken,
   fetchShopifyProductImages,
   fetchShopifyProductContext,
+  fetchVariantUnitCost,
   fetchShopifyProducts,
   streamShopifyProducts,
   getActiveShopifyConnection,
@@ -924,6 +925,191 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       },
       below,
     });
+  });
+
+  // ---------- Reprice below-margin products to a target margin ----------
+  // POST /api/products/reprice-to-margin
+  //   { threshold?, confirm, setRetail?: [{ shopify_product_id, price }] }
+  //
+  // For each pushed product below the margin threshold, computes the highest
+  // commercial_discount that still yields >= threshold margin (payout =
+  // price*(1-discount) >= cost/(1-threshold)) and writes it to the Shopify
+  // jomashop.commercial_discount metafield. `setRetail` first forces the
+  // Shopify variant price (and compareAtPrice) for the given products — used
+  // to fix data-error items (e.g. the two $1 dresses -> $5000). Products
+  // whose retail is still below cost/(1-threshold) at 0% discount are
+  // reported as `unfixable` (raise retail further). Read+write; requires
+  // confirm:true. Does NOT re-push — call the bulk push afterward.
+  app.post("/api/products/reprice-to-margin", async (req, res) => {
+    if (req.body?.confirm !== true) {
+      return res.status(400).json({ ok: false, error: "Set confirm:true to write discounts to Shopify." });
+    }
+    const threshold =
+      typeof req.body?.threshold === "number" && req.body.threshold > 0 && req.body.threshold < 1
+        ? req.body.threshold
+        : 0.5;
+    const setRetail: Array<{ shopify_product_id: string; price: number }> = Array.isArray(req.body?.setRetail)
+      ? req.body.setRetail
+          .map((r: any) => ({ shopify_product_id: String(r?.shopify_product_id ?? ""), price: Number(r?.price) }))
+          .filter((r: any) => r.shopify_product_id && Number.isFinite(r.price) && r.price > 0)
+      : [];
+    const conn = getActiveShopifyConnection();
+    if (!conn) return res.status(503).json({ ok: false, error: "No connected Shopify store." });
+    const cache = storage.getProductCache(conn.shopDomain);
+    if (!cache) return res.status(409).json({ ok: false, error: "No product cache. Refresh first." });
+    let payload: any;
+    try { payload = JSON.parse(cache.payloadJson); } catch { return res.status(500).json({ ok: false, error: "Corrupt cache." }); }
+    const mapped: any[] = Array.isArray(payload?.mapped) ? payload.mapped : [];
+    const byId = new Map(mapped.map((m) => [String(m?.source?.shopify_product_id), m]));
+
+    const gql = async (query: string, variables: Record<string, unknown>) => {
+      const r = await fetch(`https://${conn.shopDomain}/admin/api/2024-10/graphql.json`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": conn.accessToken },
+        body: JSON.stringify({ query, variables }),
+      });
+      return (await r.json()) as any;
+    };
+
+    const retailOverride = new Map<string, number>();
+    const retailResults: Array<{ id: string; ok: boolean; price: number; error?: string }> = [];
+    for (const r of setRetail) {
+      const m = byId.get(r.shopify_product_id);
+      const variantIds: string[] = (m?.source?.shopify_variant_ids ?? []).map((v: any) => String(v)).filter(Boolean);
+      if (variantIds.length === 0) { retailResults.push({ id: r.shopify_product_id, ok: false, price: r.price, error: "no variant ids in cache" }); continue; }
+      try {
+        const variants = variantIds.map((vid) => ({
+          id: `gid://shopify/ProductVariant/${vid.match(/(\d+)$/)?.[1] ?? vid}`,
+          price: r.price.toFixed(2),
+          compareAtPrice: r.price.toFixed(2),
+        }));
+        const q = `mutation U($pid: ID!, $v: [ProductVariantsBulkInput!]!) { productVariantsBulkUpdate(productId: $pid, variants: $v) { userErrors { message } } }`;
+        const j = await gql(q, { pid: `gid://shopify/Product/${r.shopify_product_id}`, v: variants });
+        const ue = j?.data?.productVariantsBulkUpdate?.userErrors ?? [];
+        if (j?.errors?.length || ue.length) { retailResults.push({ id: r.shopify_product_id, ok: false, price: r.price, error: [...(j.errors ?? []), ...ue].map((e: any) => e.message).join("; ") }); }
+        else { retailResults.push({ id: r.shopify_product_id, ok: true, price: r.price }); retailOverride.set(r.shopify_product_id, r.price); }
+      } catch (err) { retailResults.push({ id: r.shopify_product_id, ok: false, price: r.price, error: (err as Error).message }); }
+    }
+
+    // Evaluate every pushed product; collect those below threshold.
+    const targets = mapped.filter((m) => m?.push_state === "pushed" || retailOverride.has(String(m?.source?.shopify_product_id)));
+    const repriced: Array<Record<string, unknown>> = [];
+    const unfixable: Array<Record<string, unknown>> = [];
+    let metafieldWrites = 0;
+    const metaBatch: Array<{ ownerId: string; namespace: string; key: string; type: string; value: string }> = [];
+    const decideList: Array<{ m: any; retail: number; cost: number; discount: number }> = [];
+
+    // Fetch costs in batches.
+    const ids = Array.from(new Set(targets.map((m) => String(m?.source?.shopify_variant_ids?.[0] ?? "")).filter(Boolean)));
+    const costById = new Map<string, number>();
+    for (let i = 0; i < ids.length; i += 200) {
+      const gids = ids.slice(i, i + 200).map((n) => `gid://shopify/ProductVariant/${n.match(/(\d+)$/)?.[1] ?? n}`);
+      const j = await gql(`query C($ids:[ID!]!){nodes(ids:$ids){... on ProductVariant{id inventoryItem{unitCost{amount}}}}}`, { ids: gids });
+      for (const n of j?.data?.nodes ?? []) { const vid = n?.id?.match(/(\d+)$/)?.[1]; const amt = n?.inventoryItem?.unitCost?.amount; if (vid && amt) costById.set(vid, Number(amt)); }
+    }
+
+    for (const m of targets) {
+      const pid = String(m?.source?.shopify_product_id ?? "");
+      const vid = String(m?.source?.shopify_variant_ids?.[0] ?? "").match(/(\d+)$/)?.[1] ?? "";
+      const cost = costById.get(vid);
+      if (!cost || cost <= 0) continue;
+      const retail = retailOverride.get(pid) ?? (typeof m?.price === "number" ? m.price : (typeof m?.variants?.[0]?.price === "number" ? m.variants[0].price : null));
+      if (!retail || retail <= 0) continue;
+      const curDiscount = typeof m?.commercial_discount === "number" ? m.commercial_discount : 0;
+      const curPayout = retail * (1 - curDiscount);
+      const curMargin = curPayout > 0 ? (curPayout - cost) / curPayout : -1;
+      const forced = retailOverride.has(pid);
+      if (curMargin >= threshold && !forced) continue; // already fine
+      // Max discount keeping margin >= threshold: payout >= cost/(1-threshold)
+      const minPayout = cost / (1 - threshold);
+      if (retail < minPayout) {
+        // Even 0% discount can't reach target — retail too low.
+        unfixable.push({ shopify_product_id: pid, title: m?.name, brand: m?.brand, retail, unit_cost: Math.round(cost * 100) / 100, needed_retail: Math.round(minPayout * 100) / 100 });
+        // Still set discount to 0 so we don't sell below cost with a discount.
+        metaBatch.push({ ownerId: `gid://shopify/Product/${pid}`, namespace: "jomashop", key: "commercial_discount", type: "single_line_text_field", value: "0" });
+        continue;
+      }
+      const discountPct = Math.max(0, Math.floor((1 - minPayout / retail) * 100));
+      metaBatch.push({ ownerId: `gid://shopify/Product/${pid}`, namespace: "jomashop", key: "commercial_discount", type: "single_line_text_field", value: String(discountPct) });
+      repriced.push({ shopify_product_id: pid, title: m?.name, brand: m?.brand, retail, unit_cost: Math.round(cost * 100) / 100, old_discount_pct: Math.round(curDiscount * 100), new_discount_pct: discountPct, new_payout: Math.round(retail * (1 - discountPct / 100) * 100) / 100 });
+      void decideList;
+    }
+
+    // Write metafields in batches of 25 (Shopify metafieldsSet cap).
+    for (let i = 0; i < metaBatch.length; i += 25) {
+      const chunk = metaBatch.slice(i, i + 25);
+      const j = await gql(`mutation S($m:[MetafieldsSetInput!]!){metafieldsSet(metafields:$m){userErrors{message}}}`, { m: chunk });
+      const ue = j?.data?.metafieldsSet?.userErrors ?? [];
+      if (!(j?.errors?.length) && ue.length === 0) metafieldWrites += chunk.length;
+    }
+
+    storage.appendLog({
+      level: "info",
+      message: `Reprice-to-margin: ${repriced.length} repriced, ${unfixable.length} need higher retail, ${retailResults.filter((r) => r.ok).length} retail sets`,
+      detailsJson: JSON.stringify({ threshold, sample: repriced.slice(0, 20) }),
+      createdAt: Date.now(),
+    });
+    res.json({ ok: true, threshold: Math.round(threshold * 100), counts: { repriced: repriced.length, unfixable: unfixable.length, metafieldWrites, retailSet: retailResults.filter((r) => r.ok).length }, retailResults, repriced: repriced.slice(0, 500), unfixable, note: "Discounts written to Shopify jomashop.commercial_discount. Refresh from Shopify, then re-push to apply on Jomashop." });
+  });
+
+  // ---------- Bulk zero-out inventory on Jomashop ----------
+  // POST /api/jomashop/bulk-zero-inventory
+  //   { brand?, styleTag?, dryRun?, confirm? }
+  //
+  // Sets quantity 0 + status out_of_stock on Jomashop for every PUSHED
+  // product matching the brand and/or style tag. Dry-run by default; a live
+  // run requires confirm:true AND dryRun:false. Use to quickly pull a brand
+  // or style from Jomashop without touching Shopify stock.
+  app.post("/api/jomashop/bulk-zero-inventory", async (req, res) => {
+    const brand = typeof req.body?.brand === "string" ? req.body.brand.trim().toLowerCase() : "";
+    const styleTag = typeof req.body?.styleTag === "string" ? req.body.styleTag.trim().toUpperCase() : "";
+    const dryRun = req.body?.dryRun !== false || req.body?.confirm !== true;
+    if (!brand && !styleTag) {
+      return res.status(400).json({ ok: false, error: "Provide a brand and/or styleTag to target." });
+    }
+    if (!jomashopConfigured()) {
+      return res.status(503).json({ ok: false, error: "Jomashop credentials not configured." });
+    }
+    const conn = getActiveShopifyConnection();
+    const cache = conn ? storage.getProductCache(conn.shopDomain) : undefined;
+    let mapped: any[] = [];
+    if (cache) { try { mapped = JSON.parse(cache.payloadJson)?.mapped ?? []; } catch { /* ignore */ } }
+    const byId = new Map(mapped.map((m) => [String(m?.source?.shopify_product_id), m]));
+
+    // Candidate pushed rows, filtered by brand (mapped.brand) and/or style
+    // (raw_category tag code, matched case-insensitively).
+    const pushed = storage.listPushStatuses().filter((p) => p.state === "pushed");
+    const targets: Array<{ sku: string; jomashopSku: string | null; title: string; brand: string }> = [];
+    for (const p of pushed) {
+      const m = byId.get(String(p.shopifyProductId));
+      const b = String(m?.brand ?? "").toLowerCase();
+      const code = String(m?.raw_category ?? "").toUpperCase();
+      if (brand && !b.includes(brand)) continue;
+      if (styleTag && code !== styleTag && !code.includes(styleTag)) continue;
+      targets.push({ sku: p.shopifySku, jomashopSku: p.jomashopSku, title: String(m?.name ?? ""), brand: String(m?.brand ?? "") });
+    }
+
+    if (dryRun) {
+      return res.json({ ok: true, dryRun: true, matched: targets.length, sample: targets.slice(0, 30), note: "Dry run — nothing changed. POST with { confirm:true, dryRun:false } to zero these on Jomashop." });
+    }
+
+    const MAX = 1000;
+    const slice = targets.slice(0, MAX);
+    let applied = 0; let failed = 0; const errors: Array<{ sku: string; error: string }> = [];
+    for (const t of slice) {
+      const target = t.jomashopSku || t.sku;
+      try {
+        const r = await jomashopRequest({ method: "PUT", path: `/v1/inventory/${encodeURIComponent(target)}`, body: { status: "out_of_stock", quantity: 0 } });
+        if (r.ok) applied += 1; else { failed += 1; errors.push({ sku: target, error: r.error ?? `HTTP ${r.status}` }); }
+      } catch (err) { failed += 1; errors.push({ sku: target, error: (err as Error).message }); }
+    }
+    storage.appendLog({
+      level: failed > 0 ? "warn" : "info",
+      message: `Bulk zero-out (brand="${brand || "*"}", style="${styleTag || "*"}"): ${applied} zeroed / ${failed} failed of ${targets.length} matched`,
+      detailsJson: JSON.stringify({ errors: errors.slice(0, 20) }),
+      createdAt: Date.now(),
+    });
+    res.json({ ok: failed === 0, matched: targets.length, applied, failed, truncated: targets.length > MAX, errors: errors.slice(0, 20) });
   });
 
   // ---------- Description backfill ----------

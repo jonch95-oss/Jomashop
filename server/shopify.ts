@@ -670,3 +670,26 @@ export async function fetchShopifyProductContext(
     return null;
   }
 }
+
+/** Fetch a single variant's unit cost (inventoryItem.unitCost.amount). */
+export async function fetchVariantUnitCost(variantId: string | number): Promise<number | null> {
+  const conn = getActiveShopifyConnection();
+  if (!conn) return null;
+  const numericId = String(variantId).match(/(\d+)$/)?.[1] ?? String(variantId);
+  const gid = `gid://shopify/ProductVariant/${numericId}`;
+  const endpoint = `https://${conn.shopDomain}/admin/api/${ADMIN_API_VERSION}/graphql.json`;
+  const query = `query C($id: ID!) { node(id: $id) { ... on ProductVariant { inventoryItem { unitCost { amount } } } } }`;
+  try {
+    const res = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": conn.accessToken },
+      body: JSON.stringify({ query, variables: { id: gid } }),
+    });
+    if (!res.ok) return null;
+    const body = (await res.json()) as { data?: { node?: { inventoryItem?: { unitCost?: { amount?: string } | null } | null } } };
+    const amt = body.data?.node?.inventoryItem?.unitCost?.amount;
+    return amt ? Number(amt) : null;
+  } catch {
+    return null;
+  }
+}
