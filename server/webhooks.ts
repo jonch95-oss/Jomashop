@@ -198,8 +198,12 @@ export async function pushInventoryUpdate(opts: {
    *  outbound Jomashop price is recomputed from it (stored discount ratio +
    *  charm + 50% margin guard) so price changes propagate automatically. */
   newShopifyPrice?: number | null;
+  /** Explicit already-computed outbound Jomashop price (e.g. from a re-push
+   *  of an existing product). When set it is sent as-is, overriding the
+   *  stored snapshot and any newShopifyPrice recompute. */
+  outboundPrice?: number | null;
 }): Promise<{ status: "applied" | "skipped" | "rejected"; message: string; details?: unknown }> {
-  const { shopifySku, quantity, topic, shopDomain, newShopifyPrice } = opts;
+  const { shopifySku, quantity, topic, shopDomain, newShopifyPrice, outboundPrice } = opts;
   if (!shopifySku) {
     return { status: "skipped", message: "Webhook had no SKU to map" };
   }
@@ -262,6 +266,9 @@ export async function pushInventoryUpdate(opts: {
       /* best-effort */
     }
     price = charmRetailWithMarginFloor({ retail: rawPayout, cost, payoutRatio: 1, marginFloor: 0.5 });
+  }
+  if (typeof outboundPrice === "number" && Number.isFinite(outboundPrice) && outboundPrice > 0) {
+    price = outboundPrice;
   }
   const status = inventoryStatusFor(qty);
   const body: Record<string, unknown> = { status, quantity: qty };
