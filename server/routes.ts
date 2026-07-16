@@ -802,6 +802,128 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  // ---------- Margin audit ----------
+  // POST /api/products/margin-audit { threshold?, scope?, limit? }
+  //   threshold: minimum gross margin on the Jomashop payout (default 0.50)
+  //   scope: "pushed" (default) | "all"
+  //
+  // For each in-scope product, compares the Jomashop payout price
+  // (shopify_price * (1 - commercial_discount)) against the variant's
+  // Shopify unit cost (inventoryItem.unitCost). Margin = (payout - cost)/
+  // payout. Returns every product whose margin is below the threshold,
+  // with the discount % that WOULD hit the threshold, so the operator can
+  // reprice. Read-only — writes nothing.
+  app.post("/api/products/margin-audit", async (req, res) => {
+    const threshold =
+      typeof req.body?.threshold === "number" && req.body.threshold > 0 && req.body.threshold < 1
+        ? req.body.threshold
+        : 0.5;
+    const scope = req.body?.scope === "all" ? "all" : "pushed";
+    const conn = getActiveShopifyConnection();
+    if (!conn) return res.status(503).json({ ok: false, error: "No connected Shopify store." });
+    const cache = storage.getProductCache(conn.shopDomain);
+    if (!cache) return res.status(409).json({ ok: false, error: "No product cache. Refresh first." });
+    let payload: any;
+    try {
+      payload = JSON.parse(cache.payloadJson);
+    } catch {
+      return res.status(500).json({ ok: false, error: "Corrupt product cache." });
+    }
+    const mapped: any[] = Array.isArray(payload?.mapped) ? payload.mapped : [];
+    const rows = mapped.filter((m) => (scope === "all" ? true : m?.push_state === "pushed"));
+
+    // Collect the representative variant id per product (first variant).
+    type Row = { m: any; variantId: string | null; payout: number | null };
+    const work: Row[] = rows.map((m) => {
+      const vid = m?.source?.shopify_variant_ids?.[0];
+      const payout =
+        typeof m?.variants?.[0]?.jomashop_price === "number"
+          ? m.variants[0].jomashop_price
+          : typeof m?.jomashop_price === "number"
+            ? m.jomashop_price
+            : null;
+      return { m, variantId: vid ? String(vid) : null, payout };
+    });
+
+    // Batch-fetch unit costs.
+    const idList = Array.from(new Set(work.map((w) => w.variantId).filter((v): v is string => Boolean(v))));
+    const costById = new Map<string, number>();
+    for (let i = 0; i < idList.length; i += 200) {
+      const gids = idList.slice(i, i + 200).map((n) => `gid://shopify/ProductVariant/${n}`);
+      const q = `query C($ids: [ID!]!) { nodes(ids: $ids) { ... on ProductVariant { id inventoryItem { unitCost { amount } } } } }`;
+      try {
+        const resp = await fetch(`https://${conn.shopDomain}/admin/api/2024-10/graphql.json`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": conn.accessToken },
+          body: JSON.stringify({ query: q, variables: { ids: gids } }),
+        });
+        const body = (await resp.json()) as { data?: { nodes?: Array<{ id?: string; inventoryItem?: { unitCost?: { amount?: string } | null } | null } | null> } };
+        for (const n of body.data?.nodes ?? []) {
+          const id = n?.id?.match(/(\d+)$/)?.[1];
+          const amt = n?.inventoryItem?.unitCost?.amount;
+          if (id && amt) costById.set(id, Number(amt));
+        }
+      } catch {
+        /* continue with what we have */
+      }
+    }
+
+    const below: Array<Record<string, unknown>> = [];
+    let evaluated = 0;
+    let missingCost = 0;
+    let negative = 0;
+    for (const w of work) {
+      const cost = w.variantId ? costById.get(w.variantId) : undefined;
+      if (!cost || cost <= 0) {
+        missingCost += 1;
+        continue;
+      }
+      if (w.payout === null || w.payout <= 0) {
+        missingCost += 1;
+        continue;
+      }
+      evaluated += 1;
+      const margin = (w.payout - cost) / w.payout;
+      if (margin < threshold) {
+        if (margin < 0) negative += 1;
+        // Payout needed for the target margin, and the discount that yields it.
+        const payoutForTarget = cost / (1 - threshold); // margin = threshold
+        const shopifyPrice =
+          typeof w.m?.price === "number" ? w.m.price : typeof w.m?.variants?.[0]?.price === "number" ? w.m.variants[0].price : null;
+        const discountForTarget =
+          shopifyPrice && shopifyPrice > 0 ? Math.max(0, Math.round((1 - payoutForTarget / shopifyPrice) * 100)) : null;
+        below.push({
+          shopify_product_id: w.m?.source?.shopify_product_id ?? null,
+          sku: w.m?.vendor_sku ?? w.m?.sku ?? null,
+          title: w.m?.name ?? "",
+          brand: w.m?.brand ?? "",
+          category: w.m?.category ?? "",
+          shopify_price: shopifyPrice,
+          unit_cost: Math.round(cost * 100) / 100,
+          current_discount_pct: typeof w.m?.commercial_discount === "number" ? Math.round(w.m.commercial_discount * 100) : null,
+          jomashop_payout: Math.round(w.payout * 100) / 100,
+          margin_pct: Math.round(margin * 1000) / 10,
+          target_payout: Math.round(payoutForTarget * 100) / 100,
+          max_discount_pct_for_target: discountForTarget,
+        });
+      }
+    }
+    below.sort((a, b) => (a.margin_pct as number) - (b.margin_pct as number));
+    res.json({
+      ok: true,
+      threshold: Math.round(threshold * 100),
+      scope,
+      counts: {
+        inScope: rows.length,
+        evaluated,
+        belowThreshold: below.length,
+        negativeMargin: negative,
+        skippedNoCostOrPrice: missingCost,
+      },
+      below,
+    });
+  });
+
   // ---------- Description backfill ----------
   // POST /api/products/backfill-descriptions { confirm?, dryRun?, limit? }
   // Generates a short brand/item/color description (matching the catalog's
