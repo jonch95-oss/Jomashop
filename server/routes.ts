@@ -30,7 +30,6 @@ import {
   mapShopifyToJomashop,
   buildJomashopProductPayload,
   buildI1ProductEnvelope,
-  charmPrice as _charmPriceUnused,
   charmRetailWithMarginFloor,
   isSampleProduct,
   normalizeCategoryCode,
