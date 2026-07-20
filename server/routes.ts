@@ -30,7 +30,7 @@ import {
   mapShopifyToJomashop,
   buildJomashopProductPayload,
   buildI1ProductEnvelope,
-  charmPrice,
+  charmPrice as _charmPriceUnused,
   charmRetailWithMarginFloor,
   isSampleProduct,
   normalizeCategoryCode,
@@ -3325,8 +3325,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           (payload as any).__originalPrice = rawPrice;
           (payload as any).__unitCost = unitCost;
           payload.price = charmed;
+          // MSRP is the true list/retail price — never charm-round it. Only
+          // the cost/price we quote Jomashop gets the X9.99 treatment.
           if (payload.msrp !== undefined && payload.msrp !== null && Number.isFinite(Number(payload.msrp))) {
-            payload.msrp = charmPrice(Number(payload.msrp)) ?? payload.msrp;
             // The portal's MSRP column reads map_price — send it on create too.
             (payload as any).map_price = payload.msrp;
           }
