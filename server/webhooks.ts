@@ -202,8 +202,12 @@ export async function pushInventoryUpdate(opts: {
    *  of an existing product). When set it is sent as-is, overriding the
    *  stored snapshot and any newShopifyPrice recompute. */
   outboundPrice?: number | null;
+  /** Explicit MSRP / list price to send as `map_price`. Overrides the stored
+   *  snapshot, which is often stale or null on re-pushes — that left the
+   *  Jomashop portal's MSRP column blank. */
+  outboundMsrp?: number | null;
 }): Promise<{ status: "applied" | "skipped" | "rejected"; message: string; details?: unknown }> {
-  const { shopifySku, quantity, topic, shopDomain, newShopifyPrice, outboundPrice } = opts;
+  const { shopifySku, quantity, topic, shopDomain, newShopifyPrice, outboundPrice, outboundMsrp } = opts;
   if (!shopifySku) {
     return { status: "skipped", message: "Webhook had no SKU to map" };
   }
@@ -279,7 +283,10 @@ export async function pushInventoryUpdate(opts: {
   // populated MSRP column when only stock/price changes are pushed. The
   // Jomashop inventory API calls this field `map_price` (while product create
   // uses `msrp`).
-  const msrp = stored?.msrp;
+  const msrp =
+    typeof outboundMsrp === "number" && Number.isFinite(outboundMsrp) && outboundMsrp > 0
+      ? outboundMsrp
+      : stored?.msrp;
   if (msrp !== null && msrp !== undefined && Number.isFinite(Number(msrp))) {
     body.map_price = msrp;
   }

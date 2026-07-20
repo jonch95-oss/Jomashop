@@ -3766,12 +3766,14 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         if (body.pushInventory) {
           try {
             const outPrice = typeof payload.price === "number" ? payload.price : Number(payload.price);
+            const outMsrp = typeof payload.msrp === "number" ? payload.msrp : Number(payload.msrp);
             inventoryResultExisting = await pushInventoryUpdate({
               shopifySku: String(variant?.vendor_sku ?? mapped.vendor_sku),
               quantity: variant?.quantity ?? null,
               topic: "push-existing",
               shopDomain: shopDomainForExisting,
               outboundPrice: Number.isFinite(outPrice) && outPrice > 0 ? outPrice : null,
+              outboundMsrp: Number.isFinite(outMsrp) && outMsrp > 0 ? outMsrp : null,
             });
           } catch {
             /* non-fatal */
