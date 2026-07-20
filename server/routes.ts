@@ -3327,6 +3327,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           payload.price = charmed;
           if (payload.msrp !== undefined && payload.msrp !== null && Number.isFinite(Number(payload.msrp))) {
             payload.msrp = charmPrice(Number(payload.msrp)) ?? payload.msrp;
+            // The portal's MSRP column reads map_price — send it on create too.
+            (payload as any).map_price = payload.msrp;
           }
           (pushDebug as any).charm = { from: rawPrice, to: charmed, unitCost, marginFloor: 0.5 };
         }

@@ -2805,12 +2805,24 @@ export function buildI1ProductEnvelope(
   for (const k of productKeys) {
     if (k in payload) product[k] = payload[k];
   }
+  // payload.price wins: the push route may have charm-priced it (X9.99 with
+  // the 50% margin guard) AFTER the mapper computed variant.jomashop_price.
+  // Preferring the variant value here would silently discard that.
   const stock: Record<string, unknown> = {
     quantity: variant?.quantity ?? 0,
-    price: variant?.jomashop_price ?? payload.price ?? null,
+    price:
+      payload.price !== undefined && payload.price !== null && Number(payload.price) > 0
+        ? payload.price
+        : variant?.jomashop_price ?? null,
     status: variant?.status ?? "active",
   };
-  if (payload.msrp !== undefined && payload.msrp !== null) stock.msrp = payload.msrp;
+  if (payload.msrp !== undefined && payload.msrp !== null) {
+    stock.msrp = payload.msrp;
+    // Jomashop's inventory/stock model surfaces the portal MSRP column from
+    // map_price; send both so the column populates on create as well as on
+    // inventory updates.
+    stock.map_price = payload.msrp;
+  }
   return { product, stock };
 }
 
