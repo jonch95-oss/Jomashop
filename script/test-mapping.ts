@@ -40,6 +40,8 @@ import {
   normalizeI1CategorySchema,
   normalizeV1CategorySchema,
   readParentSku,
+  deriveColorFromTitle,
+  deriveGenderFromTitle,
   resolveMsrp,
   type ShopifyProduct,
   type SchemaPropertyDescriptor,
@@ -4353,6 +4355,21 @@ function runParentSkuMappingAndWriteback() {
     `Case 47h: explicit parent_sku metafield wins`,
   );
 
+  // 47i: wipe-proof derivations (color from title, gender from title, size system default).
+  assert(deriveColorFromTitle("Tods Mens Green Loafer") === "Green", `Case 47i: color from title (Green)`);
+  assert(deriveColorFromTitle("Cavalli Class Mens Navy Dress Shirt") === "Navy", `Case 47i: color from title (Navy)`);
+  assert(deriveColorFromTitle("No color here") === undefined, `Case 47i: no color word -> undefined`);
+  assert(deriveGenderFromTitle("Tods Mens Green Loafer") === "Men", `Case 47i: gender from title (Men)`);
+  assert(deriveGenderFromTitle("Prada Womens Bag") === "Women", `Case 47i: gender from title (Women)`);
+  const wiped: ShopifyProduct = {
+    id: "wiped-1", title: "Tods Mens Green Loafer", vendor: "Tods", product_type: "SHOES",
+    options: [{ name: "Size", values: ["7", "8"] }],
+    variants: [{ id: 1, sku: "STYLE1-7", price: "100.00", inventory_quantity: 1, option1: "7" }],
+    metafields: [],
+  };
+  const wm = mapShopifyToJomashop(wiped, clothingSchema());
+  assert(wm.properties.Color === "Green", `Case 47i: wiped product still derives Color=Green (got ${JSON.stringify(wm.properties.Color)})`);
+
   // 47c: a live schema with "Parent SKU" property gets the canonical value.
   const schemaWithParentSku: SchemaPropertyDescriptor[] = [
     ...apparelLiveSchema(),
@@ -5916,7 +5933,7 @@ function runInlineFieldRepairPostSaveReadiness() {
 
   const before: ShopifyProduct = {
     id: "p-inline-1",
-    title: "Cavalli Class Mens Navy Shirt",
+    title: "Cavalli Class Mens Shirt",
     vendor: "Cavalli Class",
     product_type: "Clothing",
     tags: [],
@@ -6378,7 +6395,7 @@ function runInlineRepairWarningUsesCanonicalApparel() {
   ];
   const product: ShopifyProduct = {
     id: "p-alias-warn",
-    title: "Cavalli Class Mens Navy Shirt",
+    title: "Cavalli Class Mens Shirt",
     vendor: "Cavalli Class",
     product_type: "Clothing", // legacy alias
     tags: [],

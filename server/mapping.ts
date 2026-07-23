@@ -736,6 +736,49 @@ function parsePrice(s: string | undefined | null): number | null {
 }
 
 /**
+ * Derive a Jomashop-accepted color from a product title. Wipe-proof fallback
+ * for when the color metafield has been cleared by an external import — the
+ * title (e.g. "Tods Mens Green Loafer") almost always names the color.
+ * Multi-word keys are checked first so "Light Blue" wins over "Blue".
+ */
+const TITLE_COLOR_MAP: Record<string, string> = {
+  "light blue": "Blue", "dark blue": "Navy", "rose gold": "Rose Gold-tone",
+  "off white": "White", "multi color": "Multi-Color", "multi-color": "Multi-Color",
+  black: "Black", white: "White", navy: "Navy", blue: "Blue", red: "Red", green: "Green",
+  brown: "Brown", beige: "Beige", grey: "Grey", gray: "Grey", pink: "Pink", purple: "Purple",
+  yellow: "Yellow", orange: "Orange", multicolor: "Multi-Color", multicolored: "Multi-Color",
+  cream: "White", tan: "Tan", gold: "Gold-tone", silver: "Silver-tone", burgundy: "Burgundy",
+  khaki: "Tan", olive: "Green", ivory: "White", camel: "Tan", teal: "Blue",
+  indigo: "Blue", ink: "Navy", sand: "Beige", rose: "Pink", shadow: "Grey", charcoal: "Grey",
+  natural: "Beige", ecru: "Beige", taupe: "Tan", chalk: "White", nero: "Black", nude: "Beige",
+  wine: "Burgundy", maroon: "Burgundy", fuchsia: "Pink", magenta: "Pink", coral: "Pink",
+  violet: "Purple", lilac: "Purple", lavender: "Purple", plum: "Purple", military: "Green",
+  mint: "Green", midnight: "Navy", sky: "Blue", aqua: "Blue", cobalt: "Blue",
+  caramel: "Tan", tobacco: "Tan", walnut: "Brown", chestnut: "Brown", chocolate: "Brown",
+  rust: "Orange", terracotta: "Orange", lemon: "Yellow", anthracite: "Grey", smoke: "Grey",
+  pearl: "White", alabaster: "White", offwhite: "White", ruby: "Red", copper: "Copper",
+  bronze: "Bronze", amber: "Amber", havana: "Tortoise", tortoise: "Tortoise",
+  leopard: "Leopard", zebra: "Zebra", gunmetal: "Gunmetal",
+};
+export function deriveColorFromTitle(title: string | null | undefined): string | undefined {
+  if (!title) return undefined;
+  const t = " " + String(title).toLowerCase() + " ";
+  const keys = Object.keys(TITLE_COLOR_MAP).sort((a, b) => b.length - a.length);
+  for (const k of keys) {
+    const re = new RegExp("(^|[^a-z])" + k.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&") + "([^a-z]|$)", "i");
+    if (re.test(t)) return TITLE_COLOR_MAP[k];
+  }
+  return undefined;
+}
+
+/** Derive gender from a product title ("... Mens ...", "... Womens ..."). */
+export function deriveGenderFromTitle(title: string | null | undefined): string | undefined {
+  if (!title) return undefined;
+  const m = String(title).match(/\b(men'?s|mens|women'?s|womens|unisex|kids?|boys?|girls?)\b/i);
+  return m ? normalizeGender(m[1]) : undefined;
+}
+
+/**
  * Normalize Shopify "Size Scale" values to the Jomashop `size_system` enum.
  * Shopify shops commonly use long names ("USA", "European") where Jomashop
  * expects 2-letter codes ("US", "EU"). Anything we don't recognize is
@@ -950,7 +993,9 @@ export function buildCanonicalProductFields(p: ShopifyProduct): CanonicalProduct
     }
     return undefined;
   })();
-  const color = colorMetafield || colorFromFirstVariant || colorFromAnyVariant;
+  // Wipe-proof: fall back to the color named in the title (e.g. "... Green
+  // Loafer") when metafield/option are absent (external import cleared them).
+  const color = colorMetafield || colorFromFirstVariant || colorFromAnyVariant || deriveColorFromTitle(p.title);
 
   // Size precedence: explicit Size metafield → first variant's size option →
   // ANY variant's size option (some shops leave the first variant
@@ -982,12 +1027,19 @@ export function buildCanonicalProductFields(p: ShopifyProduct): CanonicalProduct
     "Size Type",
     "Apparel Size Type",
   ]);
-  const size_system = rawSizeSystem ? normalizeSizeSystem(rawSizeSystem) : undefined;
+  // Wipe-proof: when the size-system metafield is cleared but the product
+  // clearly carries sizes, default to "US" so Shoe/Apparel Size Type never
+  // reverts to "missing" and blocks the push. The metafield always wins when
+  // present, so a re-import restores the true system.
+  const size_system = rawSizeSystem
+    ? normalizeSizeSystem(rawSizeSystem)
+    : (size ? "US" : undefined);
 
   const rawGender =
     readMetafieldAny(p, ["Gender", "gender", "custom.gender", "luxe.gender"]) ||
     tagList.find((t) => /^(Men|Mens|Women|Womens|Unisex|Kids|Kid|Boy|Boys|Girl|Girls|Child|Children|Baby|Infant|Toddler)s?$/i.test(t));
-  const gender = rawGender ? normalizeGender(rawGender) : undefined;
+  // Wipe-proof: derive from the title ("... Mens ...") when metafield/tag gone.
+  const gender = rawGender ? normalizeGender(rawGender) : deriveGenderFromTitle(p.title);
 
   // Age inference: explicit metafield, otherwise derive Kids/Adult from gender.
   let age =
