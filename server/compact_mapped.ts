@@ -18,6 +18,7 @@ export type CompactMappedProduct = {
   vendor_sku: string;
   sku: string;
   manufacturer_number: string | null;
+  parent_sku: string | null;
   name: string;
   brand: string;
   price: number | null;
@@ -118,6 +119,7 @@ export function compactifyMapped(m: any): CompactMappedProduct {
     vendor_sku: m.vendor_sku ?? "",
     sku: m.sku ?? m.vendor_sku ?? "",
     manufacturer_number: m.manufacturer_number ?? null,
+    parent_sku: m.parent_sku ?? null,
     name: m.name ?? "",
     brand: m.brand ?? "",
     description,

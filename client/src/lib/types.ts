@@ -72,6 +72,9 @@ export type MappedProduct = {
   vendor_sku: string;
   sku?: string;
   manufacturer_number?: string | null;
+  /** Size-independent parent SKU (base style + "-P") that groups all size
+   *  variants under one Jomashop product. */
+  parent_sku?: string | null;
   name: string;
   description: string;
   brand: string;

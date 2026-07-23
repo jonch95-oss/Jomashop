@@ -2254,10 +2254,11 @@ export function mapShopifyToJomashop(
           ]);
           break;
         case "parent_sku":
-          // Parent SKU is sourced strictly from explicit parent-sku
-          // metafields. Never substituted from variant size, variant SKU,
-          // brand, or handle — those are not parent SKUs by definition.
-          value = readParentSku(product);
+          // Parent SKU: an explicit parent-sku metafield wins; otherwise use
+          // the derived value (size-free manufacturer/style base + "-P") so
+          // every size variant shares one parent and Jomashop groups them.
+          // Never substituted from variant size, variant SKU, brand, or handle.
+          value = parentSku;
           break;
       }
     }

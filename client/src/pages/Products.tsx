@@ -1099,9 +1099,20 @@ export default function Products() {
                         </div>
                         {p.manufacturer_number && (
                           <div className="mt-1 text-[10px] text-muted-foreground">
-                            Designer Id: <code className="font-mono text-[11px]">{p.manufacturer_number}</code>
+                            Manufacturer # (style): <code className="font-mono text-[11px]">{p.manufacturer_number}</code>
                           </div>
                         )}
+                        <div className="mt-1 text-[10px] text-muted-foreground">
+                          Parent SKU:{" "}
+                          {p.parent_sku ? (
+                            <code className="font-mono text-[11px] text-foreground">{p.parent_sku}</code>
+                          ) : (
+                            <span className="text-amber-500">missing — refresh from Shopify to derive</span>
+                          )}
+                        </div>
+                        <div className="mt-0.5 text-[10px] text-muted-foreground">
+                          {p.variants.length} size variant{p.variants.length === 1 ? "" : "s"} grouped under this parent
+                        </div>
                         <div className="mt-2 text-[10px] uppercase tracking-wider text-muted-foreground">Category mapping</div>
                         <div className="mt-1 space-y-0.5 text-[11px]">
                           <div>
@@ -1397,7 +1408,18 @@ export default function Products() {
                       )}
 
                       <div className="md:col-span-3">
-                        <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Variants</div>
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                            Variants (children)
+                          </div>
+                          {p.parent_sku && (
+                            <div className="text-[10px] text-muted-foreground">
+                              Parent:{" "}
+                              <code className="font-mono text-[11px] text-foreground">{p.parent_sku}</code>
+                              <span className="ml-1">→ {p.variants.length} child SKU{p.variants.length === 1 ? "" : "s"}</span>
+                            </div>
+                          )}
+                        </div>
                         <div className="mt-2 overflow-hidden rounded border border-border">
                           <table className="w-full text-xs">
                             <thead className="bg-card/60 text-[10px] uppercase text-muted-foreground">
