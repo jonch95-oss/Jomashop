@@ -4378,6 +4378,16 @@ function runParentSkuMappingAndWriteback() {
   assert(deriveSizeSystem("M", false) === "US", `Case 47j: letter M -> US`);
   assert(deriveSizeSystem("One Size", false) === "US", `Case 47j: one size -> US`);
   assert(deriveSizeSystem("", false) === undefined, `Case 47j: no size -> undefined`);
+  // 47k: commercial_discount brand-rate fallback when metafield is wiped.
+  const wipedTods: ShopifyProduct = {
+    id: "wiped-tods", title: "Tods Mens Green Loafer", vendor: "Tods", product_type: "SHOES",
+    options: [{ name: "Size", values: ["7"] }],
+    variants: [{ id: 1, sku: "STYLE2-7", price: "100.00", inventory_quantity: 1, option1: "7" }],
+    metafields: [],
+  };
+  const wt = mapShopifyToJomashop(wipedTods, clothingSchema());
+  assert(Math.round((wt.commercial_discount || 0) * 100) === 65, `Case 47k: wiped Tods falls back to 65% brand rate (got ${wt.commercial_discount})`);
+  assert(wt.commercial_discount_source === "brand-rate", `Case 47k: source is brand-rate (got ${wt.commercial_discount_source})`);
 
   // 47c: a live schema with "Parent SKU" property gets the canonical value.
   const schemaWithParentSku: SchemaPropertyDescriptor[] = [

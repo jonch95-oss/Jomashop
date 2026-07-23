@@ -107,7 +107,7 @@ export type MappedProduct = {
    *  (key / label / definition name) that resolveMsrp found. */
   msrp_metafield_key: string | null;
   commercial_discount: number;
-  commercial_discount_source: "metafield" | "missing" | "invalid";
+  commercial_discount_source: "metafield" | "missing" | "invalid" | "brand-rate";
   commercial_discount_missing: boolean;
   jomashop_price: number | null;
   images: string[];
@@ -811,6 +811,28 @@ export function deriveSizeSystem(
     }
   }
   return "US"; // final fallback so the field is never left blank (never-missing)
+}
+
+/**
+ * Operator-agreed brand discount rates (percent off retail). Used ONLY as a
+ * wipe-proof fallback for commercial_discount when the Shopify metafield has
+ * been cleared by an external import — the metafield always wins when present.
+ * Keys are brand names normalized to lowercase alphanumerics.
+ */
+const BRAND_DISCOUNT_RATES: Record<string, number> = {
+  palmangels: 60, palmangel: 60,
+  isaia: 70,
+  tods: 65,
+  tomford: 80,
+  offwhite: 50,
+  scotchsoda: 80, scotchso: 80,
+  toddsnyder: 70, toddsnyde: 70,
+  rogervivier: 70, rogervivi: 70,
+};
+function brandRateFallback(vendor: string | null | undefined): number | undefined {
+  const key = String(vendor || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (!key) return undefined;
+  return BRAND_DISCOUNT_RATES[key];
 }
 
 /**
@@ -2442,15 +2464,25 @@ export function mapShopifyToJomashop(
 
   // Commercial discount: Jomashop price = Shopify price * (1 - discount).
   const discountRaw = readCommercialDiscountRaw(product);
-  const commercialDiscount = normalizeCommercialDiscount(discountRaw);
+  let commercialDiscount = normalizeCommercialDiscount(discountRaw);
   const discountRawTrimmed = discountRaw === undefined ? "" : String(discountRaw).trim();
-  const commercialDiscountMissing = discountRawTrimmed === "" || commercialDiscount <= 0;
-  const commercialDiscountSource: "metafield" | "missing" | "invalid" =
+  let commercialDiscountSource: "metafield" | "missing" | "invalid" | "brand-rate" =
     discountRawTrimmed === ""
       ? "missing"
       : commercialDiscount <= 0
         ? "invalid"
         : "metafield";
+  // Wipe-proof fallback: when the discount metafield is absent, use the
+  // operator-agreed brand rate so the product still has a valid discount and
+  // stays pushable. The metafield always wins when present.
+  if (commercialDiscount <= 0) {
+    const rate = brandRateFallback(product.vendor);
+    if (rate && rate > 0) {
+      commercialDiscount = rate / 100;
+      commercialDiscountSource = "brand-rate";
+    }
+  }
+  const commercialDiscountMissing = commercialDiscount <= 0;
   if (discountRaw !== undefined && commercialDiscount === 0 && String(discountRaw).trim() !== "" && String(discountRaw).trim() !== "0") {
     warnings.push(
       `Commercial Discount value "${discountRaw}" could not be parsed — treating as 0%.`,
