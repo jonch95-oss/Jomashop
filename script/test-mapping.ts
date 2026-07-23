@@ -1254,6 +1254,7 @@ function runStrictShapePerCategory() {
       "sku",
       "vendor_sku",
       "manufacturer_number",
+      "parent_sku",
       "description",
       "images",
       "properties",
@@ -4317,6 +4318,39 @@ function runParentSkuMappingAndWriteback() {
   assert(
     source !== null && source.namespace === "custom" && source.key === "parent_sku",
     `Case 47f: findParentSkuSource returns original (namespace,key) (got ${JSON.stringify(source)})`,
+  );
+
+  // 47g: manufacturer_number strips trailing "-<size>"; parent_sku derives base + "-P".
+  const productSized: ShopifyProduct = {
+    id: "sized-1",
+    title: "Tods Mens Green Loafer",
+    vendor: "Tods",
+    product_type: "SHOES",
+    options: [{ name: "Size", values: ["7", "7.5"] }],
+    variants: [
+      { id: 11, sku: "XXM0GW05470RE0T022-7", price: "695.00", inventory_quantity: 5, option1: "7" },
+      { id: 12, sku: "XXM0GW05470RE0T022-7.5", price: "695.00", inventory_quantity: 2, option1: "7.5" },
+    ],
+    metafields: [],
+  };
+  const mappedSized = mapShopifyToJomashop(productSized, clothingSchema());
+  assert(
+    mappedSized.manufacturer_number === "XXM0GW05470RE0T022",
+    `Case 47g: manufacturer_number strips size (got ${JSON.stringify(mappedSized.manufacturer_number)})`,
+  );
+  assert(
+    mappedSized.parent_sku === "XXM0GW05470RE0T022-P",
+    `Case 47g: parent_sku = base + "-P" (got ${JSON.stringify(mappedSized.parent_sku)})`,
+  );
+  // 47h: explicit parent_sku metafield still wins over derivation.
+  const productSizedExplicitParent: ShopifyProduct = {
+    ...productSized,
+    id: "sized-2",
+    metafields: [{ namespace: "custom", key: "parent_sku", value: "OVERRIDE-P", name: "Parent SKU" }],
+  };
+  assert(
+    mapShopifyToJomashop(productSizedExplicitParent, clothingSchema()).parent_sku === "OVERRIDE-P",
+    `Case 47h: explicit parent_sku metafield wins`,
   );
 
   // 47c: a live schema with "Parent SKU" property gets the canonical value.

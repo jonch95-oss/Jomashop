@@ -30,6 +30,7 @@ import {
   mapShopifyToJomashop,
   buildJomashopProductPayload,
   buildI1ProductEnvelope,
+  charmPrice,
   charmRetailWithMarginFloor,
   isSampleProduct,
   normalizeCategoryCode,
@@ -135,6 +136,19 @@ const refreshProgress: {
   totalProducts: null,
   lastError: null,
 };
+
+/** Live progress of the background Jomashop price sync kicked off by
+ *  POST /api/products/set-discount-bulk. */
+let setDiscountProgress: {
+  active: boolean;
+  total: number;
+  done: number;
+  applied: number;
+  skipped: number;
+  rejected: number;
+  startedAt: number | null;
+  finishedAt: number | null;
+} = { active: false, total: 0, done: 0, applied: 0, skipped: 0, rejected: 0, startedAt: null, finishedAt: null };
 
 /**
  * Build a vendor-sku → live push-status overlay so cached rows reflect the
@@ -1049,6 +1063,113 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       createdAt: Date.now(),
     });
     res.json({ ok: true, threshold: Math.round(threshold * 100), counts: { repriced: repriced.length, unfixable: unfixable.length, metafieldWrites, retailSet: retailResults.filter((r) => r.ok).length }, retailResults, repriced: repriced.slice(0, 500), unfixable, note: "Discounts written to Shopify jomashop.commercial_discount. Refresh from Shopify, then re-push to apply on Jomashop." });
+  });
+
+  // ---------- Bulk set explicit discounts (operator rules / vendor file) ----------
+  // POST /api/products/set-discount-bulk
+  //   { items:[{shopify_product_id, discount_pct}], confirm, dryRun, syncToJomashop }
+  // Writes the jomashop.commercial_discount metafield in Shopify for each
+  // product (source of truth), then kicks off a BACKGROUND job that propagates
+  // the new price to Jomashop for already-pushed SKUs. Discounts are honored
+  // EXACTLY — no 50% margin floor is applied here (operator override
+  // 2026-07-23: "discounts win"). Progress at GET /api/products/set-discount-progress.
+  app.post("/api/products/set-discount-bulk", async (req, res) => {
+    if (req.body?.confirm !== true) {
+      return res.status(400).json({ ok: false, error: "Set confirm:true to write discounts." });
+    }
+    const dryRun = req.body?.dryRun === true;
+    const syncToJomashop = req.body?.syncToJomashop !== false; // default true
+    const rawItems = Array.isArray(req.body?.items) ? req.body.items : [];
+    const items: Array<{ pid: string; pct: number }> = rawItems
+      .map((r: any) => ({ pid: String(r?.shopify_product_id ?? "").trim(), pct: Number(r?.discount_pct) }))
+      .filter((r: { pid: string; pct: number }) => r.pid && Number.isFinite(r.pct) && r.pct >= 0 && r.pct < 100);
+    if (items.length === 0) return res.status(400).json({ ok: false, error: "No valid items." });
+    const conn = getActiveShopifyConnection();
+    if (!conn) return res.status(503).json({ ok: false, error: "No connected Shopify store." });
+    const cache = storage.getProductCache(conn.shopDomain);
+    if (!cache) return res.status(409).json({ ok: false, error: "No product cache. Refresh first." });
+    let cachePayload: any;
+    try { cachePayload = JSON.parse(cache.payloadJson); } catch { return res.status(500).json({ ok: false, error: "Corrupt cache." }); }
+    const mappedRows: any[] = Array.isArray(cachePayload?.mapped) ? cachePayload.mapped : [];
+    const byId = new Map(mappedRows.map((m) => [String(m?.source?.shopify_product_id), m]));
+
+    const gql = async (query: string, variables: Record<string, unknown>) => {
+      const r = await fetch(`https://${conn.shopDomain}/admin/api/2024-10/graphql.json`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": conn.accessToken },
+        body: JSON.stringify({ query, variables }),
+      });
+      return (await r.json()) as any;
+    };
+
+    if (dryRun) {
+      const preview = items.slice(0, 25).map((it) => {
+        const m = byId.get(it.pid);
+        return { pid: it.pid, sku: m?.sku, brand: m?.brand, pushed: m?.push_state === "pushed", old_pct: Math.round((m?.commercial_discount || 0) * 100), new_pct: it.pct };
+      });
+      return res.json({ ok: true, dryRun: true, count: items.length, wouldSync: items.filter((it: { pid: string; pct: number }) => byId.get(it.pid)?.push_state === "pushed").length, preview });
+    }
+
+    // 1) Write metafields synchronously (fast).
+    const metaBatch = items.map((it) => ({
+      ownerId: `gid://shopify/Product/${it.pid}`,
+      namespace: "jomashop", key: "commercial_discount", type: "single_line_text_field",
+      value: String(it.pct),
+    }));
+    let metafieldWrites = 0;
+    const metaErrors: string[] = [];
+    for (let i = 0; i < metaBatch.length; i += 25) {
+      const chunk = metaBatch.slice(i, i + 25);
+      const j = await gql(`mutation S($m:[MetafieldsSetInput!]!){metafieldsSet(metafields:$m){userErrors{message}}}`, { m: chunk });
+      const ue = j?.data?.metafieldsSet?.userErrors ?? [];
+      if (!(j?.errors?.length) && ue.length === 0) metafieldWrites += chunk.length;
+      else metaErrors.push(...[...(j.errors ?? []), ...ue].map((e: any) => String(e.message)));
+    }
+    storage.appendLog({ level: "info", message: `Set-discount-bulk: wrote ${metafieldWrites}/${items.length} commercial_discount metafields`, detailsJson: JSON.stringify({ metaErrors: metaErrors.slice(0, 10) }), createdAt: Date.now() });
+
+    // 2) Background job: propagate new prices to Jomashop for pushed SKUs.
+    if (syncToJomashop && !setDiscountProgress.active) {
+      const toSync = items.map((it: { pid: string; pct: number }) => ({ it, m: byId.get(it.pid) })).filter((x: { it: { pid: string; pct: number }; m: any }) => x.m && x.m.push_state === "pushed");
+      setDiscountProgress = { active: true, total: toSync.length, done: 0, applied: 0, skipped: 0, rejected: 0, startedAt: Date.now(), finishedAt: null };
+      const shopDomain = conn.shopDomain;
+      void (async () => {
+        for (const { it, m } of toSync) {
+          try {
+            const retail = typeof m?.price === "number" ? m.price : (typeof m?.variants?.[0]?.price === "number" ? m.variants[0].price : null);
+            if (!retail || retail <= 0) { setDiscountProgress.skipped++; setDiscountProgress.done++; continue; }
+            const payout = retail * (1 - it.pct / 100);
+            const charmed = charmPrice(payout) ?? Math.round(payout * 100) / 100;
+            const fallbackSku = m?.jomashop_sku || m?.sku || m?.vendor_sku;
+            const variants = Array.isArray(m?.variants) && m.variants.length ? m.variants : [{ vendor_sku: fallbackSku, quantity: null }];
+            for (const v of variants) {
+              const vsku = v?.vendor_sku || fallbackSku;
+              if (!vsku) { setDiscountProgress.skipped++; continue; }
+              const r = await pushInventoryUpdate({
+                shopifySku: vsku,
+                quantity: typeof v?.quantity === "number" ? v.quantity : null,
+                topic: "discount-bulk",
+                shopDomain,
+                outboundPrice: charmed,
+                outboundMsrp: retail,
+              });
+              if (r.status === "applied") setDiscountProgress.applied++;
+              else if (r.status === "skipped") setDiscountProgress.skipped++;
+              else setDiscountProgress.rejected++;
+            }
+          } catch { setDiscountProgress.rejected++; }
+          setDiscountProgress.done++;
+        }
+        setDiscountProgress.active = false;
+        setDiscountProgress.finishedAt = Date.now();
+        storage.appendLog({ level: "info", message: `Set-discount-bulk sync done: applied ${setDiscountProgress.applied}, skipped ${setDiscountProgress.skipped}, rejected ${setDiscountProgress.rejected}`, detailsJson: "{}", createdAt: Date.now() });
+      })();
+    }
+
+    res.json({ ok: true, items: items.length, metafieldWrites, metaErrors: metaErrors.slice(0, 10), syncStarted: syncToJomashop, note: "Discounts written to Shopify. Jomashop price sync running in background — poll GET /api/products/set-discount-progress." });
+  });
+
+  app.get("/api/products/set-discount-progress", (_req, res) => {
+    res.json({ ok: true, progress: setDiscountProgress });
   });
 
   // ---------- Bulk zero-out inventory on Jomashop ----------

@@ -88,6 +88,10 @@ export type MappedProduct = {
    *  vendor_sku, but kept separate so the UI can override it independently. */
   sku: string;
   manufacturer_number: string | null;
+  /** Size-independent parent SKU used to group size variants under one
+   *  Jomashop product. Convention: base style + "-P" (e.g. 1234 -> 1234-P).
+   *  Child/variant vendor_skus are base + "-<size>" (1234-37, 1234-38). */
+  parent_sku: string | null;
   name: string;
   description: string;
   brand: string;
@@ -144,6 +148,7 @@ export type PushOverrides = {
   brand?: string;
   sku?: string;
   manufacturer_number?: string;
+  parent_sku?: string;
   /** Live Jomashop manufacturer record id (from /i1/manufacturers). When
    *  present the payload sends `product.manufacturer_id` so the new
    *  /i1/products/ endpoint can accept the create without a name lookup. */
@@ -2020,7 +2025,7 @@ export function mapShopifyToJomashop(
   // manufacturer_number precedence: real ff_designer_id metafield →
   // manufacturer_number / designer_id metafields → resolved SKU. Never a
   // synthesized demo value.
-  const manufacturerNumber =
+  const manufacturerNumberRaw =
     readMetafieldAny(product, [
       "ff_designer_id",
       "luxe.ff_designer_id",
@@ -2030,6 +2035,29 @@ export function mapShopifyToJomashop(
       "Designer Id",
     ]) ||
     (resolvedSku ? resolvedSku : null);
+  // Manufacturer / style number must be SIZE-INDEPENDENT so Jomashop groups
+  // every size under one parent product. The variant SKU (and often the
+  // metafield) carries a trailing "-<size>" token; strip it. Example:
+  // "007956S5112800-60" -> "007956S5112800", "XXM0GW05470RE0T022-7" -> base.
+  const firstVariantSize =
+    sizeOpt && firstVariant ? ((firstVariant[sizeOpt] as string | null) || undefined) : undefined;
+  const stripTrailingSize = (value: string | null, size: string | undefined): string | null => {
+    if (!value) return value;
+    const v = String(value).trim();
+    if (size && String(size).trim() !== "") {
+      const suffix = "-" + String(size).trim();
+      if (v.toUpperCase().endsWith(suffix.toUpperCase())) {
+        const stripped = v.slice(0, v.length - suffix.length);
+        if (stripped.length >= 4) return stripped;
+      }
+    }
+    return v;
+  };
+  const manufacturerNumber = stripTrailingSize(manufacturerNumberRaw, firstVariantSize);
+  // Parent SKU: an explicit metafield wins; otherwise derive base + "-P".
+  const parentSku =
+    readParentSku(product) ||
+    (manufacturerNumber ? `${manufacturerNumber}-P` : null);
 
   // Build a properties object using the category schema. Schema-driven
   // mapping always uses EXACT live/Title-Case labels so the /i1/products/
@@ -2463,6 +2491,7 @@ export function mapShopifyToJomashop(
     vendor_sku: vendorSku,
     sku: vendorSku,
     manufacturer_number: manufacturerNumber,
+    parent_sku: parentSku,
     name: product.title || "Untitled product",
     description: (product.body_html || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim(),
     brand,
@@ -2701,6 +2730,12 @@ export function buildJomashopProductPayload(
     (overrides.manufacturer_number && overrides.manufacturer_number.trim()) ||
     (mapped.manufacturer_number && String(mapped.manufacturer_number).trim()) ||
     (sku ? sku : "");
+  // Parent SKU groups all size variants under one Jomashop product. Prefer an
+  // explicit override / mapped value; otherwise derive base + "-P".
+  const parentSku =
+    (overrides.parent_sku && overrides.parent_sku.trim()) ||
+    (mapped.parent_sku && String(mapped.parent_sku).trim()) ||
+    (manufacturerNumber ? `${manufacturerNumber}-P` : "");
 
   // Strict-shape /i1 payload. Generic lowercase fields are NEVER spread to
   // the top level — they would be rejected by the live schema validator
@@ -2709,6 +2744,7 @@ export function buildJomashopProductPayload(
     sku,
     vendor_sku: sku,
     manufacturer_number: manufacturerNumber,
+    parent_sku: parentSku,
     name: mapped.name,
     description: mapped.description,
     price,
@@ -2797,6 +2833,7 @@ export function buildI1ProductEnvelope(
     "sku",
     "vendor_sku",
     "manufacturer_number",
+    "parent_sku",
     "description",
     "images",
     "properties",
