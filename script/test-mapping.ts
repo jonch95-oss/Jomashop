@@ -42,6 +42,7 @@ import {
   readParentSku,
   deriveColorFromTitle,
   deriveGenderFromTitle,
+  deriveSizeSystem,
   resolveMsrp,
   type ShopifyProduct,
   type SchemaPropertyDescriptor,
@@ -4369,6 +4370,14 @@ function runParentSkuMappingAndWriteback() {
   };
   const wm = mapShopifyToJomashop(wiped, clothingSchema());
   assert(wm.properties.Color === "Green", `Case 47i: wiped product still derives Color=Green (got ${JSON.stringify(wm.properties.Color)})`);
+  // 47j: operator-confirmed size-system inference (per value + footwear).
+  assert(deriveSizeSystem("7.5", true) === "US", `Case 47j: shoe 7.5 -> US`);
+  assert(deriveSizeSystem("42", true) === "EU", `Case 47j: shoe 42 -> EU`);
+  assert(deriveSizeSystem("48", false) === "IT", `Case 47j: apparel 48 (even) -> IT`);
+  assert(deriveSizeSystem("15", false) === "US", `Case 47j: apparel 15 -> US`);
+  assert(deriveSizeSystem("M", false) === "US", `Case 47j: letter M -> US`);
+  assert(deriveSizeSystem("One Size", false) === "US", `Case 47j: one size -> US`);
+  assert(deriveSizeSystem("", false) === undefined, `Case 47j: no size -> undefined`);
 
   // 47c: a live schema with "Parent SKU" property gets the canonical value.
   const schemaWithParentSku: SchemaPropertyDescriptor[] = [

@@ -779,6 +779,41 @@ export function deriveGenderFromTitle(title: string | null | undefined): string 
 }
 
 /**
+ * Operator-confirmed size-system inference (ported from the missing-fields
+ * autofill so the value survives metafield wipes and matches what was
+ * originally written). By size value + whether the product is footwear:
+ *   footwear  3–15 -> US, 16–50 -> EU
+ *   apparel   even 44–62 -> IT, 0–43 -> US
+ *   letters / one-size / infant ranges -> US
+ * Returns undefined only when there is no size at all.
+ */
+export function deriveSizeSystem(
+  size: string | null | undefined,
+  isFootwear: boolean,
+): string | undefined {
+  if (size === null || size === undefined) return undefined;
+  let str = String(size).toUpperCase().replace("SIZE:", "").trim();
+  if (str === "") return undefined;
+  if (str === "OS" || str === "DEFAULT TITLE" || str === "ONE SIZE") return "US";
+  if (/^X{0,3}[SML]$|^XL$|^XXL$|^XXXL$|^[0-9]+X[SL]$/.test(str)) return "US";
+  if (/\d+\s*[-/]\s*\d+M?$/.test(str)) return "US"; // infant ranges 6-12M / 6/12
+  const suit = str.match(/^(\d{2})[RSL]$/); // 38R, 52L …
+  if (suit) str = suit[1];
+  const m = str.match(/^(\d+(?:\.\d+)?)$/);
+  if (m) {
+    const n = parseFloat(m[1]);
+    if (isFootwear) {
+      if (n >= 3 && n <= 15) return "US";
+      if (n >= 16 && n <= 50) return "EU";
+    } else {
+      if (n >= 44 && n <= 62 && n % 2 === 0) return "IT";
+      if (n >= 0 && n <= 43) return "US";
+    }
+  }
+  return "US"; // final fallback so the field is never left blank (never-missing)
+}
+
+/**
  * Normalize Shopify "Size Scale" values to the Jomashop `size_system` enum.
  * Shopify shops commonly use long names ("USA", "European") where Jomashop
  * expects 2-letter codes ("US", "EU"). Anything we don't recognize is
@@ -1031,9 +1066,12 @@ export function buildCanonicalProductFields(p: ShopifyProduct): CanonicalProduct
   // clearly carries sizes, default to "US" so Shoe/Apparel Size Type never
   // reverts to "missing" and blocks the push. The metafield always wins when
   // present, so a re-import restores the true system.
+  const looksFootwear = /shoe|footwear|sneaker|trainer|loafer|boot|sandal|heel|pump|espadrille|moccasin|derby|brogue|slipper|mule|ballerina|wedge/i.test(
+    `${p.product_type || ""} ${p.title || ""}`,
+  );
   const size_system = rawSizeSystem
     ? normalizeSizeSystem(rawSizeSystem)
-    : (size ? "US" : undefined);
+    : deriveSizeSystem(size, looksFootwear);
 
   const rawGender =
     readMetafieldAny(p, ["Gender", "gender", "custom.gender", "luxe.gender"]) ||
