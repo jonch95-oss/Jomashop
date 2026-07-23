@@ -1092,6 +1092,18 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     try { cachePayload = JSON.parse(cache.payloadJson); } catch { return res.status(500).json({ ok: false, error: "Corrupt cache." }); }
     const mappedRows: any[] = Array.isArray(cachePayload?.mapped) ? cachePayload.mapped : [];
     const byId = new Map(mappedRows.map((m) => [String(m?.source?.shopify_product_id), m]));
+    // push_state is NOT reliably stored in the cache payload — it is overlaid
+    // at read-time by vendor_sku. Use the same overlay so we correctly detect
+    // which products are live on Jomashop and need a price push.
+    const pushOverlay = buildPushStatusOverlay(conn.shopDomain);
+    const isPushedProduct = (m: any): boolean => {
+      if (!m) return false;
+      const skus: string[] = [];
+      if (Array.isArray(m.variants)) for (const v of m.variants) if (v?.vendor_sku) skus.push(String(v.vendor_sku));
+      const fb = m.jomashop_sku || m.sku || m.vendor_sku;
+      if (fb) skus.push(String(fb));
+      return skus.some((sk) => pushOverlay.get(sk)?.state === "pushed");
+    };
 
     const gql = async (query: string, variables: Record<string, unknown>) => {
       const r = await fetch(`https://${conn.shopDomain}/admin/api/2024-10/graphql.json`, {
@@ -1105,9 +1117,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     if (dryRun) {
       const preview = items.slice(0, 25).map((it) => {
         const m = byId.get(it.pid);
-        return { pid: it.pid, sku: m?.sku, brand: m?.brand, pushed: m?.push_state === "pushed", old_pct: Math.round((m?.commercial_discount || 0) * 100), new_pct: it.pct };
+        return { pid: it.pid, sku: m?.sku, brand: m?.brand, pushed: isPushedProduct(m), old_pct: Math.round((m?.commercial_discount || 0) * 100), new_pct: it.pct };
       });
-      return res.json({ ok: true, dryRun: true, count: items.length, wouldSync: items.filter((it: { pid: string; pct: number }) => byId.get(it.pid)?.push_state === "pushed").length, preview });
+      return res.json({ ok: true, dryRun: true, count: items.length, wouldSync: items.filter((it: { pid: string; pct: number }) => isPushedProduct(byId.get(it.pid))).length, preview });
     }
 
     // 1) Write metafields synchronously (fast).
@@ -1129,7 +1141,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
     // 2) Background job: propagate new prices to Jomashop for pushed SKUs.
     if (syncToJomashop && !setDiscountProgress.active) {
-      const toSync = items.map((it: { pid: string; pct: number }) => ({ it, m: byId.get(it.pid) })).filter((x: { it: { pid: string; pct: number }; m: any }) => x.m && x.m.push_state === "pushed");
+      const toSync = items.map((it: { pid: string; pct: number }) => ({ it, m: byId.get(it.pid) })).filter((x: { it: { pid: string; pct: number }; m: any }) => isPushedProduct(x.m));
       setDiscountProgress = { active: true, total: toSync.length, done: 0, applied: 0, skipped: 0, rejected: 0, startedAt: Date.now(), finishedAt: null };
       const shopDomain = conn.shopDomain;
       void (async () => {
