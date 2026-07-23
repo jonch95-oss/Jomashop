@@ -398,33 +398,54 @@ export default function Products() {
       if (brandFilter) scopeParts.push(`brand="${brandFilter}"`);
       if (jomashopCategoryFilter) scopeParts.push(`Jomashop category="${jomashopCategoryFilter}"`);
       const scopeLabel = scopeParts.length > 0 ? ` (${scopeParts.join(", ")})` : "";
-      if (!window.confirm(`Push ${targets.length} product(s) to Jomashop${scopeLabel}?`)) return;
+      const vc = targets.reduce((sum, p) => sum + Math.max(1, p.variants?.length ?? 1), 0);
+      if (!window.confirm(`Push ${targets.length} product(s) — ${vc} size variant(s) — to Jomashop${scopeLabel}?`)) return;
     }
+    // Push EVERY size variant of each product — each is created as its own
+    // child (unique vendor_sku) sharing the parent SKU + size-free
+    // manufacturer number, so Jomashop groups them under one parent.
+    const totalVariants = targets.reduce(
+      (sum, p) => sum + Math.max(1, p.variants?.length ?? 1),
+      0,
+    );
     setBulkPushing(true);
-    setBulkProgress({ done: 0, total: targets.length, ok: 0, failed: 0 });
+    setBulkProgress({ done: 0, total: totalVariants, ok: 0, failed: 0 });
     let ok = 0;
     let failed = 0;
+    let done = 0;
     for (let i = 0; i < targets.length; i += 1) {
       const p = targets[i];
-      try {
-        const res = await apiRequest("POST", "/api/jomashop/push-product", {
-          confirm: true,
-          pushInventory: true,
-          product: shopifyProductFromMapped(p),
-          overrides: {
-            category: (p.suggested_category || p.category || "").trim(),
-            brand: (p.brand || "").trim(),
-            sku: (p.sku || p.vendor_sku || "").trim(),
-            manufacturer_number: (p.manufacturer_number || p.sku || p.vendor_sku || "").trim(),
-          },
-        });
-        const body = await res.json().catch(() => ({ ok: false }));
-        if (body && body.ok) ok += 1;
-        else failed += 1;
-      } catch {
-        failed += 1;
+      const variants =
+        p.variants && p.variants.length > 0
+          ? p.variants
+          : [{ vendor_sku: p.sku || p.vendor_sku }];
+      for (const v of variants) {
+        const childSku = (v.vendor_sku || p.sku || p.vendor_sku || "").trim();
+        try {
+          const res = await apiRequest("POST", "/api/jomashop/push-product", {
+            confirm: true,
+            pushInventory: true,
+            variantSku: childSku,
+            product: shopifyProductFromMapped(p),
+            overrides: {
+              category: (p.suggested_category || p.category || "").trim(),
+              brand: (p.brand || "").trim(),
+              // child = variant vendor_sku (base-size); parent SKU + shared
+              // manufacturer number are derived server-side from the
+              // (size-free) manufacturer_number below.
+              sku: childSku,
+              manufacturer_number: (p.manufacturer_number || "").trim(),
+            },
+          });
+          const body = await res.json().catch(() => ({ ok: false }));
+          if (body && body.ok) ok += 1;
+          else failed += 1;
+        } catch {
+          failed += 1;
+        }
+        done += 1;
+        setBulkProgress({ done, total: totalVariants, ok, failed });
       }
-      setBulkProgress({ done: i + 1, total: targets.length, ok, failed });
     }
     setBulkPushing(false);
     queryClient.invalidateQueries({ queryKey: ["/api/products/cache"] });
