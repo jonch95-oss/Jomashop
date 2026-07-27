@@ -163,6 +163,19 @@ let pushMissingProgress: {
   lastError: string | null;
 } = { active: false, total: 0, done: 0, created: 0, alreadyLive: 0, failed: 0, startedAt: null, finishedAt: null, lastError: null };
 
+/** Fallback vendor-code -> Jomashop manufacturer name for the push-missing
+ *  job, used only when no saved/built-in brand override matches. Keys are
+ *  uppercased alphanumerics of the raw brand. */
+const PUSH_BRAND_ALIAS: Record<string, string> = {
+  "SCOTCHSO": "Scotch & Soda", "SCOTCHSODA": "Scotch & Soda",
+  "PALMANGEL": "Palm Angels", "PALMANGELS": "Palm Angels",
+  "TOMFORD": "Tom Ford", "OFFWHITE": "Off White", "TODS": "Tod's",
+  "TODDSNYDE": "Todd Snyder", "TODDSNYDER": "Todd Snyder",
+  "ROGERVIVI": "Roger Vivier", "ROGERVIVIER": "Roger Vivier",
+  "ORLBROWN": "Orlebar Brown", "GOSHA": "Gosha Rubchinskiy",
+  "CAVALLICLASS": "Roberto Cavalli",
+};
+
 /** Live progress of the background manufacturer_number update job (regroups
  *  existing Jomashop products by setting the size-free manufacturer #). */
 let updateMfrProgress: {
@@ -1272,12 +1285,22 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           const product = full?.product;
           const mapped = full?.mapped;
           if (!product) { pushMissingProgress.failed++; pushMissingProgress.done++; continue; }
+          // Resolve the brand to its Jomashop manufacturer name. Passing the
+          // raw vendor code (e.g. "SCOTCH&SO") bypasses the brand mapping and
+          // aborts with "Brand not found". Prefer the saved/built-in override,
+          // then a known-alias fallback, then the raw value.
+          const rawBrand = String(mapped?.brand || "").trim();
+          const aliasKey = rawBrand.toUpperCase().replace(/[^A-Z0-9&]/g, "");
+          const brandResolved =
+            lookupBrandOverride(rawBrand)?.jomashopBrand ||
+            PUSH_BRAND_ALIAS[aliasKey] ||
+            rawBrand;
           const overrides = {
             // Use the canonical Jomashop category (e.g. "Footwear"), NOT the
             // suggested subtype ("Sneakers"/"Boots") — those are not valid
             // Jomashop category names and abort the push.
             category: String(mapped?.category || mapped?.suggested_category || "").trim(),
-            brand: String(mapped?.brand || "").trim(),
+            brand: brandResolved,
             sku: item.variantSku,
             manufacturer_number: String(mapped?.manufacturer_number || "").trim(),
           };
