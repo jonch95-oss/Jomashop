@@ -150,6 +150,19 @@ let setDiscountProgress: {
   finishedAt: number | null;
 } = { active: false, total: 0, done: 0, applied: 0, skipped: 0, rejected: 0, startedAt: null, finishedAt: null };
 
+/** Live progress of the background "push missing size variants" job. */
+let pushMissingProgress: {
+  active: boolean;
+  total: number;
+  done: number;
+  created: number;
+  alreadyLive: number;
+  failed: number;
+  startedAt: number | null;
+  finishedAt: number | null;
+  lastError: string | null;
+} = { active: false, total: 0, done: 0, created: 0, alreadyLive: 0, failed: 0, startedAt: null, finishedAt: null, lastError: null };
+
 /**
  * Build a vendor-sku → live push-status overlay so cached rows reflect the
  * latest push state without requiring a full /api/products/refresh. The push
@@ -1182,6 +1195,112 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   app.get("/api/products/set-discount-progress", (_req, res) => {
     res.json({ ok: true, progress: setDiscountProgress });
+  });
+
+  // ---------- Background push of MISSING size variants ----------
+  // POST /api/products/push-missing-variants  { confirm, dryRun }
+  // For every product that is NOT blocked by missing required fields, pushes
+  // each size variant that is not already live on Jomashop — each as its own
+  // child (unique vendor_sku) sharing the size-free manufacturer number +
+  // parent SKU (base-P), so Jomashop groups the full size run under one
+  // parent. Reuses the existing single-variant push via internal calls (no
+  // logic duplicated). Runs in the background; poll GET
+  // /api/products/push-missing-progress. Dry-run returns the worklist size.
+  app.post("/api/products/push-missing-variants", async (req, res) => {
+    if (req.body?.confirm !== true) {
+      return res.status(400).json({ ok: false, error: "Set confirm:true to push missing sizes to Jomashop." });
+    }
+    const dryRun = req.body?.dryRun === true;
+    const conn = getActiveShopifyConnection();
+    if (!conn) return res.status(503).json({ ok: false, error: "No connected Shopify store." });
+    const cache = storage.getProductCache(conn.shopDomain);
+    if (!cache) return res.status(409).json({ ok: false, error: "No product cache. Refresh first." });
+    let cachePayload: any;
+    try { cachePayload = JSON.parse(cache.payloadJson); } catch { return res.status(500).json({ ok: false, error: "Corrupt cache." }); }
+    const mappedRows: any[] = Array.isArray(cachePayload?.mapped) ? cachePayload.mapped : [];
+    const overlay = buildPushStatusOverlay(conn.shopDomain);
+
+    // Worklist: pushable products (no missing required/top-level), variants
+    // not already live on Jomashop.
+    type Item = { pid: string; variantSku: string };
+    const work: Item[] = [];
+    let blockedProducts = 0;
+    for (const m of mappedRows) {
+      const blocked = (m?.missing_required?.length ?? 0) > 0 || (m?.missing_top_level?.length ?? 0) > 0;
+      const pid = String(m?.source?.shopify_product_id ?? "");
+      if (!pid) continue;
+      if (blocked) { blockedProducts++; continue; }
+      const variants = Array.isArray(m?.variants) ? m.variants : [];
+      for (const v of variants) {
+        const vsku = String(v?.vendor_sku ?? "").trim();
+        if (!vsku) continue;
+        if (overlay.get(vsku)?.state === "pushed") continue; // already live
+        work.push({ pid, variantSku: vsku });
+      }
+    }
+
+    if (dryRun) {
+      const byProduct = new Set(work.map((w) => w.pid)).size;
+      return res.json({ ok: true, dryRun: true, missingVariants: work.length, productsAffected: byProduct, blockedProducts });
+    }
+    if (pushMissingProgress.active) {
+      return res.status(409).json({ ok: false, error: "A push-missing job is already running.", progress: pushMissingProgress });
+    }
+
+    pushMissingProgress = { active: true, total: work.length, done: 0, created: 0, alreadyLive: 0, failed: 0, startedAt: Date.now(), finishedAt: null, lastError: null };
+    const base = `http://127.0.0.1:${process.env.PORT || "5000"}`;
+    const adminToken = process.env.ADMIN_TOKEN || "";
+    const authHeaders = { "Content-Type": "application/json", Authorization: `Bearer ${adminToken}` };
+
+    void (async () => {
+      const fullCache = new Map<string, any>(); // pid -> { product, mapped }
+      for (const item of work) {
+        try {
+          let full = fullCache.get(item.pid);
+          if (!full) {
+            const fr = await fetch(`${base}/api/products/full/${item.pid}`, { headers: authHeaders });
+            full = await fr.json();
+            fullCache.set(item.pid, full);
+          }
+          const product = full?.product;
+          const mapped = full?.mapped;
+          if (!product) { pushMissingProgress.failed++; pushMissingProgress.done++; continue; }
+          const overrides = {
+            category: String(mapped?.suggested_category || mapped?.category || "").trim(),
+            brand: String(mapped?.brand || "").trim(),
+            sku: item.variantSku,
+            manufacturer_number: String(mapped?.manufacturer_number || "").trim(),
+          };
+          const pr = await fetch(`${base}/api/jomashop/push-product`, {
+            method: "POST",
+            headers: authHeaders,
+            body: JSON.stringify({ product, variantSku: item.variantSku, confirm: true, pushInventory: true, overrides }),
+          });
+          const pj = await pr.json().catch(() => ({ ok: false }));
+          if (pj?.ok && pj?.alreadyExists) pushMissingProgress.alreadyLive++;
+          else if (pj?.ok) pushMissingProgress.created++;
+          else pushMissingProgress.failed++;
+        } catch (err) {
+          pushMissingProgress.failed++;
+          pushMissingProgress.lastError = (err as Error).message;
+        }
+        pushMissingProgress.done++;
+      }
+      pushMissingProgress.active = false;
+      pushMissingProgress.finishedAt = Date.now();
+      storage.appendLog({
+        level: "info",
+        message: `Push-missing-variants done: created ${pushMissingProgress.created}, alreadyLive ${pushMissingProgress.alreadyLive}, failed ${pushMissingProgress.failed}`,
+        detailsJson: "{}",
+        createdAt: Date.now(),
+      });
+    })();
+
+    res.json({ ok: true, started: true, missingVariants: work.length, blockedProducts, note: "Pushing missing sizes in the background — poll GET /api/products/push-missing-progress." });
+  });
+
+  app.get("/api/products/push-missing-progress", (_req, res) => {
+    res.json({ ok: true, progress: pushMissingProgress });
   });
 
   // ---------- Bulk zero-out inventory on Jomashop ----------
