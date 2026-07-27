@@ -4388,6 +4388,16 @@ function runParentSkuMappingAndWriteback() {
   const wt = mapShopifyToJomashop(wipedTods, clothingSchema());
   assert(Math.round((wt.commercial_discount || 0) * 100) === 65, `Case 47k: wiped Tods falls back to 65% brand rate (got ${wt.commercial_discount})`);
   assert(wt.commercial_discount_source === "brand-rate", `Case 47k: source is brand-rate (got ${wt.commercial_discount_source})`);
+  // 47l: anti-wonky size-system sanity check overrides an implausible metafield.
+  const wonky: ShopifyProduct = {
+    id: "wonky-1", title: "Tods Mens Loafer", vendor: "Tods", product_type: "SHOES",
+    options: [{ name: "Size", values: ["8"] }],
+    variants: [{ id: 1, sku: "WONK-8", price: "100.00", inventory_quantity: 1, option1: "8" }],
+    metafields: [{ namespace: "custom", key: "size_scale", value: "EU", name: "Size Scale" }],
+  };
+  const wk = mapShopifyToJomashop(wonky, clothingSchema());
+  const wkType = wk.properties["Shoe Size Type"] ?? wk.properties["Apparel Size Type"];
+  assert(wkType === "US" || wk.properties["Shoe Size Type"] === "US", `Case 47l: EU+size8 shoe sanity-checked to US (got ${JSON.stringify(wkType)})`);
 
   // 47c: a live schema with "Parent SKU" property gets the canonical value.
   const schemaWithParentSku: SchemaPropertyDescriptor[] = [

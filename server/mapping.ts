@@ -1091,9 +1091,23 @@ export function buildCanonicalProductFields(p: ShopifyProduct): CanonicalProduct
   const looksFootwear = /shoe|footwear|sneaker|trainer|loafer|boot|sandal|heel|pump|espadrille|moccasin|derby|brogue|slipper|mule|ballerina|wedge/i.test(
     `${p.product_type || ""} ${p.title || ""}`,
   );
-  const size_system = rawSizeSystem
+  let size_system = rawSizeSystem
     ? normalizeSizeSystem(rawSizeSystem)
     : deriveSizeSystem(size, looksFootwear);
+  // Anti-wonky sanity check: never emit an impossible size + system combo for
+  // footwear. A metafield can carry a stale/wrong system (e.g. labelling a
+  // US-8 shoe as "EU", which would read as the nonexistent "EU 8"). When the
+  // size value is inconsistent with the system, trust the size value:
+  //   footwear numeric <= 15  -> US   (EU/IT shoes start ~35; kids start ~16)
+  //   footwear numeric >= 35  -> EU   (US shoes don't reach 35)
+  // Kids EU sizes (16-34) are left as-is so valid kids EU shoes keep "EU".
+  if (looksFootwear && size) {
+    const sizeNum = parseFloat(String(size).replace(/[^0-9.]/g, ""));
+    if (Number.isFinite(sizeNum)) {
+      if (size_system === "EU" && sizeNum <= 15) size_system = "US";
+      else if (size_system === "US" && sizeNum >= 35) size_system = "EU";
+    }
+  }
 
   const rawGender =
     readMetafieldAny(p, ["Gender", "gender", "custom.gender", "luxe.gender"]) ||
