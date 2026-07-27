@@ -1266,7 +1266,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           const mapped = full?.mapped;
           if (!product) { pushMissingProgress.failed++; pushMissingProgress.done++; continue; }
           const overrides = {
-            category: String(mapped?.suggested_category || mapped?.category || "").trim(),
+            // Use the canonical Jomashop category (e.g. "Footwear"), NOT the
+            // suggested subtype ("Sneakers"/"Boots") — those are not valid
+            // Jomashop category names and abort the push.
+            category: String(mapped?.category || mapped?.suggested_category || "").trim(),
             brand: String(mapped?.brand || "").trim(),
             sku: item.variantSku,
             manufacturer_number: String(mapped?.manufacturer_number || "").trim(),
