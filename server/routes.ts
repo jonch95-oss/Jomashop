@@ -163,6 +163,13 @@ let pushMissingProgress: {
   lastError: string | null;
 } = { active: false, total: 0, done: 0, created: 0, alreadyLive: 0, failed: 0, startedAt: null, finishedAt: null, lastError: null };
 
+/** Live progress of the background manufacturer_number update job (regroups
+ *  existing Jomashop products by setting the size-free manufacturer #). */
+let updateMfrProgress: {
+  active: boolean; total: number; done: number; ok: number; failed: number;
+  startedAt: number | null; finishedAt: number | null; lastError: string | null;
+} = { active: false, total: 0, done: 0, ok: 0, failed: 0, startedAt: null, finishedAt: null, lastError: null };
+
 /**
  * Build a vendor-sku → live push-status overlay so cached rows reflect the
  * latest push state without requiring a full /api/products/refresh. The push
@@ -1304,6 +1311,74 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   app.get("/api/products/push-missing-progress", (_req, res) => {
     res.json({ ok: true, progress: pushMissingProgress });
+  });
+
+  // ---------- Update manufacturer_number on EXISTING Jomashop products ----------
+  // POST /api/jomashop/update-manufacturer
+  //   { items: [{ jomashop_sku, manufacturer_number }], confirm, dryRun }
+  // Jomashop has NO parent-sku field; it groups variations by
+  // manufacturer_number. This regroups already-live products by PUTting the
+  // size-free manufacturer # onto each (keyed by its Jomashop SKU). Small
+  // batches (<=5) run synchronously and return the raw Jomashop responses so
+  // a single item can be safely tested; larger runs go to a background job
+  // (poll GET /api/jomashop/update-manufacturer-progress).
+  app.post("/api/jomashop/update-manufacturer", async (req, res) => {
+    if (req.body?.confirm !== true) {
+      return res.status(400).json({ ok: false, error: "Set confirm:true to update manufacturer numbers on Jomashop." });
+    }
+    if (!jomashopConfigured()) {
+      return res.status(503).json({ ok: false, error: "Jomashop credentials not configured." });
+    }
+    const dryRun = req.body?.dryRun === true;
+    const rawItems = Array.isArray(req.body?.items) ? req.body.items : [];
+    const items = rawItems
+      .map((r: any) => ({ jomashop_sku: String(r?.jomashop_sku ?? "").trim(), manufacturer_number: String(r?.manufacturer_number ?? "").trim() }))
+      .filter((r: any) => r.jomashop_sku && r.manufacturer_number);
+    if (items.length === 0) return res.status(400).json({ ok: false, error: "No valid { jomashop_sku, manufacturer_number } items." });
+
+    if (dryRun) {
+      return res.json({ ok: true, dryRun: true, count: items.length, sample: items.slice(0, 20) });
+    }
+
+    const doOne = async (it: { jomashop_sku: string; manufacturer_number: string }) => {
+      const r = await jomashopRequest({
+        method: "PUT",
+        path: `/v1/products/${encodeURIComponent(it.jomashop_sku)}`,
+        body: { product: { manufacturer_number: it.manufacturer_number } },
+      });
+      return { jomashop_sku: it.jomashop_sku, manufacturer_number: it.manufacturer_number, ok: r.ok, status: r.status, error: r.ok ? null : (r.errorData ?? r.error ?? null) };
+    };
+
+    // Small batch (test): run synchronously and return raw results.
+    if (items.length <= 5) {
+      const results = [];
+      for (const it of items) {
+        try { results.push(await doOne(it)); }
+        catch (err) { results.push({ jomashop_sku: it.jomashop_sku, ok: false, error: (err as Error).message }); }
+      }
+      return res.json({ ok: true, mode: "sync", results });
+    }
+
+    // Bulk: background job.
+    if (updateMfrProgress.active) {
+      return res.status(409).json({ ok: false, error: "An update-manufacturer job is already running.", progress: updateMfrProgress });
+    }
+    updateMfrProgress = { active: true, total: items.length, done: 0, ok: 0, failed: 0, startedAt: Date.now(), finishedAt: null, lastError: null };
+    void (async () => {
+      for (const it of items) {
+        try { const r = await doOne(it); if (r.ok) updateMfrProgress.ok++; else { updateMfrProgress.failed++; updateMfrProgress.lastError = JSON.stringify(r.error).slice(0, 200); } }
+        catch (err) { updateMfrProgress.failed++; updateMfrProgress.lastError = (err as Error).message; }
+        updateMfrProgress.done++;
+      }
+      updateMfrProgress.active = false;
+      updateMfrProgress.finishedAt = Date.now();
+      storage.appendLog({ level: "info", message: `Update-manufacturer done: ${updateMfrProgress.ok} ok / ${updateMfrProgress.failed} failed`, detailsJson: "{}", createdAt: Date.now() });
+    })();
+    res.json({ ok: true, mode: "background", total: items.length, note: "Updating in background — poll GET /api/jomashop/update-manufacturer-progress." });
+  });
+
+  app.get("/api/jomashop/update-manufacturer-progress", (_req, res) => {
+    res.json({ ok: true, progress: updateMfrProgress });
   });
 
   // ---------- Bulk zero-out inventory on Jomashop ----------
