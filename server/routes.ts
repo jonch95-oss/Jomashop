@@ -183,6 +183,12 @@ let updateMfrProgress: {
   startedAt: number | null; finishedAt: number | null; lastError: string | null;
 } = { active: false, total: 0, done: 0, ok: 0, failed: 0, startedAt: null, finishedAt: null, lastError: null };
 
+/** Throttle between Jomashop-bound iterations in background jobs so we stay
+ *  under Jomashop's rate limits (120 GET/min, 600 PUT/POST/min). Each push
+ *  is ~2 writes, so ~350ms/iteration keeps writes well under the cap. */
+const JOMASHOP_THROTTLE_MS = Number(process.env.JOMASHOP_THROTTLE_MS) || 350;
+const sleepMs = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
 /**
  * Build a vendor-sku → live push-status overlay so cached rows reflect the
  * latest push state without requiring a full /api/products/refresh. The push
@@ -1200,6 +1206,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
               if (r.status === "applied") setDiscountProgress.applied++;
               else if (r.status === "skipped") setDiscountProgress.skipped++;
               else setDiscountProgress.rejected++;
+              await sleepMs(JOMASHOP_THROTTLE_MS);
             }
           } catch { setDiscountProgress.rejected++; }
           setDiscountProgress.done++;
@@ -1318,6 +1325,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           pushMissingProgress.lastError = (err as Error).message;
         }
         pushMissingProgress.done++;
+        await sleepMs(JOMASHOP_THROTTLE_MS);
       }
       pushMissingProgress.active = false;
       pushMissingProgress.finishedAt = Date.now();
@@ -1392,6 +1400,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         try { const r = await doOne(it); if (r.ok) updateMfrProgress.ok++; else { updateMfrProgress.failed++; updateMfrProgress.lastError = JSON.stringify(r.error).slice(0, 200); } }
         catch (err) { updateMfrProgress.failed++; updateMfrProgress.lastError = (err as Error).message; }
         updateMfrProgress.done++;
+        await sleepMs(JOMASHOP_THROTTLE_MS);
       }
       updateMfrProgress.active = false;
       updateMfrProgress.finishedAt = Date.now();
