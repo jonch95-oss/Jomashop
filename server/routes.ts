@@ -193,6 +193,15 @@ let attachImgProgress: {
   results: Record<string, string[]>;
 } = { active: false, total: 0, done: 0, ok: 0, failed: 0, startedAt: null, finishedAt: null, lastError: null, results: {} };
 
+/** Progress of the background "dedupe product media" job — removes duplicate
+ *  image media from Shopify products (keeps the clean originals) and records
+ *  the surviving canonical image urls per product id. */
+let dedupMediaProgress: {
+  active: boolean; total: number; done: number; ok: number; deleted: number; failed: number;
+  startedAt: number | null; finishedAt: number | null; lastError: string | null;
+  results: Record<string, string[]>;
+} = { active: false, total: 0, done: 0, ok: 0, deleted: 0, failed: 0, startedAt: null, finishedAt: null, lastError: null, results: {} };
+
 /** Progress of the background set-title job (updates Shopify product title AND
  *  the Jomashop listing name so titles go live and never revert to the old
  *  Shopify title on a future sync). */
@@ -1591,6 +1600,72 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       storage.appendLog({ level: "info", message: `Attach-images done: ok ${attachImgProgress.ok}, failed ${attachImgProgress.failed}`, detailsJson: "{}", createdAt: Date.now() });
     })();
     res.json({ ok: true, started: true, products: items.length, note: "Uploading images to Shopify in background — poll GET /api/products/attach-shopify-images-progress." });
+  });
+
+  app.get("/api/products/dedup-media-progress", (_req, res) => {
+    res.json({ ok: true, progress: dedupMediaProgress });
+  });
+
+  // POST /api/products/dedup-media  { items:[{ shopify_product_id }], confirm }
+  // For each product, keep only image media whose filename matches the clean
+  // "<name>_<n>.jpg" pattern (no Shopify UUID suffix) and delete the rest.
+  // Records surviving canonical urls per product id in dedupMediaProgress.results.
+  app.post("/api/products/dedup-media", async (req, res) => {
+    if (req.body?.confirm !== true) return res.status(400).json({ ok: false, error: "Set confirm:true to dedupe media." });
+    const raw = Array.isArray(req.body?.items) ? req.body.items : [];
+    const pids = raw.map((r: any) => String(r?.shopify_product_id ?? "").trim()).filter(Boolean);
+    if (pids.length === 0) return res.status(400).json({ ok: false, error: "No shopify_product_id items." });
+    const conn = getActiveShopifyConnection();
+    if (!conn) return res.status(503).json({ ok: false, error: "No connected Shopify store." });
+    if (dedupMediaProgress.active) return res.status(409).json({ ok: false, error: "A dedup job is already running.", progress: dedupMediaProgress });
+
+    dedupMediaProgress = { active: true, total: pids.length, done: 0, ok: 0, deleted: 0, failed: 0, startedAt: Date.now(), finishedAt: null, lastError: null, results: {} };
+    const shopGql = async (query: string, variables: Record<string, unknown>) => {
+      const r = await fetch(`https://${conn.shopDomain}/admin/api/2024-10/graphql.json`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": conn.accessToken },
+        body: JSON.stringify({ query, variables }),
+      });
+      return (await r.json()) as any;
+    };
+    // clean filename: "<anything>_<digits>.jpg" with no 8-4-4-4-12 uuid segment.
+    const isClean = (url: string): boolean => {
+      const fn = (url.split("/").pop() || "").split("?")[0];
+      if (/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i.test(fn)) return false;
+      return /_\d+\.(jpg|jpeg|png|webp)$/i.test(fn);
+    };
+    void (async () => {
+      for (const pid of pids) {
+        try {
+          const gid = `gid://shopify/Product/${pid}`;
+          const q = `query P($id:ID!){ product(id:$id){ media(first:50){ nodes{ ... on MediaImage { id image { url } } } } } }`;
+          const j = await shopGql(q, { id: gid });
+          const nodes = (j?.data?.product?.media?.nodes ?? []).filter((n: any) => n?.id && n?.image?.url);
+          const keep = nodes.filter((n: any) => isClean(n.image.url));
+          const del = nodes.filter((n: any) => !isClean(n.image.url));
+          // Fallback: if nothing matches the clean pattern, keep the first 3 and delete the rest.
+          let keepFinal = keep, delFinal = del;
+          if (keep.length === 0 && nodes.length > 0) { keepFinal = nodes.slice(0, 3); delFinal = nodes.slice(3); }
+          if (delFinal.length > 0) {
+            const dm = `mutation D($productId:ID!,$mediaIds:[ID!]!){ productDeleteMedia(productId:$productId, mediaIds:$mediaIds){ deletedMediaIds mediaUserErrors{ message } } }`;
+            const dj = await shopGql(dm, { productId: gid, mediaIds: delFinal.map((n: any) => n.id) });
+            const derr = dj?.data?.productDeleteMedia?.mediaUserErrors ?? [];
+            if (derr.length) throw new Error("productDeleteMedia: " + JSON.stringify(derr).slice(0, 160));
+            dedupMediaProgress.deleted += (dj?.data?.productDeleteMedia?.deletedMediaIds ?? []).length;
+          }
+          dedupMediaProgress.results[pid] = keepFinal.map((n: any) => n.image.url);
+          dedupMediaProgress.ok++;
+        } catch (err) {
+          dedupMediaProgress.failed++;
+          dedupMediaProgress.lastError = (err as Error).message;
+        }
+        dedupMediaProgress.done++;
+        await sleepMs(300);
+      }
+      dedupMediaProgress.active = false;
+      dedupMediaProgress.finishedAt = Date.now();
+    })();
+    res.json({ ok: true, started: true, products: pids.length, note: "Deduping product media in background — poll GET /api/products/dedup-media-progress." });
   });
 
   // ---------- Zero out inventory for a specific SKU list ----------
