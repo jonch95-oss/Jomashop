@@ -183,6 +183,16 @@ let updateMfrProgress: {
   startedAt: number | null; finishedAt: number | null; lastError: string | null;
 } = { active: false, total: 0, done: 0, ok: 0, failed: 0, startedAt: null, finishedAt: null, lastError: null };
 
+/** Progress of the background "upload provided images to Shopify" job. Uploads
+ *  local image bytes to each Shopify product via staged upload + productCreateMedia,
+ *  polls until the CDN url is ready, and records url list per product id so a
+ *  follow-up set-title-bulk can push those Shopify CDN urls to Jomashop. */
+let attachImgProgress: {
+  active: boolean; total: number; done: number; ok: number; failed: number;
+  startedAt: number | null; finishedAt: number | null; lastError: string | null;
+  results: Record<string, string[]>;
+} = { active: false, total: 0, done: 0, ok: 0, failed: 0, startedAt: null, finishedAt: null, lastError: null, results: {} };
+
 /** Progress of the background set-title job (updates Shopify product title AND
  *  the Jomashop listing name so titles go live and never revert to the old
  *  Shopify title on a future sync). */
@@ -1443,7 +1453,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const dryRun = req.body?.dryRun === true;
     const raw = Array.isArray(req.body?.items) ? req.body.items : [];
     const items = raw
-      .map((r: any) => ({ pid: String(r?.shopify_product_id ?? "").trim(), title: String(r?.title ?? "").trim(), jskus: Array.isArray(r?.jomashop_skus) ? r.jomashop_skus.map((x: any) => String(x).trim()).filter(Boolean) : [] }))
+      .map((r: any) => ({ pid: String(r?.shopify_product_id ?? "").trim(), title: String(r?.title ?? "").trim(), jskus: Array.isArray(r?.jomashop_skus) ? r.jomashop_skus.map((x: any) => String(x).trim()).filter(Boolean) : [], images: Array.isArray(r?.images) ? r.images.map((x: any) => String(x).trim()).filter(Boolean) : [] }))
       .filter((r: any) => r.pid && r.title);
     if (items.length === 0) return res.status(400).json({ ok: false, error: "No valid { shopify_product_id, title } items." });
     const conn = getActiveShopifyConnection();
@@ -1490,6 +1500,97 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   app.get("/api/products/set-title-progress", (_req, res) => {
     res.json({ ok: true, progress: setTitleProgress });
+
+  app.get("/api/products/attach-shopify-images-progress", (_req, res) => {
+    res.json({ ok: true, progress: attachImgProgress });
+  });
+
+  // POST /api/products/attach-shopify-images
+  //   { items: [{ shopify_product_id, images: [{ filename, b64 }] }], confirm }
+  // Uploads the provided image bytes to each Shopify product via staged upload +
+  // productCreateMedia, polls until the CDN url is READY, and records the url
+  // list per product id in attachImgProgress.results. A follow-up set-title-bulk
+  // then pushes those Shopify CDN urls to Jomashop so the listings go live.
+  app.post("/api/products/attach-shopify-images", async (req, res) => {
+    if (req.body?.confirm !== true) return res.status(400).json({ ok: false, error: "Set confirm:true to upload images." });
+    const raw = Array.isArray(req.body?.items) ? req.body.items : [];
+    const items = raw
+      .map((r: any) => ({
+        pid: String(r?.shopify_product_id ?? "").trim(),
+        images: Array.isArray(r?.images)
+          ? r.images.map((im: any) => ({ filename: String(im?.filename ?? "img.jpg"), b64: String(im?.b64 ?? "") })).filter((im: any) => im.b64)
+          : [],
+      }))
+      .filter((r: any) => r.pid && r.images.length > 0);
+    if (items.length === 0) return res.status(400).json({ ok: false, error: "No valid { shopify_product_id, images } items." });
+    const conn = getActiveShopifyConnection();
+    if (!conn) return res.status(503).json({ ok: false, error: "No connected Shopify store." });
+    if (attachImgProgress.active) return res.status(409).json({ ok: false, error: "An attach-images job is already running.", progress: attachImgProgress });
+
+    attachImgProgress = { active: true, total: items.length, done: 0, ok: 0, failed: 0, startedAt: Date.now(), finishedAt: null, lastError: null, results: {} };
+    const shopGql = async (query: string, variables: Record<string, unknown>) => {
+      const r = await fetch(`https://${conn.shopDomain}/admin/api/2024-10/graphql.json`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": conn.accessToken },
+        body: JSON.stringify({ query, variables }),
+      });
+      return (await r.json()) as any;
+    };
+    void (async () => {
+      for (const it of items) {
+        try {
+          const productGid = `gid://shopify/Product/${it.pid}`;
+          // 1) Stage uploads for all images.
+          const stagedQ = `mutation S($input:[StagedUploadInput!]!){ stagedUploadsCreate(input:$input){ stagedTargets{ url resourceUrl parameters{ name value } } userErrors{ message } } }`;
+          const stagedInput = it.images.map((im: any) => ({ filename: im.filename, mimeType: "image/jpeg", resource: "IMAGE", httpMethod: "POST" }));
+          const sj = await shopGql(stagedQ, { input: stagedInput });
+          const targets = sj?.data?.stagedUploadsCreate?.stagedTargets ?? [];
+          const sErr = sj?.data?.stagedUploadsCreate?.userErrors ?? [];
+          if (targets.length !== it.images.length || sErr.length) throw new Error("stagedUploadsCreate: " + JSON.stringify(sErr).slice(0, 160));
+          // 2) Upload bytes to each staged target.
+          const sources: string[] = [];
+          for (let i = 0; i < targets.length; i++) {
+            const t = targets[i];
+            const form = new FormData();
+            for (const prm of (t.parameters ?? [])) form.append(prm.name, prm.value);
+            const buf = Buffer.from(it.images[i].b64, "base64");
+            form.append("file", new Blob([buf], { type: "image/jpeg" }), it.images[i].filename);
+            const up = await fetch(t.url, { method: "POST", body: form as any });
+            if (!up.ok) throw new Error(`staged upload HTTP ${up.status}`);
+            sources.push(t.resourceUrl);
+          }
+          // 3) Attach to product.
+          const cmQ = `mutation C($productId:ID!,$media:[CreateMediaInput!]!){ productCreateMedia(productId:$productId, media:$media){ media{ ... on MediaImage { id status } } mediaUserErrors{ message } } }`;
+          const media = sources.map((src) => ({ originalSource: src, mediaContentType: "IMAGE" }));
+          const cj = await shopGql(cmQ, { productId: productGid, media });
+          const cErr = cj?.data?.productCreateMedia?.mediaUserErrors ?? [];
+          if (cErr.length) throw new Error("productCreateMedia: " + JSON.stringify(cErr).slice(0, 160));
+          // 4) Poll product media until CDN urls are READY.
+          const pollQ = `query P($id:ID!){ product(id:$id){ media(first:30){ nodes{ ... on MediaImage { status image { url } } } } } }`;
+          let urls: string[] = [];
+          for (let attempt = 0; attempt < 15; attempt++) {
+            await sleepMs(2000);
+            const pj = await shopGql(pollQ, { id: productGid });
+            const nodes = pj?.data?.product?.media?.nodes ?? [];
+            const ready = nodes.filter((n: any) => n?.status === "READY" && n?.image?.url);
+            if (ready.length >= sources.length) { urls = ready.map((n: any) => n.image.url); break; }
+            urls = ready.map((n: any) => n?.image?.url).filter(Boolean);
+          }
+          if (urls.length === 0) throw new Error("no READY media urls after polling");
+          attachImgProgress.results[it.pid] = urls;
+          attachImgProgress.ok++;
+        } catch (err) {
+          attachImgProgress.failed++;
+          attachImgProgress.lastError = (err as Error).message;
+        }
+        attachImgProgress.done++;
+      }
+      attachImgProgress.active = false;
+      attachImgProgress.finishedAt = Date.now();
+      storage.appendLog({ level: "info", message: `Attach-images done: ok ${attachImgProgress.ok}, failed ${attachImgProgress.failed}`, detailsJson: "{}", createdAt: Date.now() });
+    })();
+    res.json({ ok: true, started: true, products: items.length, note: "Uploading images to Shopify in background — poll GET /api/products/attach-shopify-images-progress." });
+  });
   });
 
   // ---------- Zero out inventory for a specific SKU list ----------
