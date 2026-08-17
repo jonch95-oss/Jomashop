@@ -202,6 +202,14 @@ let dedupMediaProgress: {
   results: Record<string, string[]>;
 } = { active: false, total: 0, done: 0, ok: 0, deleted: 0, failed: 0, startedAt: null, finishedAt: null, lastError: null, results: {} };
 
+/** Progress of the background "set images only on Jomashop" job (PUTs
+ *  product.images WITHOUT name, so it works on already-approved products
+ *  where name/title changes are rejected). */
+let setImagesProgress: {
+  active: boolean; total: number; done: number; ok: number; failed: number;
+  startedAt: number | null; finishedAt: number | null; lastError: string | null;
+} = { active: false, total: 0, done: 0, ok: 0, failed: 0, startedAt: null, finishedAt: null, lastError: null };
+
 /** Progress of the background set-title job (updates Shopify product title AND
  *  the Jomashop listing name so titles go live and never revert to the old
  *  Shopify title on a future sync). */
@@ -1600,6 +1608,42 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       storage.appendLog({ level: "info", message: `Attach-images done: ok ${attachImgProgress.ok}, failed ${attachImgProgress.failed}`, detailsJson: "{}", createdAt: Date.now() });
     })();
     res.json({ ok: true, started: true, products: items.length, note: "Uploading images to Shopify in background — poll GET /api/products/attach-shopify-images-progress." });
+  });
+
+  app.get("/api/products/set-images-progress", (_req, res) => {
+    res.json({ ok: true, progress: setImagesProgress });
+  });
+
+  // POST /api/products/set-images-bulk  { items:[{ jomashop_skus:string[], images:string[] }], confirm }
+  // PUTs product.images ONLY (no name) to each Jomashop SKU — works on approved
+  // products where a name/title change is rejected. Background + throttled.
+  app.post("/api/products/set-images-bulk", async (req, res) => {
+    if (req.body?.confirm !== true) return res.status(400).json({ ok: false, error: "Set confirm:true." });
+    const raw = Array.isArray(req.body?.items) ? req.body.items : [];
+    const items = raw
+      .map((r: any) => ({
+        jskus: Array.isArray(r?.jomashop_skus) ? r.jomashop_skus.map((x: any) => String(x).trim()).filter(Boolean) : [],
+        images: Array.isArray(r?.images) ? r.images.map((x: any) => String(x).trim()).filter(Boolean) : [],
+      }))
+      .filter((r: any) => r.jskus.length > 0 && r.images.length > 0);
+    if (items.length === 0) return res.status(400).json({ ok: false, error: "No valid { jomashop_skus, images } items." });
+    if (setImagesProgress.active) return res.status(409).json({ ok: false, error: "A set-images job is already running.", progress: setImagesProgress });
+    setImagesProgress = { active: true, total: items.reduce((n: number, it: any) => n + it.jskus.length, 0), done: 0, ok: 0, failed: 0, startedAt: Date.now(), finishedAt: null, lastError: null };
+    void (async () => {
+      for (const it of items) {
+        for (const sku of it.jskus) {
+          try {
+            const r = await jomashopRequest({ method: "PUT", path: `/v1/products/${encodeURIComponent(sku)}`, body: { product: { images: it.images } } });
+            if (r.ok) setImagesProgress.ok++; else { setImagesProgress.failed++; setImagesProgress.lastError = JSON.stringify(r.errorData ?? r.error ?? "").slice(0, 200); }
+          } catch (err) { setImagesProgress.failed++; setImagesProgress.lastError = (err as Error).message; }
+          setImagesProgress.done++;
+          await sleepMs(JOMASHOP_THROTTLE_MS);
+        }
+      }
+      setImagesProgress.active = false;
+      setImagesProgress.finishedAt = Date.now();
+    })();
+    res.json({ ok: true, started: true, skus: setImagesProgress.total, note: "Setting Jomashop images in background — poll GET /api/products/set-images-progress." });
   });
 
   app.get("/api/products/dedup-media-progress", (_req, res) => {
