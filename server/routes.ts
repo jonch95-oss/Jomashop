@@ -4316,6 +4316,37 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       });
     }
 
+    // ---- Hard image guard (applies to EVERY push path) ----
+    // Never create/push an image-less product on Jomashop — it is unsellable
+    // and drives high returns. If, after hydrating images from Shopify, the
+    // outbound payload still has no image, refuse the push (and report it in
+    // dry-run). Callers must add an image first.
+    const outboundImages = Array.isArray((payload as any)?.images)
+      ? (payload as any).images.filter((x: any) => typeof x === "string" && x.trim() !== "")
+      : [];
+    if (outboundImages.length === 0) {
+      storage.updateSyncJob(job.id, {
+        status: "failed",
+        finishedAt: Date.now(),
+        summary: "no_image: refused to push image-less product",
+      });
+      storage.appendLog({
+        jobId: job.id,
+        level: "warn",
+        message: `Refused push for ${mapped.vendor_sku}: no image (image-less products are never pushed to Jomashop)`,
+        detailsJson: JSON.stringify({ vendorSku: mapped.vendor_sku, imagesFetched, imagesFetchError }),
+        createdAt: Date.now(),
+      });
+      return res.status(422).json({
+        ok: false,
+        blocked: "no_image",
+        error: `Refusing to push ${mapped.vendor_sku}: no image. Image-less products are not pushed to Jomashop until an image is added.`,
+        vendorSku: mapped.vendor_sku,
+        imagesFetched,
+        imagesFetchError,
+      });
+    }
+
     // Dry-run / validate-only: all preflight checks have passed and the
     // payload is fully built. Return the would-be payload + envelope without
     // calling the Jomashop API so the operator can preview a clean push.
