@@ -1500,6 +1500,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   app.get("/api/products/set-title-progress", (_req, res) => {
     res.json({ ok: true, progress: setTitleProgress });
+  });
 
   app.get("/api/products/attach-shopify-images-progress", (_req, res) => {
     res.json({ ok: true, progress: attachImgProgress });
@@ -1590,7 +1591,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       storage.appendLog({ level: "info", message: `Attach-images done: ok ${attachImgProgress.ok}, failed ${attachImgProgress.failed}`, detailsJson: "{}", createdAt: Date.now() });
     })();
     res.json({ ok: true, started: true, products: items.length, note: "Uploading images to Shopify in background — poll GET /api/products/attach-shopify-images-progress." });
-  });
   });
 
   // ---------- Zero out inventory for a specific SKU list ----------
