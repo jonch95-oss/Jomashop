@@ -183,6 +183,21 @@ let updateMfrProgress: {
   startedAt: number | null; finishedAt: number | null; lastError: string | null;
 } = { active: false, total: 0, done: 0, ok: 0, failed: 0, startedAt: null, finishedAt: null, lastError: null };
 
+/** Progress of the background set-title job (updates Shopify product title AND
+ *  the Jomashop listing name so titles go live and never revert to the old
+ *  Shopify title on a future sync). */
+let setTitleProgress: {
+  active: boolean; total: number; done: number; shopifyOk: number; jomashopOk: number; failed: number;
+  startedAt: number | null; finishedAt: number | null; lastError: string | null;
+} = { active: false, total: 0, done: 0, shopifyOk: 0, jomashopOk: 0, failed: 0, startedAt: null, finishedAt: null, lastError: null };
+
+/** Progress of the background "zero out inventory by SKU list" job (used to
+ *  pull image-less products off sale on Jomashop until images exist). */
+let zeroSkusProgress: {
+  active: boolean; total: number; done: number; ok: number; failed: number;
+  startedAt: number | null; finishedAt: number | null; lastError: string | null;
+} = { active: false, total: 0, done: 0, ok: 0, failed: 0, startedAt: null, finishedAt: null, lastError: null };
+
 /** Throttle between Jomashop-bound iterations in background jobs so we stay
  *  under Jomashop's rate limits (120 GET/min, 600 PUT/POST/min). Each push
  *  is ~2 writes, so ~350ms/iteration keeps writes well under the cap. */
@@ -1252,11 +1267,15 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     type Item = { pid: string; variantSku: string };
     const work: Item[] = [];
     let blockedProducts = 0;
+    let noImageProducts = 0;
     for (const m of mappedRows) {
       const blocked = (m?.missing_required?.length ?? 0) > 0 || (m?.missing_top_level?.length ?? 0) > 0;
       const pid = String(m?.source?.shopify_product_id ?? "");
       if (!pid) continue;
       if (blocked) { blockedProducts++; continue; }
+      // Never create an image-less product on Jomashop — it would be
+      // unsellable / high-return. Skip until it has an image.
+      if (!Array.isArray(m?.images) || m.images.length === 0) { noImageProducts++; continue; }
       const variants = Array.isArray(m?.variants) ? m.variants : [];
       for (const v of variants) {
         const vsku = String(v?.vendor_sku ?? "").trim();
@@ -1268,7 +1287,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
     if (dryRun) {
       const byProduct = new Set(work.map((w) => w.pid)).size;
-      return res.json({ ok: true, dryRun: true, missingVariants: work.length, productsAffected: byProduct, blockedProducts });
+      return res.json({ ok: true, dryRun: true, missingVariants: work.length, productsAffected: byProduct, blockedProducts, noImageProducts });
     }
     if (pushMissingProgress.active) {
       return res.status(409).json({ ok: false, error: "A push-missing job is already running.", progress: pushMissingProgress });
@@ -1337,7 +1356,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       });
     })();
 
-    res.json({ ok: true, started: true, missingVariants: work.length, blockedProducts, note: "Pushing missing sizes in the background — poll GET /api/products/push-missing-progress." });
+    res.json({ ok: true, started: true, missingVariants: work.length, blockedProducts, noImageProducts, note: "Pushing missing sizes in the background — poll GET /api/products/push-missing-progress." });
   });
 
   app.get("/api/products/push-missing-progress", (_req, res) => {
@@ -1411,6 +1430,99 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   app.get("/api/jomashop/update-manufacturer-progress", (_req, res) => {
     res.json({ ok: true, progress: updateMfrProgress });
+  });
+
+  // ---------- Set product TITLE (Shopify source + Jomashop listing) ----------
+  // POST /api/products/set-title-bulk
+  //   { items: [{ shopify_product_id, jomashop_skus: string[], title }], confirm, dryRun }
+  // Updates the Shopify product title (the source of truth, so the new title
+  // never reverts on a future re-map/re-push) AND PUTs the Jomashop listing
+  // name for each live SKU (so it goes live now). Background + throttled.
+  app.post("/api/products/set-title-bulk", async (req, res) => {
+    if (req.body?.confirm !== true) return res.status(400).json({ ok: false, error: "Set confirm:true to update titles." });
+    const dryRun = req.body?.dryRun === true;
+    const raw = Array.isArray(req.body?.items) ? req.body.items : [];
+    const items = raw
+      .map((r: any) => ({ pid: String(r?.shopify_product_id ?? "").trim(), title: String(r?.title ?? "").trim(), jskus: Array.isArray(r?.jomashop_skus) ? r.jomashop_skus.map((x: any) => String(x).trim()).filter(Boolean) : [] }))
+      .filter((r: any) => r.pid && r.title);
+    if (items.length === 0) return res.status(400).json({ ok: false, error: "No valid { shopify_product_id, title } items." });
+    const conn = getActiveShopifyConnection();
+    if (!conn) return res.status(503).json({ ok: false, error: "No connected Shopify store." });
+    if (dryRun) return res.json({ ok: true, dryRun: true, products: items.length, jomashopSkus: items.reduce((n: number, it: any) => n + it.jskus.length, 0) });
+    if (setTitleProgress.active) return res.status(409).json({ ok: false, error: "A set-title job is already running.", progress: setTitleProgress });
+
+    setTitleProgress = { active: true, total: items.length, done: 0, shopifyOk: 0, jomashopOk: 0, failed: 0, startedAt: Date.now(), finishedAt: null, lastError: null };
+    const shopGql = async (query: string, variables: Record<string, unknown>) => {
+      const r = await fetch(`https://${conn.shopDomain}/admin/api/2024-10/graphql.json`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": conn.accessToken },
+        body: JSON.stringify({ query, variables }),
+      });
+      return (await r.json()) as any;
+    };
+    void (async () => {
+      for (const it of items) {
+        try {
+          // 1) Shopify product title (source of truth -> no revert).
+          const q = `mutation U($input: ProductInput!){ productUpdate(input: $input){ product { id } userErrors { message } } }`;
+          const j = await shopGql(q, { input: { id: `gid://shopify/Product/${it.pid}`, title: it.title } });
+          const ue = j?.data?.productUpdate?.userErrors ?? [];
+          if (!(j?.errors?.length) && ue.length === 0) setTitleProgress.shopifyOk++;
+          else { setTitleProgress.failed++; setTitleProgress.lastError = [...(j.errors ?? []), ...ue].map((e: any) => e.message).join("; ").slice(0, 200); }
+          await sleepMs(JOMASHOP_THROTTLE_MS);
+          // 2) Jomashop listing name for each live SKU (goes live now).
+          for (const sku of it.jskus) {
+            const prod: Record<string, unknown> = { name: it.title };
+            if (it.images && it.images.length > 0) prod.images = it.images; // absolute URLs or base64 data URIs
+            const r = await jomashopRequest({ method: "PUT", path: `/v1/products/${encodeURIComponent(sku)}`, body: { product: prod } });
+            if (r.ok) setTitleProgress.jomashopOk++; else { setTitleProgress.failed++; setTitleProgress.lastError = JSON.stringify(r.errorData ?? r.error ?? "").slice(0, 200); }
+            await sleepMs(JOMASHOP_THROTTLE_MS);
+          }
+        } catch (err) { setTitleProgress.failed++; setTitleProgress.lastError = (err as Error).message; }
+        setTitleProgress.done++;
+      }
+      setTitleProgress.active = false;
+      setTitleProgress.finishedAt = Date.now();
+      storage.appendLog({ level: "info", message: `Set-title done: shopify ${setTitleProgress.shopifyOk}, jomashop ${setTitleProgress.jomashopOk}, failed ${setTitleProgress.failed}`, detailsJson: "{}", createdAt: Date.now() });
+    })();
+    res.json({ ok: true, started: true, products: items.length, note: "Updating Shopify titles + Jomashop names in background — poll GET /api/products/set-title-progress." });
+  });
+
+  app.get("/api/products/set-title-progress", (_req, res) => {
+    res.json({ ok: true, progress: setTitleProgress });
+  });
+
+  // ---------- Zero out inventory for a specific SKU list ----------
+  // POST /api/jomashop/zero-inventory-skus  { skus: [...], confirm, dryRun }
+  // Sets quantity 0 + status out_of_stock on Jomashop for each SKU. Used to
+  // pull image-less products off sale until real images are added. Throttled.
+  app.post("/api/jomashop/zero-inventory-skus", async (req, res) => {
+    if (req.body?.confirm !== true) return res.status(400).json({ ok: false, error: "Set confirm:true to zero out inventory." });
+    if (!jomashopConfigured()) return res.status(503).json({ ok: false, error: "Jomashop credentials not configured." });
+    const dryRun = req.body?.dryRun === true;
+    const skus = (Array.isArray(req.body?.skus) ? req.body.skus : []).map((x: any) => String(x).trim()).filter(Boolean);
+    if (skus.length === 0) return res.status(400).json({ ok: false, error: "No skus provided." });
+    if (dryRun) return res.json({ ok: true, dryRun: true, count: skus.length, sample: skus.slice(0, 20) });
+    if (zeroSkusProgress.active) return res.status(409).json({ ok: false, error: "A zero-inventory job is already running.", progress: zeroSkusProgress });
+    zeroSkusProgress = { active: true, total: skus.length, done: 0, ok: 0, failed: 0, startedAt: Date.now(), finishedAt: null, lastError: null };
+    void (async () => {
+      for (const sku of skus) {
+        try {
+          const r = await jomashopRequest({ method: "PUT", path: `/v1/inventory/${encodeURIComponent(sku)}`, body: { status: "out_of_stock", quantity: 0 } });
+          if (r.ok) zeroSkusProgress.ok++; else { zeroSkusProgress.failed++; zeroSkusProgress.lastError = JSON.stringify(r.errorData ?? r.error ?? "").slice(0, 160); }
+        } catch (err) { zeroSkusProgress.failed++; zeroSkusProgress.lastError = (err as Error).message; }
+        zeroSkusProgress.done++;
+        await sleepMs(JOMASHOP_THROTTLE_MS);
+      }
+      zeroSkusProgress.active = false;
+      zeroSkusProgress.finishedAt = Date.now();
+      storage.appendLog({ level: "info", message: `Zero-inventory-skus done: ${zeroSkusProgress.ok} ok / ${zeroSkusProgress.failed} failed of ${skus.length}`, detailsJson: "{}", createdAt: Date.now() });
+    })();
+    res.json({ ok: true, started: true, total: skus.length, note: "Zeroing out in background — poll GET /api/jomashop/zero-inventory-progress." });
+  });
+
+  app.get("/api/jomashop/zero-inventory-progress", (_req, res) => {
+    res.json({ ok: true, progress: zeroSkusProgress });
   });
 
   // ---------- Bulk zero-out inventory on Jomashop ----------
