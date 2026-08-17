@@ -96,6 +96,7 @@ type ProductFilter =
   | "missing_discount"
   | "unresolved_brand"
   | "unresolved_category"
+  | "missing_image"
   | "sample";
 
 function brandUnresolved(p: MappedProduct): boolean {
@@ -146,6 +147,16 @@ function hasCommercialDiscount(p: MappedProduct): boolean {
   return p.commercial_discount_missing !== true && typeof p.commercial_discount === "number" && p.commercial_discount > 0;
 }
 
+/** True when the product has at least one image. Image-less products can't be
+ *  pushed to Jomashop (unsellable / high return) and are surfaced via the
+ *  "Missing images" filter so they can be pulled for photography. */
+function hasImage(p: MappedProduct): boolean {
+  const imgs = (p as any).images;
+  if (Array.isArray(imgs) && imgs.some((x: any) => typeof x === "string" && x.trim() !== "")) return true;
+  const single = (p as any).image;
+  return typeof single === "string" && single.trim() !== "";
+}
+
 function commercialDiscountLabel(p: MappedProduct): string {
   if (!hasCommercialDiscount(p)) return "missing";
   return `${Math.round(p.commercial_discount * 1000) / 10}%`;
@@ -175,6 +186,7 @@ function unresolvedRequiredEnumSummary(p: MappedProduct): string | null {
  */
 function isPushBlocked(p: MappedProduct): boolean {
   if (p.is_sample) return true;
+  if (!hasImage(p)) return true;
   if (!hasCommercialDiscount(p)) return true;
   if (p.readiness === "ready") return false;
   // "rejected" rows can still be retried via the modal; we surface them
@@ -529,6 +541,7 @@ export default function Products() {
       missing_discount: 0,
       unresolved_brand: 0,
       unresolved_category: 0,
+      missing_image: 0,
       sample: 0,
     };
     for (const p of mapped) {
@@ -543,6 +556,7 @@ export default function Products() {
       else if (miss.length > 0 && !p.is_sample) counts.missing += 1;
       if (!p.is_sample && brandUnresolved(p)) counts.unresolved_brand += 1;
       if (!p.is_sample && categoryUnresolved(p)) counts.unresolved_category += 1;
+      if (!p.is_sample && !hasImage(p)) counts.missing_image += 1;
     }
     return counts;
   }, [scopedProducts]);
@@ -578,6 +592,7 @@ export default function Products() {
       if (filter === "missing_discount") return !p.is_sample && !hasCommercialDiscount(p);
       if (filter === "unresolved_brand") return !p.is_sample && brandUnresolved(p);
       if (filter === "unresolved_category") return !p.is_sample && categoryUnresolved(p);
+      if (filter === "missing_image") return !p.is_sample && !hasImage(p);
       if (filter === "sample") return p.is_sample === true;
       return true;
     });
@@ -666,6 +681,7 @@ export default function Products() {
     { key: "not_pushed", label: "Not pushed", count: filterCounts.not_pushed },
     { key: "rejected", label: "Rejected / Needs fix", count: filterCounts.rejected },
     { key: "missing_discount", label: "Missing discount", count: filterCounts.missing_discount },
+    { key: "missing_image", label: "Missing images", count: filterCounts.missing_image },
     { key: "unresolved_brand", label: "Unresolved brand", count: filterCounts.unresolved_brand },
     {
       key: "unresolved_category",
@@ -847,10 +863,39 @@ export default function Products() {
                 );
               })()}
               <Button
+                data-testid="button-export-filtered-csv"
+                size="sm"
+                variant="outline"
+                className="ml-auto h-7 text-[11px]"
+                onClick={() => {
+                  const rows = [["Vendor SKU", "Brand", "Name", "Category", "Has Image"]];
+                  for (const p of filteredProducts) {
+                    rows.push([
+                      p.vendor_sku ?? "",
+                      p.brand ?? "",
+                      (p.name ?? "").replace(/"/g, "'"),
+                      finalJomashopCategoryOf(p),
+                      hasImage(p) ? "yes" : "no",
+                    ]);
+                  }
+                  const csv = rows.map((r) => r.map((c) => `"${String(c)}"`).join(",")).join("\n");
+                  const blob = new Blob([csv], { type: "text/csv" });
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement("a");
+                  a.href = url;
+                  a.download = `products-${filter}-${new Date().toISOString().slice(0, 10)}.csv`;
+                  a.click();
+                  URL.revokeObjectURL(url);
+                }}
+                title="Download the current filtered list as CSV (e.g. the Missing images list to send for photography)."
+              >
+                Export CSV
+              </Button>
+              <Button
                 data-testid="button-bulk-push-filtered"
                 size="sm"
                 variant="default"
-                className="ml-auto h-7 text-[11px]"
+                className="h-7 text-[11px]"
                 onClick={() => runBulkPush()}
                 disabled={
                   bulkPushing ||
