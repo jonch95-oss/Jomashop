@@ -2086,7 +2086,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   app.get("/api/jomashop/inventory", async (_req, res) => {
     if (!jomashopConfigured()) return res.json({ configured: false, items: [] });
-    const result = await jomashopRequest({ path: "/v1/inventory" });
+    const result = await jomashopRequest({ path: "/v1/inventory", query: { per_page: "99999" } });
     if (!result.ok) return res.status(502).json({ error: result.error });
     res.json({ configured: true, data: result.data });
   });
