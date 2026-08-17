@@ -42,7 +42,7 @@ declare module "http" {
 // consumed.
 app.use(
   express.json({
-    limit: "5mb",
+    limit: "25mb",
     verify: (req, _res, buf) => {
       req.rawBody = buf;
     },
