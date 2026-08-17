@@ -27,7 +27,7 @@ const httpServer = createServer(app);
 // first and Express's app.use("/api", mw) had stripped the "/api" prefix,
 // causing the `req.path === "/api/health"` exemption to never match.
 app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, time: new Date().toISOString(), build: "missing-image-filter-v6" });
+  res.json({ ok: true, time: new Date().toISOString(), build: "ready-excludes-imageless-v7" });
 });
 app.head("/api/health", (_req, res) => res.status(200).end());
 

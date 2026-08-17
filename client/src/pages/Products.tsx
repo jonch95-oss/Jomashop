@@ -552,7 +552,7 @@ export default function Products() {
       else if (state === "rejected" || state === "failed") counts.rejected += 1;
       else if (!p.is_sample) counts.not_pushed += 1;
       if (!p.is_sample && !hasCommercialDiscount(p)) counts.missing_discount += 1;
-      if (isReady(p)) counts.ready += 1;
+      if (isReady(p) && hasImage(p)) counts.ready += 1;
       else if (miss.length > 0 && !p.is_sample) counts.missing += 1;
       if (!p.is_sample && brandUnresolved(p)) counts.unresolved_brand += 1;
       if (!p.is_sample && categoryUnresolved(p)) counts.unresolved_category += 1;
@@ -584,7 +584,7 @@ export default function Products() {
       const miss = missingFieldsFor(p);
       const state = pushStateOf(p);
       if (filter === "all") return true;
-      if (filter === "ready") return isReady(p);
+      if (filter === "ready") return isReady(p) && hasImage(p);
       if (filter === "missing") return miss.length > 0 && !p.is_sample;
       if (filter === "pushed") return state === "pushed";
       if (filter === "not_pushed") return state === "not_pushed" && !p.is_sample;
