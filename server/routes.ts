@@ -2507,6 +2507,11 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       });
       if (dryRun) continue;
       const product = mappedByProductId.get(entry.shopifyProductId);
+      // Keep any snapshot the row already has. It carries the prices last
+      // sent to Jomashop, and replacing it with the Shopify-derived payload
+      // would silently undo a price import for every row being repaired.
+      const preservedPayload =
+        existing?.lastPayloadJson ?? (product ? JSON.stringify(product) : null);
       storage.upsertPushStatus({
         shopDomain,
         shopifyProductId: entry.shopifyProductId,
@@ -2517,7 +2522,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         lastStatus: null,
         // Marked so the operator can tell an adopted row from a real push.
         lastError: null,
-        lastPayloadJson: product ? JSON.stringify(product) : null,
+        lastPayloadJson: preservedPayload,
         lastInvalidParams: null,
         lastRejectedCategory: null,
         lastRejectedBrand: null,
