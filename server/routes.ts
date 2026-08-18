@@ -4620,16 +4620,24 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     if (body.allowDuplicate !== true) {
       const portalLookup = buildPortalLiveLookup();
       const hit = portalLiveStateFor(portalLookup, portalCandidatesForProduct(mapped));
-      if (hit.state === "live") {
+      // Presence in the portal blocks, not just liveness. A row the portal
+      // knows but has not assigned a Jomashop SKU to still occupies that
+      // vendor SKU on Jomashop's side, so re-pushing it collides. The two
+      // states differ only in the message.
+      if (hit.state === "live" || hit.state === "in_portal") {
+        const liveLabel =
+          hit.state === "live"
+            ? `already lists this style as live on Jomashop (Jomashop SKU ${hit.jomashopSku ?? "unknown"})`
+            : "already has this style (no Jomashop SKU assigned yet)";
         storage.updateSyncJob(job.id, {
           status: "failed",
           finishedAt: Date.now(),
-          summary: "already_live: refused duplicate push",
+          summary: `${hit.state === "live" ? "already_live" : "already_in_portal"}: refused duplicate push`,
         });
         storage.appendLog({
           jobId: job.id,
           level: "warn",
-          message: `Refused push for ${mapped.vendor_sku}: already live on Jomashop as ${hit.jomashopSku ?? "(no SKU recorded)"}`,
+          message: `Refused push for ${mapped.vendor_sku}: Vendor Portal ${liveLabel}`,
           detailsJson: JSON.stringify({
             vendorSku: mapped.vendor_sku,
             portalVendorSku: hit.vendorSku,
@@ -4640,12 +4648,11 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         });
         return res.status(409).json({
           ok: false,
-          blocked: "already_live",
+          blocked: hit.state === "live" ? "already_live" : "already_in_portal",
           error:
-            `Refusing to push ${mapped.vendor_sku}: the Vendor Portal already lists this style as live on ` +
-            `Jomashop (Jomashop SKU ${hit.jomashopSku ?? "unknown"}, matched on ${hit.matchedOn ?? "SKU"}). ` +
-            `Pushing again would create a duplicate listing. Use the Inventory page to update it instead, ` +
-            `or re-send with allowDuplicate:true if this really is a new product.`,
+            `Refusing to push ${mapped.vendor_sku}: the Vendor Portal ${liveLabel}, matched on ` +
+            `${hit.matchedOn ?? "SKU"}. Pushing again would duplicate it. Use the Inventory page to ` +
+            `update it instead, or re-send with allowDuplicate:true if this really is a new product.`,
           vendorSku: mapped.vendor_sku,
           portal: hit,
         });

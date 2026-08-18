@@ -195,10 +195,16 @@ function isPushBlocked(p: MappedProduct): boolean {
   if (p.is_sample) return true;
   if (!hasImage(p)) return true;
   if (!hasCommercialDiscount(p)) return true;
-  // Already live on Jomashop per the Vendor Portal export — pushing again
-  // creates a duplicate listing. The server refuses this too; blocking it here
-  // keeps it out of "Ready to push" and out of the bulk "Push filtered" count.
-  if (portalStateOf(p) === "live") return true;
+  // Already pushed from this app. push-product always POSTs (it never PUTs to
+  // update), so re-pushing is at best a wasted write against Jomashop's rate
+  // budget and at worst a duplicate when the vendor SKU has since changed.
+  // Without this, filtering to "Pushed" still offered every row for bulk push.
+  if (pushStateOf(p) === "pushed") return true;
+  // Already in the Vendor Portal. Presence is the signal, not just liveness:
+  // the SKU exists on Jomashop's side either way, so pushing again duplicates
+  // it. The server refuses this too; blocking here keeps these out of
+  // "Ready to push" and out of the bulk "Push filtered" count.
+  if (portalStateOf(p) !== "unknown") return true;
   if (p.readiness === "ready") return false;
   // "rejected" rows can still be retried via the modal; we surface them
   // through the modal flow rather than the row button so the operator has
@@ -565,7 +571,7 @@ export default function Products() {
       else if (state === "rejected" || state === "failed") counts.rejected += 1;
       else if (!p.is_sample) counts.not_pushed += 1;
       if (!p.is_sample && !hasCommercialDiscount(p)) counts.missing_discount += 1;
-      if (isReady(p) && hasImage(p) && portalStateOf(p) !== "live") counts.ready += 1;
+      if (isReady(p) && hasImage(p) && !isPushBlocked(p)) counts.ready += 1;
       else if (miss.length > 0 && !p.is_sample) counts.missing += 1;
       if (!p.is_sample && brandUnresolved(p)) counts.unresolved_brand += 1;
       if (!p.is_sample && categoryUnresolved(p)) counts.unresolved_category += 1;
@@ -602,7 +608,7 @@ export default function Products() {
       const miss = missingFieldsFor(p);
       const state = pushStateOf(p);
       if (filter === "all") return true;
-      if (filter === "ready") return isReady(p) && hasImage(p) && portalStateOf(p) !== "live";
+      if (filter === "ready") return isReady(p) && hasImage(p) && !isPushBlocked(p);
       if (filter === "missing") return miss.length > 0 && !p.is_sample;
       if (filter === "pushed") return state === "pushed";
       if (filter === "not_pushed") return state === "not_pushed" && !p.is_sample;

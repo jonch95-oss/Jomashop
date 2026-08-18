@@ -219,15 +219,27 @@ A product is matched on any of its identifiers — vendor SKU, style/parent
 number, Jomashop SKU, or any variant SKU — so a style is recognized even when
 the individual size SKU isn't in the export.
 
+`live` vs `in_portal` is a **display** distinction, not a push-permission one.
+Both block a push. The Jomashop SKU tells you the storefront listing exists;
+it is not a reliable "not live" signal when absent, because the bulk-update
+workbook leaves that column blank for rows it has no SKU to quote — confirm
+against the portal's own Joma Status column before reading a blank as "not
+live".
+
 This drives three things:
 
 - **Products** shows a **Live on Jomashop** / **In portal, not live** badge per
   card, with matching filter chips.
-- **`live` products are excluded from "Ready to push"** and from the bulk
-  **Push filtered** count, so they can't be swept up in a batch.
+- **Anything the portal already knows is excluded from "Ready to push"** and
+  from the bulk **Push filtered** count, so it can't be swept up in a batch.
+  That is presence, not just liveness — a row with no Jomashop SKU yet still
+  occupies that vendor SKU on Jomashop's side, so re-pushing it collides.
+  Products already marked `pushed` locally are excluded on the same grounds:
+  push-product always POSTs and never PUTs, so a re-push is a wasted write at
+  best and a duplicate at worst.
 - **`POST /api/jomashop/push-product` refuses them** with HTTP 409 and
-  `blocked: "already_live"`, on every push path including dry runs. Override
-  deliberately with `allowDuplicate: true`.
+  `blocked: "already_live"` or `"already_in_portal"`, on every push path
+  including dry runs. Override deliberately with `allowDuplicate: true`.
 
 Local `push_state` alone cannot prevent duplicates, because it is empty for
 anything pushed before the app's database was last reset — which is exactly
