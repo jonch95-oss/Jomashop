@@ -73,9 +73,12 @@ import { registerMappingMemoryRoutes } from "./mapping_memory";
 import {
   registerPortalRoutes,
   buildCatalogIndex,
+  buildPortalLiveLookup,
   catalogEntriesFromProducts,
   matchPortalStyle,
   normMatchKey,
+  portalCandidatesForProduct,
+  portalLiveStateFor,
   type CatalogIndex,
   type PortalRowInput,
 } from "./portal_reconcile";
@@ -311,14 +314,27 @@ function paginateCachePayload(
   const start = Math.min(opts.offset, totalCount);
   const end = Math.min(start + opts.limit, totalCount);
   const overlay = buildPushStatusOverlay(opts.shopDomain);
+  // Portal truth overlay: whether the Vendor Portal already has this style and
+  // whether Jomashop has assigned it a SKU. Read once per request; it is what
+  // the Products page uses to show "Live on Jomashop" and what stops the same
+  // item being pushed a second time.
+  const portalLookup = buildPortalLiveLookup();
   const slice = allMapped
     .slice(start, end)
     .map((m) => {
       const compact = compactifyMapped(m);
+      const portalHit = portalLiveStateFor(portalLookup, portalCandidatesForProduct(m));
+      const portal = {
+        portal_state: portalHit.state,
+        portal_jomashop_sku: portalHit.jomashopSku,
+        portal_vendor_sku: portalHit.vendorSku,
+        portal_matched_on: portalHit.matchedOn,
+      };
       const live = overlay.get(compact.vendor_sku);
-      if (!live) return compact;
+      if (!live) return { ...compact, ...portal };
       return {
         ...compact,
+        ...portal,
         push_state: live.state ?? compact.push_state,
         jomashop_sku: live.jomashopSku ?? compact.jomashop_sku,
         last_push_error: live.lastError ?? null,
@@ -2883,6 +2899,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       return null;
     }
 
+    // Portal truth lookup, built once for the whole preview: has the Vendor
+    // Portal already got this style, and has Jomashop assigned it a SKU?
+    const previewPortalLookup = buildPortalLiveLookup();
+
     // Push-status index by Shopify SKU so we can attach pushed/rejected/etc
     // metadata to each mapped product.
     const pushIndex = new Map<
@@ -3172,10 +3192,15 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         readiness = "needs-category-verification";
       }
 
+      const portalHit = portalLiveStateFor(previewPortalLookup, portalCandidatesForProduct(m));
       return {
         ...m,
         push_state: status?.state ?? "not_pushed",
-        jomashop_sku: status?.jomashopSku ?? null,
+        portal_state: portalHit.state,
+        portal_jomashop_sku: portalHit.jomashopSku,
+        portal_vendor_sku: portalHit.vendorSku,
+        portal_matched_on: portalHit.matchedOn,
+        jomashop_sku: status?.jomashopSku ?? portalHit.jomashopSku ?? null,
         last_push_error: status?.lastError ?? null,
         last_pushed_at: status?.lastPushedAt ?? null,
         last_invalid_params: status?.lastInvalidParams ?? null,
@@ -3932,6 +3957,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
        *  would-be Jomashop payload WITHOUT calling the Jomashop API. Lets the
        *  operator safely validate a product before any live mutation. */
       dryRun?: boolean;
+      /** Override the duplicate guard below and push even though the Vendor
+       *  Portal already lists this style as live on Jomashop. */
+      allowDuplicate?: boolean;
     };
     const dryRun = body.dryRun === true;
 
@@ -4580,6 +4608,48 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         mapped,
         schemaSource: liveSchemaSource,
       });
+    }
+
+    // ---- Duplicate guard: already on Jomashop (applies to EVERY push path) ----
+    // The Vendor Portal is the record of what Jomashop already has. If the
+    // imported export shows this style already carries a Jomashop SKU, pushing
+    // it again creates a second listing for the same product. Local push_state
+    // cannot catch this on its own — it is empty for anything pushed before
+    // this app's database was last reset, which is exactly when duplicates
+    // happen. Set `allowDuplicate: true` to override deliberately.
+    if (body.allowDuplicate !== true) {
+      const portalLookup = buildPortalLiveLookup();
+      const hit = portalLiveStateFor(portalLookup, portalCandidatesForProduct(mapped));
+      if (hit.state === "live") {
+        storage.updateSyncJob(job.id, {
+          status: "failed",
+          finishedAt: Date.now(),
+          summary: "already_live: refused duplicate push",
+        });
+        storage.appendLog({
+          jobId: job.id,
+          level: "warn",
+          message: `Refused push for ${mapped.vendor_sku}: already live on Jomashop as ${hit.jomashopSku ?? "(no SKU recorded)"}`,
+          detailsJson: JSON.stringify({
+            vendorSku: mapped.vendor_sku,
+            portalVendorSku: hit.vendorSku,
+            jomashopSku: hit.jomashopSku,
+            matchedOn: hit.matchedOn,
+          }),
+          createdAt: Date.now(),
+        });
+        return res.status(409).json({
+          ok: false,
+          blocked: "already_live",
+          error:
+            `Refusing to push ${mapped.vendor_sku}: the Vendor Portal already lists this style as live on ` +
+            `Jomashop (Jomashop SKU ${hit.jomashopSku ?? "unknown"}, matched on ${hit.matchedOn ?? "SKU"}). ` +
+            `Pushing again would create a duplicate listing. Use the Inventory page to update it instead, ` +
+            `or re-send with allowDuplicate:true if this really is a new product.`,
+          vendorSku: mapped.vendor_sku,
+          portal: hit,
+        });
+      }
     }
 
     // ---- Hard image guard (applies to EVERY push path) ----

@@ -113,7 +113,10 @@ import {
   isTemplateNoiseRow,
   trimTemplateRows,
   inferStyleNumber,
+  portalLiveStateFor,
+  portalCandidatesForProduct,
   type CatalogEntry,
+  type PortalLiveLookup,
 } from "../server/portal_reconcile";
 
 // Pure (storage-free) enum override resolver that mimics the production
@@ -7517,6 +7520,73 @@ function runPortalReconcileTests() {
     }) === "Needs Review",
     "status: brand+title stays Needs Review even without status columns",
   );
+
+  // ------------------------------------------------------------------
+  // Duplicate guard: is this style already on Jomashop?
+  // ------------------------------------------------------------------
+  console.log("\n  Portal live lookup (duplicate guard):");
+
+  const mkLookup = (
+    entries: Array<[string, "live" | "in_portal", string | null]>,
+  ): PortalLiveLookup => ({
+    rowCount: entries.length,
+    byKey: new Map(
+      entries.map(([key, state, joma]) => [
+        key.toLowerCase().replace(/[^a-z0-9]+/g, ""),
+        { state, vendorSku: key, jomashopSku: joma, jomaStatus: null, status: null, matchedOn: key },
+      ]),
+    ),
+  });
+
+  const lookup = mkLookup([
+    ["3100B374-6/12", "live", "Y-A849U"],
+    ["XXM06G0ES50RE0S611", "in_portal", null],
+  ]);
+
+  assert(
+    portalLiveStateFor(lookup, ["3100B374-6/12"]).state === "live",
+    "portal lookup: exact vendor SKU → live",
+  );
+  assert(
+    portalLiveStateFor(lookup, ["3100b374 6 12"]).state === "live",
+    "portal lookup: match is punctuation/case insensitive",
+  );
+  assert(
+    portalLiveStateFor(lookup, ["3100B374-6/12"]).jomashopSku === "Y-A849U",
+    "portal lookup: carries the Jomashop SKU for the block message",
+  );
+  assert(
+    portalLiveStateFor(lookup, ["XXM06G0ES50RE0S611"]).state === "in_portal",
+    "portal lookup: no Jomashop SKU yet → in_portal, push still allowed",
+  );
+  assert(
+    portalLiveStateFor(lookup, ["BRAND-NEW-SKU"]).state === "unknown",
+    "portal lookup: unseen SKU → unknown",
+  );
+  // A live hit anywhere in the candidate list wins, so a product whose style
+  // is live is caught even when the size SKU we look up first is not.
+  assert(
+    portalLiveStateFor(lookup, ["XXM06G0ES50RE0S611", "3100B374-6/12"]).state === "live",
+    "portal lookup: strongest hit wins over candidate order",
+  );
+  // Nothing imported → never claim an item is absent from the portal.
+  assert(
+    portalLiveStateFor({ rowCount: 0, byKey: new Map() }, ["3100B374-6/12"]).state === "unknown",
+    "portal lookup: empty import → unknown, never a false 'not live'",
+  );
+
+  const cands = portalCandidatesForProduct({
+    vendor_sku: "TF-1",
+    sku: "TF-1",
+    manufacturer_number: "L1833LCL395X1N001",
+    jomashop_sku: "Z-YE4D4",
+    variants: [{ vendor_sku: "TF-1-S" }, { vendor_sku: "TF-1-M" }, { vendor_sku: "" }],
+  });
+  assert(cands.includes("L1833LCL395X1N001"), "candidates: style number included");
+  assert(cands.includes("TF-1-S") && cands.includes("TF-1-M"), "candidates: variant SKUs included");
+  assert(cands.filter((c) => c === "TF-1").length === 1, "candidates: de-duplicated");
+  assert(!cands.includes(""), "candidates: blanks dropped");
+  assert(portalCandidatesForProduct(null).length === 0, "candidates: null product → empty");
 }
 
 runPortalReconcileTests();

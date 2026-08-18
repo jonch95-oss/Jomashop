@@ -479,6 +479,123 @@ export function isInventoryPushEligible(matchStatus: PortalMatchStatus | null | 
   return matchStatus === "Confirmed Live" || matchStatus === "Active in Portal";
 }
 
+// ---------- "Is this already on Jomashop?" lookup ----------
+//
+// The Products page and every push path need a cheap answer to one question:
+// does the Vendor Portal already have this style, and has Jomashop already
+// assigned it a SKU? That is what stops the same item being pushed twice.
+// It is deliberately separate from reconcileAll(), which walks the whole
+// Shopify cache — this only reads the imported portal rows.
+
+export type PortalLiveState = "live" | "in_portal" | "unknown";
+
+export type PortalLiveHit = {
+  state: PortalLiveState;
+  vendorSku: string | null;
+  jomashopSku: string | null;
+  jomaStatus: string | null;
+  status: string | null;
+  /** Which candidate key produced the hit — shown in the UI / block message. */
+  matchedOn: string | null;
+};
+
+export type PortalLiveLookup = {
+  byKey: Map<string, PortalLiveHit>;
+  /** 0 when nothing has been imported — callers should then say "unknown", not "not live". */
+  rowCount: number;
+};
+
+const UNKNOWN_HIT: PortalLiveHit = {
+  state: "unknown",
+  vendorSku: null,
+  jomashopSku: null,
+  jomaStatus: null,
+  status: null,
+  matchedOn: null,
+};
+
+/**
+ * Index every imported portal row by each identifier it can be recognized by:
+ * its vendor SKU, its style/parent number, and its Jomashop SKU.
+ *
+ * A row counts as "live" when the portal has assigned it a Jomashop SKU (the
+ * signal the Manage Inventory workbook carries) or explicitly says so via Joma
+ * Status — unless the portal Status marks it Inactive, in which case it is not
+ * something we should treat as live. A row with no Jomashop SKU yet is
+ * "in_portal": known to the portal, not yet on Jomashop.
+ */
+export function buildPortalLiveLookup(): PortalLiveLookup {
+  const byKey = new Map<string, PortalLiveHit>();
+  const rows = storage.listPortalStyles();
+  for (const r of rows) {
+    const jomashopSku = r.jomashopSku ?? null;
+    const jomaStatus = r.jomaStatus ?? null;
+    const status = r.status ?? null;
+    const state: PortalLiveState =
+      isInactive(status) ? "in_portal" : jomashopSku || isLive(jomaStatus) ? "live" : "in_portal";
+    const set = (raw: string | null | undefined) => {
+      const key = normMatchKey(raw);
+      if (!key) return;
+      const existing = byKey.get(key);
+      // A live row always wins the key — two rows sharing a style number where
+      // one is already on Jomashop means the style IS on Jomashop.
+      if (existing && !(state === "live" && existing.state !== "live")) return;
+      byKey.set(key, {
+        state,
+        vendorSku: r.vendorSku,
+        jomashopSku,
+        jomaStatus,
+        status,
+        matchedOn: raw ? String(raw) : null,
+      });
+    };
+    set(r.vendorSku);
+    set(r.styleNumber);
+    set(jomashopSku);
+  }
+  return { byKey, rowCount: rows.length };
+}
+
+/**
+ * Resolve a product's identifiers against the portal lookup. Returns the
+ * strongest hit — "live" beats "in_portal" beats "unknown" — so a product
+ * whose style is live counts as live even if one of its size SKUs is not in
+ * the export.
+ */
+export function portalLiveStateFor(
+  lookup: PortalLiveLookup,
+  candidates: Array<string | null | undefined>,
+): PortalLiveHit {
+  if (lookup.rowCount === 0) return UNKNOWN_HIT;
+  let best: PortalLiveHit = UNKNOWN_HIT;
+  for (const c of candidates) {
+    const key = normMatchKey(c);
+    if (!key) continue;
+    const hit = lookup.byKey.get(key);
+    if (!hit) continue;
+    if (hit.state === "live") return { ...hit, matchedOn: String(c) };
+    if (best.state === "unknown") best = { ...hit, matchedOn: String(c) };
+  }
+  return best;
+}
+
+/** Every identifier a mapped product can be recognized by in the portal. */
+export function portalCandidatesForProduct(m: Record<string, any> | null | undefined): string[] {
+  if (!m || typeof m !== "object") return [];
+  const out: string[] = [];
+  const push = (v: unknown) => {
+    if (v === null || v === undefined) return;
+    const s = String(v).trim();
+    if (s) out.push(s);
+  };
+  push(m.vendor_sku);
+  push(m.sku);
+  push(m.manufacturer_number);
+  push(m.jomashop_sku);
+  if (Array.isArray(m.variants)) for (const v of m.variants) push(v?.vendor_sku);
+  return Array.from(new Set(out));
+}
+
 // ---------- Reconciliation against the live cache ----------
 
 type CachedRow = Record<string, any>;

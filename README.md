@@ -206,6 +206,36 @@ a blank status there still means **Needs Review**.
 3. Review the reconciliation table — filter by status, check matched Shopify
    SKU/product and confidence, and confirm inventory eligibility before pushing.
 
+### Not pushing the same style twice
+
+Once an export is imported, every product row carries a `portal_state` derived
+from it, independent of this app's own push history:
+
+- **`live`** — the portal has already assigned the style a Jomashop SKU.
+- **`in_portal`** — the portal knows the style; Jomashop has not listed it yet.
+- **`unknown`** — no portal row matched, or nothing has been imported.
+
+A product is matched on any of its identifiers — vendor SKU, style/parent
+number, Jomashop SKU, or any variant SKU — so a style is recognized even when
+the individual size SKU isn't in the export.
+
+This drives three things:
+
+- **Products** shows a **Live on Jomashop** / **In portal, not live** badge per
+  card, with matching filter chips.
+- **`live` products are excluded from "Ready to push"** and from the bulk
+  **Push filtered** count, so they can't be swept up in a batch.
+- **`POST /api/jomashop/push-product` refuses them** with HTTP 409 and
+  `blocked: "already_live"`, on every push path including dry runs. Override
+  deliberately with `allowDuplicate: true`.
+
+Local `push_state` alone cannot prevent duplicates, because it is empty for
+anything pushed before the app's database was last reset — which is exactly
+when duplicate pushes happen. The portal export is the independent check.
+
+Nothing has been imported yet means `portal_state` is `unknown` everywhere and
+no push is blocked — the guard never guesses that an item is absent.
+
 ---
 
 ## "It's live on Jomashop but the app says it was never pushed"
