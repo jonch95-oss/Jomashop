@@ -288,6 +288,24 @@ skipped, so re-running it is cheap.
 Afterwards the stored snapshot holds your prices, so stock webhooks replay
 *those* — the reverting stops without freezing anything.
 
+### Transient Jomashop failures
+
+Jomashop sheds load with `503 This website is under heavy load (queue full)`
+and rate-limits with `429`. Neither means the request was wrong, so
+`jomashopRequest` retries them with exponential backoff plus jitter —
+`JOMASHOP_RETRY_ATTEMPTS` (default 4) and `JOMASHOP_RETRY_BASE_MS` (default
+1000), honoring `Retry-After` when the server sends one. Without this a bulk
+run discarded every SKU the queue refused and left the catalog half-updated.
+
+GET and PUT are retried on any transient status. **POST is retried only on 429
+and 503** — a 504 may mean the server processed the request and only the
+response was lost, and retrying a product create would list it twice.
+
+A run can be halted with `POST /api/jomashop/price-import/stop` (**Stop** on
+the progress line). SKUs already pushed keep their new prices. Re-running the
+same file resumes the rest and retries the failures: a SKU that never applied
+still reads as "would change", and one that did is skipped.
+
 ---
 
 ## "It's live on Jomashop but the app says it was never pushed"

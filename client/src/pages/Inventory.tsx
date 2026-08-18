@@ -48,6 +48,7 @@ type PriceProgress = {
   skipped: number;
   rejected: number;
   errors: string[];
+  stopped?: boolean;
 };
 type ReconcileResult = {
   ok?: boolean;
@@ -109,7 +110,7 @@ export default function Inventory() {
       const body = (await res.json()) as PriceImportResult;
       if (!res.ok && !body.error) body.error = `Import failed (${res.status})`;
       setPriceResult(body);
-      if (!dryRun && body.ok) setPriceProgress({ active: true, total: body.will_change ?? 0, done: 0, applied: 0, skipped: 0, rejected: 0, errors: [] });
+      if (!dryRun && body.ok) setPriceProgress({ active: true, total: body.will_change ?? 0, done: 0, applied: 0, skipped: 0, rejected: 0, errors: [], stopped: false });
     } catch (e) {
       setPriceResult({ ok: false, error: (e as Error).message });
     } finally {
@@ -297,12 +298,32 @@ export default function Inventory() {
           {priceProgress && (
             <div className="rounded-md border border-border bg-card/40 px-3 py-2 text-xs text-muted-foreground">
               {priceProgress.active ? (
-                <span className="inline-flex items-center gap-1.5">
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" /> Pushing {priceProgress.done} / {priceProgress.total} —{" "}
-                  {priceProgress.applied} applied, {priceProgress.rejected} rejected
-                </span>
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="inline-flex items-center gap-1.5">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" /> Pushing {priceProgress.done} / {priceProgress.total} —{" "}
+                    {priceProgress.applied} applied, {priceProgress.rejected} rejected
+                  </span>
+                  <Button
+                    data-testid="button-price-stop"
+                    variant="destructive"
+                    size="sm"
+                    onClick={async () => {
+                      try {
+                        await apiRequest("POST", "/api/jomashop/price-import/stop", {});
+                      } catch {
+                        /* the poll will reflect it either way */
+                      }
+                    }}
+                  >
+                    Stop
+                  </Button>
+                </div>
               ) : (
-                <>Done: {priceProgress.applied} applied, {priceProgress.skipped} skipped, {priceProgress.rejected} rejected of {priceProgress.total}.</>
+                <>
+                  {priceProgress.stopped ? "Stopped early" : "Done"}: {priceProgress.applied} applied,{" "}
+                  {priceProgress.skipped} skipped, {priceProgress.rejected} rejected of {priceProgress.total}.
+                  {priceProgress.rejected > 0 && " Re-run the same file to retry just the failures — anything already applied is skipped."}
+                </>
               )}
               {priceProgress.errors?.length > 0 && (
                 <div className="mt-1 max-h-24 overflow-y-auto font-mono text-[11px] text-rose-600 dark:text-rose-400">

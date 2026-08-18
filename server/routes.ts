@@ -2580,14 +2580,32 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     startedAt: number | null;
     finishedAt: number | null;
     errors: string[];
+    stopped: boolean;
   };
   let priceImportProgress: PriceImportProgress = {
     active: false, total: 0, done: 0, applied: 0, skipped: 0, rejected: 0,
-    startedAt: null, finishedAt: null, errors: [],
+    startedAt: null, finishedAt: null, errors: [], stopped: false,
   };
+  // Checked once per SKU so a run can be halted without restarting the service.
+  let priceImportCancel = false;
 
   app.get("/api/jomashop/price-import-progress", (_req, res) => {
     res.json({ ok: true, progress: priceImportProgress });
+  });
+
+  // Halt a running import. Already-pushed SKUs keep their new prices; the rest
+  // are simply not sent. Re-running the same file resumes the remainder,
+  // because a SKU that was never applied still reads as "would change".
+  app.post("/api/jomashop/price-import/stop", (_req, res) => {
+    if (!priceImportProgress.active) {
+      return res.json({ ok: true, stopped: false, note: "No price import is running." });
+    }
+    priceImportCancel = true;
+    res.json({
+      ok: true,
+      stopped: true,
+      note: `Stopping after the current SKU (${priceImportProgress.done}/${priceImportProgress.total} done).`,
+    });
   });
 
   app.post("/api/jomashop/price-import", priceUpload.single("file"), async (req, res) => {
@@ -2739,10 +2757,15 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       // ---- 2) Push to Jomashop in the background, throttled ----
       priceImportProgress = {
         active: true, total: changed.length, done: 0, applied: 0, skipped: 0, rejected: 0,
-        startedAt: Date.now(), finishedAt: null, errors: [],
+        startedAt: Date.now(), finishedAt: null, errors: [], stopped: false,
       };
+      priceImportCancel = false;
       void (async () => {
         for (const it of changed) {
+          if (priceImportCancel) {
+            priceImportProgress.stopped = true;
+            break;
+          }
           try {
             // quantity null → pushInventoryUpdate reuses the stored quantity,
             // so a price import never disturbs stock.
@@ -2773,9 +2796,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         }
         priceImportProgress.active = false;
         priceImportProgress.finishedAt = Date.now();
+        priceImportCancel = false;
         storage.appendLog({
           level: priceImportProgress.rejected > 0 ? "warn" : "info",
-          message: `Price import: applied ${priceImportProgress.applied}, skipped ${priceImportProgress.skipped}, rejected ${priceImportProgress.rejected} of ${priceImportProgress.total}`,
+          message: `Price import${priceImportProgress.stopped ? " (stopped early)" : ""}: applied ${priceImportProgress.applied}, skipped ${priceImportProgress.skipped}, rejected ${priceImportProgress.rejected} of ${priceImportProgress.total}`,
           detailsJson: JSON.stringify({ errors: priceImportProgress.errors }),
           createdAt: Date.now(),
         });

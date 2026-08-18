@@ -160,6 +160,69 @@ export type JomashopRequestOptions = {
   body?: unknown;
 };
 
+// ---------- Transient-failure retry ----------
+//
+// Jomashop sheds load with "503 This website is under heavy load (queue
+// full)" and rate-limits with 429. Neither means the request was wrong, but
+// without a retry both surfaced as permanent rejections — a bulk job would
+// discard hundreds of SKUs mid-run and leave the catalog half-updated.
+
+/** Statuses that mean "try again", as opposed to "this request is invalid". */
+const TRANSIENT_STATUSES = new Set([429, 502, 503, 504]);
+
+const RETRY_MAX_ATTEMPTS = Number(process.env.JOMASHOP_RETRY_ATTEMPTS) || 4;
+const RETRY_BASE_MS = Number(process.env.JOMASHOP_RETRY_BASE_MS) || 1000;
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/**
+ * Is retrying this request safe?
+ *
+ * GET and PUT are idempotent, so any transient status can be retried. POST is
+ * not: a 504 may mean the server processed the request and only the response
+ * was lost, and retrying would create a second product. So POST is retried
+ * only on statuses that state the request was refused before processing.
+ */
+function mayRetry(method: string, status: number): boolean {
+  if (!TRANSIENT_STATUSES.has(status)) return false;
+  const m = (method || "GET").toUpperCase();
+  if (m === "GET" || m === "PUT" || m === "HEAD") return true;
+  return status === 429 || status === 503;
+}
+
+/** Honor Retry-After (seconds, or an HTTP date) when the server sends one. */
+function retryAfterMs(res: Response): number | null {
+  const raw = res.headers.get("retry-after");
+  if (!raw) return null;
+  const secs = Number(raw);
+  if (Number.isFinite(secs) && secs >= 0) return Math.min(secs * 1000, 60_000);
+  const at = Date.parse(raw);
+  if (Number.isFinite(at)) return Math.min(Math.max(at - Date.now(), 0), 60_000);
+  return null;
+}
+
+/**
+ * Re-issue a request while it keeps coming back with a transient status.
+ * Exponential backoff with jitter so a bulk job's parallel-ish callers do not
+ * all retry on the same beat and re-saturate the queue they just backed off.
+ */
+async function retryTransient(
+  first: Response,
+  doFetch: () => Promise<Response>,
+  opts: JomashopRequestOptions,
+): Promise<Response> {
+  let res = first;
+  const method = opts.method || "GET";
+  for (let attempt = 1; attempt < RETRY_MAX_ATTEMPTS; attempt++) {
+    if (!mayRetry(method, res.status)) return res;
+    const backoff = RETRY_BASE_MS * 2 ** (attempt - 1);
+    const jitter = Math.floor(backoff * 0.25 * Math.random());
+    await sleep(retryAfterMs(res) ?? backoff + jitter);
+    res = await doFetch();
+  }
+  return res;
+}
+
 export async function jomashopRequest<T = unknown>(
   opts: JomashopRequestOptions,
 ): Promise<{ ok: boolean; status: number; data?: T; error?: string; errorData?: unknown }> {
@@ -199,6 +262,7 @@ export async function jomashopRequest<T = unknown>(
       await ensureToken(cfg);
       res = await doFetch();
     }
+    res = await retryTransient(res, doFetch, opts);
   } catch (err) {
     return { ok: false, status: 0, error: (err as Error).message };
   }
