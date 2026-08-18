@@ -57,6 +57,15 @@ function hashBody(req: RawBodyRequest): string | null {
   return crypto.createHash("sha256").update(buf).digest("hex");
 }
 
+/**
+ * Statuses that mean "Jomashop was unavailable", not "this product is wrong".
+ * 0 is our own client's code for a network-level failure. Mirrors the retry
+ * set in jomashop.ts.
+ */
+function isTransientStatus(status: number): boolean {
+  return status === 0 || status === 429 || status === 502 || status === 503 || status === 504;
+}
+
 type PushStatusPayload = {
   price?: number | null;
   msrp?: number | null;
@@ -339,7 +348,13 @@ export async function pushInventoryUpdate(opts: {
     shopifyVariantId: lookup.shopifyVariantId,
     shopifySku: lookup.shopifySku,
     jomashopSku: lookup.jomashopSku,
-    state: resp.ok ? lookup.state : "failed",
+    // A transient refusal (429 / 5xx / network) says nothing about the
+    // product — only that Jomashop was busy. Demoting it to "failed" was
+    // permanent damage: "failed" rows are excluded from inventory sync and
+    // from price imports, both of which filter on state === "pushed", so one
+    // busy moment silently dropped a live SKU out of every future run.
+    // Only a real rejection changes the state.
+    state: resp.ok ? lookup.state : isTransientStatus(resp.status) ? lookup.state : "failed",
     lastStatus: resp.status,
     lastError: resp.ok ? null : resp.error ?? null,
     lastPayloadJson: nextPayloadJson,
