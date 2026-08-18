@@ -250,6 +250,46 @@ no push is blocked — the guard never guesses that an item is absent.
 
 ---
 
+## Prices and MSRP: importing a Jomashop workbook
+
+If you maintain prices in the Jomashop bulk-update workbook and upload it
+there, the bridge will revert it on the next stock change. That is not a
+pricing bug — `pushInventoryUpdate` sends `price` and `map_price` on **every**
+inventory write, including one triggered purely by a stock-level webhook, and
+the values it sends come from the snapshot stored on the `push_statuses` row.
+A stale snapshot gets replayed over your upload.
+
+The fix is to make the bridge adopt the file rather than to stop it writing
+prices. **Inventory page → Import prices & MSRP**, or:
+
+```bash
+# preview — nothing is written
+curl -X POST "$APP_URL/api/jomashop/price-import" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -F file=@inventory.xlsm
+
+# apply
+curl -X POST "$APP_URL/api/jomashop/price-import" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -F file=@inventory.xlsm -F dryRun=false
+```
+
+It reads the same workbook the Portal Styles import accepts, matches each row
+to a pushed SKU, and then:
+
+1. writes MSRP back to Shopify (`jomashop.msrp`), so the mapper agrees with
+   the file on the next refresh;
+2. pushes price + MSRP to Jomashop over `PUT /v1/inventory/:sku` — the same
+   call inventory updates already use — throttled by `JOMASHOP_THROTTLE_MS`,
+   in the background. Poll `GET /api/jomashop/price-import-progress`.
+
+Quantity is passed as `null`, so the stored stock value is reused and **a
+price import never changes stock**. Rows that resolve to no change are
+skipped, so re-running it is cheap.
+
+Afterwards the stored snapshot holds your prices, so stock webhooks replay
+*those* — the reverting stops without freezing anything.
+
+---
+
 ## "It's live on Jomashop but the app says it was never pushed"
 
 `push_state` is derived **entirely** from this app's own `push_statuses` table

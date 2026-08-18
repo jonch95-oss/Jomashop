@@ -1,12 +1,13 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { Download, RefreshCw, Ban, History } from "lucide-react";
+import { Download, RefreshCw, Ban, History, Upload, Loader2 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { PageHeader, LoadingRows, ErrorBlock } from "@/components/AppShell";
 import { apiRequest } from "@/lib/queryClient";
+import { authHeaders } from "@/lib/adminToken";
 
 type Row = { vendor_sku: string; price: number; status: string; quantity: number };
 type Preview = {
@@ -15,6 +16,38 @@ type Preview = {
   note: string;
   pushed_sku_count?: number;
   unresolved_in_cache?: number;
+};
+type PriceImportResult = {
+  ok?: boolean;
+  dryRun?: boolean;
+  parsed_from?: string | null;
+  parsed_rows?: number;
+  matched?: number;
+  will_change?: number;
+  unchanged?: number;
+  unmatched?: number;
+  not_pushed?: number;
+  no_price_or_msrp?: number;
+  metafieldWrites?: number;
+  preview?: Array<{
+    vendor_sku: string;
+    shopify_sku: string;
+    price: number | null;
+    msrp: number | null;
+    current_price: number | null;
+    current_msrp: number | null;
+  }>;
+  note?: string;
+  error?: string;
+};
+type PriceProgress = {
+  active: boolean;
+  total: number;
+  done: number;
+  applied: number;
+  skipped: number;
+  rejected: number;
+  errors: string[];
 };
 type ReconcileResult = {
   ok?: boolean;
@@ -52,6 +85,53 @@ export default function Inventory() {
     onSuccess: (r) => setSyncResult(r),
     onError: (e: Error) => setSyncResult({ ok: false, error: e.message }),
   });
+
+  // ---- Price / MSRP import from a Jomashop bulk-update workbook ----
+  const priceFileRef = useRef<HTMLInputElement>(null);
+  const [priceFile, setPriceFile] = useState<File | null>(null);
+  const [priceBusy, setPriceBusy] = useState(false);
+  const [priceResult, setPriceResult] = useState<PriceImportResult | null>(null);
+  const [priceProgress, setPriceProgress] = useState<PriceProgress | null>(null);
+
+  async function runPriceImport(dryRun: boolean) {
+    if (!priceFile) return;
+    setPriceBusy(true);
+    try {
+      const fd = new FormData();
+      fd.append("file", priceFile);
+      fd.append("dryRun", String(dryRun));
+      const res = await fetch("/api/jomashop/price-import", {
+        method: "POST",
+        credentials: "include",
+        headers: authHeaders(),
+        body: fd,
+      });
+      const body = (await res.json()) as PriceImportResult;
+      if (!res.ok && !body.error) body.error = `Import failed (${res.status})`;
+      setPriceResult(body);
+      if (!dryRun && body.ok) setPriceProgress({ active: true, total: body.will_change ?? 0, done: 0, applied: 0, skipped: 0, rejected: 0, errors: [] });
+    } catch (e) {
+      setPriceResult({ ok: false, error: (e as Error).message });
+    } finally {
+      setPriceBusy(false);
+    }
+  }
+
+  // Poll the background push while it runs.
+  useEffect(() => {
+    if (!priceProgress?.active) return;
+    const t = setInterval(async () => {
+      try {
+        const r = await fetch("/api/jomashop/price-import-progress", { credentials: "include", headers: authHeaders() });
+        const j = await r.json();
+        if (j?.progress) setPriceProgress(j.progress);
+        if (j?.progress && !j.progress.active) q.refetch();
+      } catch {
+        /* transient — keep polling */
+      }
+    }, 2000);
+    return () => clearInterval(t);
+  }, [priceProgress?.active]);
 
   const [reconcileSource, setReconcileSource] = useState<"jomashop" | "portal">("jomashop");
   const [reconcileResult, setReconcileResult] = useState<ReconcileResult | null>(null);
@@ -125,6 +205,114 @@ export default function Inventory() {
       <div className="mb-4 rounded-md border border-border bg-card/40 px-4 py-2.5 text-xs text-muted-foreground">
         {q.data.note} Inventory updates use Jomashop's documented fields: quantity, price, map_price, and status. Shopify visibility follows stock automatically for pushed products.
       </div>
+
+      <Card className="mb-4" data-testid="card-price-import">
+        <CardHeader className="border-b border-card-border">
+          <CardTitle className="flex items-center gap-2 text-sm">
+            <Upload className="h-4 w-4 text-violet-500" /> Import prices &amp; MSRP from a Jomashop workbook
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-3 p-5">
+          <p className="text-xs text-muted-foreground">
+            Upload the same bulk-update workbook you send to Jomashop. The bridge adopts its Price and MSRP
+            columns, writes MSRP back to Shopify, and pushes the new values to Jomashop over the same channel
+            inventory updates use. This is what stops your uploads being reverted: stock webhooks replay the
+            price the bridge has stored, so once it stores yours, they replay yours. Stock is never touched.
+          </p>
+          <div className="flex flex-wrap items-center gap-2">
+            <input
+              ref={priceFileRef}
+              type="file"
+              accept=".csv,.xlsx,.xlsm,.xltx,.xltm,.xls"
+              className="hidden"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) { setPriceFile(f); setPriceResult(null); setPriceProgress(null); }
+              }}
+            />
+            <Button data-testid="button-price-file" variant="outline" size="sm" onClick={() => priceFileRef.current?.click()} disabled={priceBusy}>
+              <Upload className="mr-1.5 h-3.5 w-3.5" /> Choose file
+            </Button>
+            {priceFile && <span className="text-xs text-muted-foreground">{priceFile.name}</span>}
+            <Button data-testid="button-price-preview" variant="outline" size="sm" disabled={!priceFile || priceBusy} onClick={() => runPriceImport(true)}>
+              {priceBusy ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : null} Preview changes
+            </Button>
+            {priceResult?.ok && priceResult.dryRun && (priceResult.will_change ?? 0) > 0 && (
+              <Button
+                data-testid="button-price-apply"
+                size="sm"
+                disabled={priceBusy}
+                onClick={() => {
+                  if (window.confirm(`Push new price/MSRP for ${priceResult.will_change} SKU(s) to Jomashop?`)) runPriceImport(false);
+                }}
+              >
+                Apply {priceResult.will_change} to Jomashop
+              </Button>
+            )}
+          </div>
+
+          {priceResult && (
+            <div className={`rounded-md border px-3 py-2 text-xs ${priceResult.ok ? "border-border bg-card/40 text-muted-foreground" : "border-rose-500/50 bg-rose-500/10 text-rose-600"}`}>
+              {priceResult.ok ? (
+                <>
+                  Read {priceResult.parsed_rows ?? 0} row(s){priceResult.parsed_from ? ` from ${priceResult.parsed_from}` : ""} — {priceResult.matched ?? 0} matched a pushed SKU,{" "}
+                  <strong>{priceResult.will_change ?? 0} would change</strong>, {priceResult.unchanged ?? 0} already match.{" "}
+                  {(priceResult.unmatched ?? 0) > 0 && `${priceResult.unmatched} had no Shopify match. `}
+                  {(priceResult.not_pushed ?? 0) > 0 && `${priceResult.not_pushed} are not pushed yet. `}
+                  {priceResult.note}
+                </>
+              ) : (
+                `Price import failed: ${priceResult.error ?? "unknown error"}`
+              )}
+            </div>
+          )}
+
+          {priceResult?.ok && priceResult.dryRun && (priceResult.preview?.length ?? 0) > 0 && (
+            <div className="max-h-56 overflow-auto rounded-md border border-border">
+              <table className="w-full text-xs">
+                <thead className="sticky top-0 bg-card text-[10px] uppercase tracking-wider text-muted-foreground">
+                  <tr>
+                    <th className="px-3 py-1.5 text-left font-medium">SKU</th>
+                    <th className="px-3 py-1.5 text-right font-medium">Price now → new</th>
+                    <th className="px-3 py-1.5 text-right font-medium">MSRP now → new</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {priceResult.preview!.map((r) => (
+                    <tr key={r.shopify_sku} className="border-t border-border">
+                      <td className="px-3 py-1.5 font-mono">{r.shopify_sku}</td>
+                      <td className="px-3 py-1.5 text-right tabular-nums">
+                        {r.current_price ?? "—"} <span className="text-muted-foreground">→</span> <strong>{r.price ?? "—"}</strong>
+                      </td>
+                      <td className="px-3 py-1.5 text-right tabular-nums">
+                        {r.current_msrp ?? "—"} <span className="text-muted-foreground">→</span> <strong>{r.msrp ?? "—"}</strong>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {priceProgress && (
+            <div className="rounded-md border border-border bg-card/40 px-3 py-2 text-xs text-muted-foreground">
+              {priceProgress.active ? (
+                <span className="inline-flex items-center gap-1.5">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" /> Pushing {priceProgress.done} / {priceProgress.total} —{" "}
+                  {priceProgress.applied} applied, {priceProgress.rejected} rejected
+                </span>
+              ) : (
+                <>Done: {priceProgress.applied} applied, {priceProgress.skipped} skipped, {priceProgress.rejected} rejected of {priceProgress.total}.</>
+              )}
+              {priceProgress.errors?.length > 0 && (
+                <div className="mt-1 max-h-24 overflow-y-auto font-mono text-[11px] text-rose-600 dark:text-rose-400">
+                  {priceProgress.errors.map((e, i) => <div key={i}>{e}</div>)}
+                </div>
+              )}
+            </div>
+          )}
+        </CardContent>
+      </Card>
 
       <Card className="mb-4" data-testid="card-reconcile-push-state">
         <CardHeader className="border-b border-card-border">

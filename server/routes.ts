@@ -1,6 +1,7 @@
 import type { Express } from "express";
 import type { Server } from "node:http";
 import crypto from "node:crypto";
+import multer from "multer";
 import { storage } from "./storage";
 import {
   getJomashopConfig,
@@ -73,6 +74,8 @@ import { registerMappingMemoryRoutes } from "./mapping_memory";
 import {
   registerPortalRoutes,
   buildCatalogIndex,
+  coercePortalRecord,
+  recordsFromBuffer,
   buildPortalLiveLookup,
   catalogEntriesFromProducts,
   matchPortalStyle,
@@ -241,6 +244,12 @@ let zeroSkusProgress: {
  *  is ~2 writes, so ~350ms/iteration keeps writes well under the cap. */
 const JOMASHOP_THROTTLE_MS = Number(process.env.JOMASHOP_THROTTLE_MS) || 350;
 const sleepMs = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/** Integer cents (how portal rows are stored) → dollars, or null. */
+function centsToDollarsNum(c: number | null | undefined): number | null {
+  if (c === null || c === undefined || !Number.isFinite(c)) return null;
+  return Math.round(c) / 100;
+}
 
 /**
  * Build a vendor-sku → live push-status overlay so cached rows reflect the
@@ -2543,6 +2552,243 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         ? "Dry run — nothing written. Re-send with dryRun:false to adopt these into push_statuses."
         : `Adopted ${adoptions.length} SKU(s) into push_statuses for ${shopDomain}.`,
     });
+  });
+
+  // --------------------------------------------------------------------
+  // Price / MSRP import from a Jomashop bulk-update workbook.
+  //
+  // Solves the round trip: you maintain prices in the Jomashop workbook,
+  // upload it there, and the bridge then reverts it on the next stock
+  // webhook. That happens because pushInventoryUpdate replays the price and
+  // map_price it has STORED, and that snapshot is stale. So rather than
+  // freezing pricing, this makes the bridge adopt the file: it reads the same
+  // workbook, updates Shopify + the stored snapshot, and pushes the new
+  // values to Jomashop over the same PUT /v1/inventory path that inventory
+  // updates already use. After it runs, webhooks replay the NEW prices.
+  //
+  // multipart field "file" (.xlsm/.xlsx/.csv), or JSON { rows: [...] }.
+  // body/query: dryRun (default true), writeShopify (default true).
+  const priceUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
+
+  type PriceImportProgress = {
+    active: boolean;
+    total: number;
+    done: number;
+    applied: number;
+    skipped: number;
+    rejected: number;
+    startedAt: number | null;
+    finishedAt: number | null;
+    errors: string[];
+  };
+  let priceImportProgress: PriceImportProgress = {
+    active: false, total: 0, done: 0, applied: 0, skipped: 0, rejected: 0,
+    startedAt: null, finishedAt: null, errors: [],
+  };
+
+  app.get("/api/jomashop/price-import-progress", (_req, res) => {
+    res.json({ ok: true, progress: priceImportProgress });
+  });
+
+  app.post("/api/jomashop/price-import", priceUpload.single("file"), async (req, res) => {
+    try {
+      const dryRun = String(req.body?.dryRun ?? req.query?.dryRun ?? "true").toLowerCase() !== "false";
+      const writeShopify = String(req.body?.writeShopify ?? "true").toLowerCase() !== "false";
+
+      const conn = getActiveShopifyConnection();
+      if (!conn) return res.status(503).json({ ok: false, error: "No connected Shopify store with an access token." });
+      const shopDomain = conn.shopDomain;
+
+      // ---- Parse the workbook (same reader the Portal Styles import uses) ----
+      let records: Array<Record<string, string>> = [];
+      let parseNote = "";
+      if (req.file) {
+        const parsed = await recordsFromBuffer(req.file.buffer, req.file.originalname || "upload.xlsm");
+        records = parsed.records;
+        parseNote = parsed.note;
+      } else if (Array.isArray(req.body?.rows)) {
+        records = req.body.rows.map((r: Record<string, unknown>) => {
+          const rec: Record<string, string> = {};
+          for (const [k, v] of Object.entries(r ?? {})) rec[k] = v === null || v === undefined ? "" : String(v);
+          return rec;
+        });
+      } else {
+        return res.status(400).json({ ok: false, error: "Provide a file upload (field \"file\") or JSON { rows: [...] }." });
+      }
+      const rows = records.map(coercePortalRecord).filter(Boolean) as NonNullable<ReturnType<typeof coercePortalRecord>>[];
+      if (rows.length === 0) {
+        return res.status(400).json({ ok: false, error: `No usable rows (every row was missing a SKU). Parsed ${records.length} row(s).` });
+      }
+
+      // ---- Match each row to the Shopify catalog ----
+      const cache = storage.getProductCache(shopDomain);
+      if (!cache) return res.status(409).json({ ok: false, error: "No product cache. Refresh products from Shopify first." });
+      let mapped: any[] = [];
+      try {
+        const payload = JSON.parse(cache.payloadJson);
+        mapped = Array.isArray(payload?.mapped) ? payload.mapped : [];
+      } catch {
+        return res.status(500).json({ ok: false, error: "Corrupt product cache." });
+      }
+      const index = buildCatalogIndex(catalogEntriesFromProducts(mapped));
+
+      type Item = {
+        vendor_sku: string;
+        shopify_sku: string;
+        shopify_product_id: string;
+        price: number | null;
+        msrp: number | null;
+        current_price: number | null;
+        current_msrp: number | null;
+        changed: boolean;
+      };
+      const items: Item[] = [];
+      let unmatched = 0;
+      let notPushed = 0;
+      let noValues = 0;
+      const seen = new Set<string>();
+
+      for (const row of rows) {
+        const price = centsToDollarsNum(row.priceCents);
+        const msrp = centsToDollarsNum(row.msrpCents);
+        if (price === null && msrp === null) { noValues += 1; continue; }
+        const portalRow = { ...row, raw: {} };
+        const match = matchPortalStyle(portalRow, index);
+        if (!match.entry || match.confidence === "Brand+Title") { unmatched += 1; continue; }
+        const shopifySku = match.entry.sku;
+        if (seen.has(shopifySku)) continue;
+        seen.add(shopifySku);
+        const ps = storage.getPushStatusBySku(shopDomain, shopifySku);
+        if (!ps || ps.state !== "pushed") { notPushed += 1; continue; }
+        // What the bridge would currently replay on the next stock webhook.
+        let currentPrice: number | null = null;
+        let currentMsrp: number | null = null;
+        if (ps.lastPayloadJson) {
+          try {
+            const snap = JSON.parse(ps.lastPayloadJson);
+            currentPrice = typeof snap?.price === "number" ? snap.price : null;
+            currentMsrp = typeof snap?.msrp === "number" ? snap.msrp : null;
+          } catch { /* stale/corrupt snapshot — treat as unknown */ }
+        }
+        items.push({
+          vendor_sku: row.vendorSku,
+          shopify_sku: shopifySku,
+          shopify_product_id: match.entry.shopifyProductId,
+          price, msrp, current_price: currentPrice, current_msrp: currentMsrp,
+          changed: (price !== null && price !== currentPrice) || (msrp !== null && msrp !== currentMsrp),
+        });
+      }
+
+      const changed = items.filter((i) => i.changed);
+      const baseCounts = {
+        parsed_rows: rows.length,
+        matched: items.length,
+        will_change: changed.length,
+        unchanged: items.length - changed.length,
+        unmatched,
+        not_pushed: notPushed,
+        no_price_or_msrp: noValues,
+      };
+
+      if (dryRun) {
+        return res.json({
+          ok: true, dryRun: true, parsed_from: parseNote || null, ...baseCounts,
+          preview: changed.slice(0, 200),
+          note: `Nothing written. ${changed.length} SKU(s) would change. Re-send with dryRun:false to apply.`,
+        });
+      }
+      if (priceImportProgress.active) {
+        return res.status(409).json({ ok: false, error: "A price import is already running. Poll GET /api/jomashop/price-import-progress." });
+      }
+      if (changed.length === 0) {
+        return res.json({ ok: true, dryRun: false, ...baseCounts, note: "Nothing to change — the bridge already holds these prices." });
+      }
+
+      // ---- 1) Write MSRP back to Shopify so the mapper agrees with the file ----
+      let metafieldWrites = 0;
+      const metaErrors: string[] = [];
+      if (writeShopify) {
+        const gql = async (query: string, variables: Record<string, unknown>) => {
+          const r = await fetch(`https://${conn.shopDomain}/admin/api/2024-10/graphql.json`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": conn.accessToken },
+            body: JSON.stringify({ query, variables }),
+          });
+          return (await r.json()) as any;
+        };
+        const metaBatch = changed
+          .filter((i) => i.msrp !== null && i.shopify_product_id)
+          .map((i) => ({
+            ownerId: `gid://shopify/Product/${i.shopify_product_id}`,
+            namespace: "jomashop", key: "msrp", type: "single_line_text_field",
+            value: String(i.msrp),
+          }));
+        for (let i = 0; i < metaBatch.length; i += 25) {
+          const chunk = metaBatch.slice(i, i + 25);
+          try {
+            const j = await gql(`mutation S($m:[MetafieldsSetInput!]!){metafieldsSet(metafields:$m){userErrors{message}}}`, { m: chunk });
+            const ue = j?.data?.metafieldsSet?.userErrors ?? [];
+            if (!(j?.errors?.length) && ue.length === 0) metafieldWrites += chunk.length;
+            else metaErrors.push(...[...(j.errors ?? []), ...ue].map((e: any) => String(e.message)));
+          } catch (err) {
+            metaErrors.push((err as Error).message);
+          }
+        }
+      }
+
+      // ---- 2) Push to Jomashop in the background, throttled ----
+      priceImportProgress = {
+        active: true, total: changed.length, done: 0, applied: 0, skipped: 0, rejected: 0,
+        startedAt: Date.now(), finishedAt: null, errors: [],
+      };
+      void (async () => {
+        for (const it of changed) {
+          try {
+            // quantity null → pushInventoryUpdate reuses the stored quantity,
+            // so a price import never disturbs stock.
+            const r = await pushInventoryUpdate({
+              shopifySku: it.shopify_sku,
+              quantity: null,
+              topic: "price-import",
+              shopDomain,
+              outboundPrice: it.price,
+              outboundMsrp: it.msrp,
+            });
+            if (r.status === "applied") priceImportProgress.applied++;
+            else if (r.status === "skipped") priceImportProgress.skipped++;
+            else {
+              priceImportProgress.rejected++;
+              if (priceImportProgress.errors.length < 20) {
+                priceImportProgress.errors.push(`${it.shopify_sku}: ${r.message}`);
+              }
+            }
+          } catch (err) {
+            priceImportProgress.rejected++;
+            if (priceImportProgress.errors.length < 20) {
+              priceImportProgress.errors.push(`${it.shopify_sku}: ${(err as Error).message}`);
+            }
+          }
+          priceImportProgress.done++;
+          await sleepMs(JOMASHOP_THROTTLE_MS);
+        }
+        priceImportProgress.active = false;
+        priceImportProgress.finishedAt = Date.now();
+        storage.appendLog({
+          level: priceImportProgress.rejected > 0 ? "warn" : "info",
+          message: `Price import: applied ${priceImportProgress.applied}, skipped ${priceImportProgress.skipped}, rejected ${priceImportProgress.rejected} of ${priceImportProgress.total}`,
+          detailsJson: JSON.stringify({ errors: priceImportProgress.errors }),
+          createdAt: Date.now(),
+        });
+      })();
+
+      res.json({
+        ok: true, dryRun: false, parsed_from: parseNote || null, ...baseCounts,
+        metafieldWrites, metaErrors: metaErrors.slice(0, 10),
+        note: `MSRP written to Shopify. Pushing ${changed.length} SKU(s) to Jomashop in the background — poll GET /api/jomashop/price-import-progress.`,
+      });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: (err as Error).message });
+    }
   });
 
   app.get("/api/jomashop/orders", async (req, res) => {
