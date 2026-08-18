@@ -24,6 +24,8 @@ type ReconcileResult = {
   adopted?: number;
   already_known?: number;
   unmatched?: number;
+  unmatched_skus?: Array<{ vendor_sku: string; jomashop_sku: string | null }>;
+  unmatched_truncated?: boolean;
   note?: string;
   error?: string;
 };
@@ -180,6 +182,28 @@ export default function Inventory() {
               {reconcileResult.ok
                 ? `${reconcileResult.live_rows ?? 0} live row(s) read — ${reconcileResult.adopted ?? 0} missing from push state, ${reconcileResult.already_known ?? 0} already tracked, ${reconcileResult.unmatched ?? 0} with no Shopify match. ${reconcileResult.note ?? ""}`
                 : `Reconcile failed: ${reconcileResult.error ?? "unknown error"}`}
+            </div>
+          )}
+          {reconcileResult?.ok && (reconcileResult.unmatched_skus?.length ?? 0) > 0 && (
+            <div className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs">
+              <div className="mb-1 font-medium text-amber-700 dark:text-amber-400">
+                On Jomashop but not in your Shopify catalog ({reconcileResult.unmatched ?? 0})
+              </div>
+              <p className="mb-2 text-muted-foreground">
+                These exist on Jomashop with no matching Shopify product, so they can never appear on the
+                Products page. Usually a SKU that drifted, or an item sold on Jomashop only.
+              </p>
+              <div className="max-h-40 overflow-y-auto font-mono text-[11px] text-muted-foreground">
+                {reconcileResult.unmatched_skus!.map((u) => (
+                  <div key={u.vendor_sku}>
+                    {u.vendor_sku}
+                    {u.jomashop_sku ? ` — ${u.jomashop_sku}` : ""}
+                  </div>
+                ))}
+              </div>
+              {reconcileResult.unmatched_truncated && (
+                <div className="mt-1 text-[11px] text-muted-foreground">Showing the first 500.</div>
+              )}
             </div>
           )}
         </CardContent>

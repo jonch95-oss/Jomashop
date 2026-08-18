@@ -2432,6 +2432,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           adopted: 0,
           already_known: 0,
           unmatched: 0,
+          unmatched_skus: [],
+          unmatched_truncated: false,
           adoptions: [],
           note: "Jomashop returned no inventory rows — nothing to reconcile.",
         });
@@ -2448,7 +2450,11 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       confidence: string;
     }> = [];
     let alreadyKnown = 0;
-    let unmatched = 0;
+    // SKUs that ARE on Jomashop but match nothing in the Shopify cache. These
+    // are the real blind spot: they exist on Jomashop, so they can never show
+    // up on the Products page (which is driven by the Shopify catalog). Listing
+    // them is the only way the operator can see what is live but unrepresented.
+    const unmatchedSkus: Array<{ vendor_sku: string; jomashop_sku: string | null }> = [];
     const seen = new Set<string>();
 
     for (const row of live) {
@@ -2475,7 +2481,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const match = matchPortalStyle(portalRow, index);
       const entry = match.entry;
       if (!entry || match.confidence === "Brand+Title") {
-        unmatched += 1;
+        unmatchedSkus.push({ vendor_sku: row.vendorSku, jomashop_sku: row.jomashopSku });
         continue;
       }
       const existing = storage.getPushStatusBySku(shopDomain, entry.sku);
@@ -2515,7 +2521,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       level: "info",
       message:
         `Push-state reconcile from ${source}: ${adoptions.length} adopted, ` +
-        `${alreadyKnown} already known, ${unmatched} unmatched (dryRun=${dryRun})`,
+        `${alreadyKnown} already known, ${unmatchedSkus.length} unmatched (dryRun=${dryRun})`,
       detailsJson: JSON.stringify({ source, dryRun, adoptions: adoptions.slice(0, 200) }),
       createdAt: now,
     });
@@ -2527,7 +2533,11 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       live_rows: live.length,
       adopted: adoptions.length,
       already_known: alreadyKnown,
-      unmatched,
+      unmatched: unmatchedSkus.length,
+      // Live on Jomashop, absent from the Shopify catalog — these cannot
+      // appear on the Products page at all, so they are listed here.
+      unmatched_skus: unmatchedSkus.slice(0, 500),
+      unmatched_truncated: unmatchedSkus.length > 500,
       adoptions: adoptions.slice(0, 500),
       note: dryRun
         ? "Dry run — nothing written. Re-send with dryRun:false to adopt these into push_statuses."
