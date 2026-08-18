@@ -298,6 +298,41 @@ export async function pushInventoryUpdate(opts: {
   });
   // Update the stored push status row so subsequent webhooks have a current
   // snapshot.
+  //
+  // The snapshot MUST absorb the price/MSRP/quantity we just sent. It is the
+  // source every later inventory write replays, so leaving it stale meant a
+  // deliberate price change was silently undone by the next stock webhook,
+  // which would replay the superseded figures. That is precisely how a price
+  // uploaded straight to Jomashop got reverted.
+  let nextPayloadJson = lookup.lastPayloadJson;
+  if (resp.ok) {
+    try {
+      const snap = (stored ? { ...stored } : {}) as PushStatusPayload & Record<string, unknown>;
+      if (price !== null && price !== undefined && Number.isFinite(Number(price))) {
+        snap.price = Number(price);
+      }
+      if (msrp !== null && msrp !== undefined && Number.isFinite(Number(msrp))) {
+        snap.msrp = Number(msrp);
+      }
+      if (Array.isArray(snap.variants)) {
+        snap.variants = snap.variants.map((v) =>
+          v?.vendor_sku === shopifySku
+            ? {
+                ...v,
+                quantity: qty,
+                ...(price !== null && price !== undefined && Number.isFinite(Number(price))
+                  ? { jomashop_price: Number(price) }
+                  : {}),
+              }
+            : v,
+        );
+      }
+      nextPayloadJson = JSON.stringify(snap);
+    } catch {
+      // Never let snapshot bookkeeping fail the push that already succeeded.
+      nextPayloadJson = lookup.lastPayloadJson;
+    }
+  }
   storage.upsertPushStatus({
     shopDomain: lookup.shopDomain,
     shopifyProductId: lookup.shopifyProductId,
@@ -307,7 +342,7 @@ export async function pushInventoryUpdate(opts: {
     state: resp.ok ? lookup.state : "failed",
     lastStatus: resp.status,
     lastError: resp.ok ? null : resp.error ?? null,
-    lastPayloadJson: lookup.lastPayloadJson,
+    lastPayloadJson: nextPayloadJson,
     lastPushedAt: lookup.lastPushedAt,
     updatedAt: Date.now(),
   });

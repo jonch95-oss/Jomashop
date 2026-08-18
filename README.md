@@ -286,7 +286,11 @@ price import never changes stock**. Rows that resolve to no change are
 skipped, so re-running it is cheap.
 
 Afterwards the stored snapshot holds your prices, so stock webhooks replay
-*those* — the reverting stops without freezing anything.
+*those* — the reverting stops without freezing anything. That depends on
+`pushInventoryUpdate` folding the price, MSRP and quantity it just sent back
+into `lastPayloadJson`. It previously rewrote the row with the *old* snapshot,
+which meant a deliberate price change was undone by the very next stock
+webhook replaying superseded figures.
 
 ### Transient Jomashop failures
 
