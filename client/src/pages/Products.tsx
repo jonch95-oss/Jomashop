@@ -97,6 +97,8 @@ type ProductFilter =
   | "unresolved_brand"
   | "unresolved_category"
   | "missing_image"
+  | "portal_live"
+  | "portal_not_live"
   | "sample";
 
 function brandUnresolved(p: MappedProduct): boolean {
@@ -124,6 +126,11 @@ function missingFieldsFor(p: MappedProduct): string[] {
 
 function pushStateOf(p: MappedProduct): "pushed" | "rejected" | "failed" | "not_pushed" {
   return (p.push_state as any) || "not_pushed";
+}
+
+/** What the imported Vendor Portal export says about this style. */
+function portalStateOf(p: MappedProduct): "live" | "in_portal" | "unknown" {
+  return (p.portal_state as any) || "unknown";
 }
 
 /** Final Jomashop category as resolved (or suggested) for filtering/grouping. */
@@ -188,6 +195,16 @@ function isPushBlocked(p: MappedProduct): boolean {
   if (p.is_sample) return true;
   if (!hasImage(p)) return true;
   if (!hasCommercialDiscount(p)) return true;
+  // Already pushed from this app. push-product always POSTs (it never PUTs to
+  // update), so re-pushing is at best a wasted write against Jomashop's rate
+  // budget and at worst a duplicate when the vendor SKU has since changed.
+  // Without this, filtering to "Pushed" still offered every row for bulk push.
+  if (pushStateOf(p) === "pushed") return true;
+  // Already in the Vendor Portal. Presence is the signal, not just liveness:
+  // the SKU exists on Jomashop's side either way, so pushing again duplicates
+  // it. The server refuses this too; blocking here keeps these out of
+  // "Ready to push" and out of the bulk "Push filtered" count.
+  if (portalStateOf(p) !== "unknown") return true;
   if (p.readiness === "ready") return false;
   // "rejected" rows can still be retried via the modal; we surface them
   // through the modal flow rather than the row button so the operator has
@@ -542,6 +559,8 @@ export default function Products() {
       unresolved_brand: 0,
       unresolved_category: 0,
       missing_image: 0,
+      portal_live: 0,
+      portal_not_live: 0,
       sample: 0,
     };
     for (const p of mapped) {
@@ -552,11 +571,16 @@ export default function Products() {
       else if (state === "rejected" || state === "failed") counts.rejected += 1;
       else if (!p.is_sample) counts.not_pushed += 1;
       if (!p.is_sample && !hasCommercialDiscount(p)) counts.missing_discount += 1;
-      if (isReady(p) && hasImage(p)) counts.ready += 1;
+      if (isReady(p) && hasImage(p) && !isPushBlocked(p)) counts.ready += 1;
       else if (miss.length > 0 && !p.is_sample) counts.missing += 1;
       if (!p.is_sample && brandUnresolved(p)) counts.unresolved_brand += 1;
       if (!p.is_sample && categoryUnresolved(p)) counts.unresolved_category += 1;
       if (!p.is_sample && !hasImage(p)) counts.missing_image += 1;
+      if (!p.is_sample) {
+        const ps = portalStateOf(p);
+        if (ps === "live") counts.portal_live += 1;
+        else if (ps === "in_portal") counts.portal_not_live += 1;
+      }
     }
     return counts;
   }, [scopedProducts]);
@@ -584,7 +608,7 @@ export default function Products() {
       const miss = missingFieldsFor(p);
       const state = pushStateOf(p);
       if (filter === "all") return true;
-      if (filter === "ready") return isReady(p) && hasImage(p);
+      if (filter === "ready") return isReady(p) && hasImage(p) && !isPushBlocked(p);
       if (filter === "missing") return miss.length > 0 && !p.is_sample;
       if (filter === "pushed") return state === "pushed";
       if (filter === "not_pushed") return state === "not_pushed" && !p.is_sample;
@@ -593,6 +617,8 @@ export default function Products() {
       if (filter === "unresolved_brand") return !p.is_sample && brandUnresolved(p);
       if (filter === "unresolved_category") return !p.is_sample && categoryUnresolved(p);
       if (filter === "missing_image") return !p.is_sample && !hasImage(p);
+      if (filter === "portal_live") return !p.is_sample && portalStateOf(p) === "live";
+      if (filter === "portal_not_live") return !p.is_sample && portalStateOf(p) === "in_portal";
       if (filter === "sample") return p.is_sample === true;
       return true;
     });
@@ -682,6 +708,8 @@ export default function Products() {
     { key: "rejected", label: "Rejected / Needs fix", count: filterCounts.rejected },
     { key: "missing_discount", label: "Missing discount", count: filterCounts.missing_discount },
     { key: "missing_image", label: "Missing images", count: filterCounts.missing_image },
+    { key: "portal_live", label: "Live on Jomashop", count: filterCounts.portal_live },
+    { key: "portal_not_live", label: "In portal, not live", count: filterCounts.portal_not_live },
     { key: "unresolved_brand", label: "Unresolved brand", count: filterCounts.unresolved_brand },
     {
       key: "unresolved_category",
@@ -1006,6 +1034,31 @@ export default function Products() {
                             className="text-[10px] uppercase"
                           >
                             Not pushed
+                          </Badge>
+                        )}
+                        {portalStateOf(p) === "live" && (
+                          <Badge
+                            data-testid={`badge-portal-live-${p.vendor_sku}`}
+                            variant="outline"
+                            className="bg-emerald-500/15 text-[10px] uppercase text-emerald-700 dark:text-emerald-400"
+                            title={
+                              `The Vendor Portal export lists this style as live on Jomashop` +
+                              `${p.portal_jomashop_sku ? ` (Jomashop SKU ${p.portal_jomashop_sku})` : ""}` +
+                              `${p.portal_matched_on ? `, matched on ${p.portal_matched_on}` : ""}. ` +
+                              `Pushing again would create a duplicate listing.`
+                            }
+                          >
+                            Live on Jomashop
+                          </Badge>
+                        )}
+                        {portalStateOf(p) === "in_portal" && (
+                          <Badge
+                            data-testid={`badge-portal-not-live-${p.vendor_sku}`}
+                            variant="outline"
+                            className="bg-sky-500/15 text-[10px] uppercase text-sky-700 dark:text-sky-400"
+                            title="In your Vendor Portal, but Jomashop has not assigned it a SKU yet."
+                          >
+                            In portal, not live
                           </Badge>
                         )}
                         {p.readiness === "needs-category-verification" && (

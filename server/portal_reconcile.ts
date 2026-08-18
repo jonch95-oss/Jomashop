@@ -26,6 +26,8 @@ import type { PortalMatchConfidence, PortalMatchStatus, InsertPortalStyle } from
 export type PortalRowInput = {
   vendorSku: string;
   jomashopSku: string | null;
+  /** Style / parent number (Shopify manufacturer_number), when the export has one. */
+  styleNumber: string | null;
   name: string | null;
   brand: string | null;
   category: string | null;
@@ -89,13 +91,29 @@ export type PortalHeaderField =
   | "price"
   | "msrp";
 
+/**
+ * Synthetic key prefix used by `tableToRecords` for columns whose header cell
+ * is blank. The Jomashop workbook ships the style/parent number under exactly
+ * such a column, so dropping unnamed columns loses a real match key.
+ */
+export const UNNAMED_COLUMN_PREFIX = "__col";
+
 export function headerToField(header: string): PortalHeaderField | null {
   const n = normHeader(header);
   if (!n) return null;
   const has = (s: string) => n.includes(s);
-  if (has("jomashop") && has("sku")) return "jomashopSku";
+  if (n.startsWith(UNNAMED_COLUMN_PREFIX)) return null;
+  // "Joma Status" must be tested before the SKU rules below, which also
+  // accept the short "joma" spelling.
   if (has("joma") && has("status")) return "jomaStatus";
+  // The live Jomashop workbook labels this column "Joma SKU"; the web export
+  // labels it "Jomashop SKU". Accept both — this is the identifier that says
+  // an item exists on Jomashop, so losing it makes every row unmatchable.
+  if (has("joma") && has("sku")) return "jomashopSku";
   if (n === "status") return "status";
+  if (has("style") || has("parent") || has("manufacturer") || n === "mpn" || has("model")) {
+    return "styleNumber";
+  }
   if (has("sku")) return "vendorSku";
   if ((has("product") && has("id")) || has("upc") || has("barcode") || has("gtin")) return "productId";
   if (has("name") || has("title")) return "name";
@@ -187,21 +205,55 @@ export function parsePortalCsv(text: string): string[][] {
   return rows.filter((r) => r.some((cell) => cell.trim() !== ""));
 }
 
-/** Turn a header row + data rows into raw records keyed by original header. */
+/**
+ * Turn a header row + data rows into raw records keyed by original header.
+ *
+ * Columns whose header cell is blank are kept under a synthetic
+ * `__col<index>` key rather than dropped: the Jomashop workbook puts the
+ * style/parent number in an unnamed column and we need it to match.
+ */
 export function tableToRecords(table: string[][]): Array<Record<string, string>> {
   if (table.length === 0) return [];
-  const headers = table[0].map((h) => String(h ?? "").trim());
+  const width = table.reduce((w, row) => Math.max(w, row.length), 0);
+  const headers: string[] = [];
+  for (let c = 0; c < width; c++) {
+    const label = String(table[0][c] ?? "").trim();
+    headers.push(label || `${UNNAMED_COLUMN_PREFIX}${c}`);
+  }
   const out: Array<Record<string, string>> = [];
   for (let r = 1; r < table.length; r++) {
     const rec: Record<string, string> = {};
     for (let c = 0; c < headers.length; c++) {
-      const key = headers[c];
-      if (!key) continue;
-      rec[key] = String(table[r][c] ?? "").trim();
+      rec[headers[c]] = String(table[r][c] ?? "").trim();
     }
     out.push(rec);
   }
   return out;
+}
+
+/**
+ * Recover a style/parent number from an unlabeled column.
+ *
+ * The Jomashop workbook has no header on the column holding the style number,
+ * but the relationship is unambiguous: the vendor SKU is the style plus a size
+ * suffix ("L1833LCL395X1N001-OS" -> "L1833LCL395X1N001"). So an unnamed cell
+ * whose value is a strict prefix of the vendor SKU is the style number.
+ */
+export function inferStyleNumber(
+  vendorSku: string,
+  raw: Record<string, string>,
+): string | null {
+  const skuKey = normMatchKey(vendorSku);
+  if (!skuKey) return null;
+  for (const [k, v] of Object.entries(raw)) {
+    if (!k.startsWith(UNNAMED_COLUMN_PREFIX)) continue;
+    const val = String(v ?? "").trim();
+    if (!val) continue;
+    const valKey = normMatchKey(val);
+    if (!valKey || valKey === skuKey) continue;
+    if (skuKey.startsWith(valKey)) return val;
+  }
+  return null;
 }
 
 /** Normalize one raw record (header→value) into a typed portal row. */
@@ -221,6 +273,7 @@ export function coercePortalRecord(raw: Record<string, unknown>): PortalRowInput
   return {
     vendorSku,
     jomashopSku: blankToNull(picked.jomashopSku),
+    styleNumber: blankToNull(picked.styleNumber) ?? inferStyleNumber(vendorSku, rawStr),
     name: blankToNull(picked.name),
     brand: blankToNull(picked.brand),
     category: blankToNull(picked.category),
@@ -350,6 +403,18 @@ export function matchPortalStyle(row: PortalRowInput, index: CatalogIndex): Port
   if (skuKey && index.byManufacturer.has(skuKey)) {
     return { confidence: "Style/Parent SKU", entry: index.byManufacturer.get(skuKey)! };
   }
+  // Explicit style column (or the one recovered from the workbook's unnamed
+  // column) — the Jomashop export's vendor SKU carries a size suffix, so the
+  // style number is what actually lines up with manufacturer_number.
+  const styleKey = normMatchKey(row.styleNumber);
+  if (styleKey) {
+    if (index.byManufacturer.has(styleKey)) {
+      return { confidence: "Style/Parent SKU", entry: index.byManufacturer.get(styleKey)! };
+    }
+    if (index.bySku.has(styleKey)) {
+      return { confidence: "Style/Parent SKU", entry: index.bySku.get(styleKey)! };
+    }
+  }
   const btKey = row.brand && row.name ? normMatchKey(`${row.brand} ${row.name}`) : "";
   if (btKey && index.byBrandTitle.has(btKey)) {
     return { confidence: "Brand+Title", entry: index.byBrandTitle.get(btKey)! };
@@ -367,19 +432,168 @@ function isInactive(status: string | null): boolean {
   return !!status && status.toLowerCase().trim() === "inactive";
 }
 
-/** Derive the reconciliation status from the match + the portal status fields. */
-export function reconcileStatus(row: PortalRowInput, match: PortalMatch): PortalMatchStatus {
+/**
+ * Derive the reconciliation status from the match + the portal status fields.
+ *
+ * `opts.statusColumnsPresent` describes the EXPORT, not the row: the Jomashop
+ * "Manage Inventory" workbook has no Status / Joma Status columns at all — it
+ * is simply the list of what the vendor has on Jomashop. When the export
+ * carries no status columns anywhere, a blank status is not "unknown", it is
+ * "present in the portal" — and a row that already has a Jomashop SKU is live.
+ * When the export DOES have status columns, a blank one is genuinely
+ * unreviewed and stays Needs Review.
+ */
+export function reconcileStatus(
+  row: PortalRowInput,
+  match: PortalMatch,
+  opts?: { statusColumnsPresent?: boolean },
+): PortalMatchStatus {
   if (!match.entry) return "Unmatched Portal Row";
   if (match.confidence === "Brand+Title") return "Needs Review";
   if (isLive(row.jomaStatus)) return "Confirmed Live";
   if (isActive(row.status)) return "Active in Portal";
   if (isInactive(row.status)) return "Inactive in Portal";
+  const statusColumnsPresent = opts?.statusColumnsPresent ?? true;
+  if (!statusColumnsPresent && !row.status && !row.jomaStatus) {
+    // A Jomashop SKU is only assigned once the style exists on Jomashop, so on
+    // a status-column-less export it IS the live signal. Rows still waiting on
+    // one are in the vendor's portal but not yet on the storefront.
+    return row.jomashopSku ? "Confirmed Live" : "Active in Portal";
+  }
   return "Needs Review";
+}
+
+/**
+ * Does this batch of rows carry any status signal at all? Used to decide
+ * whether a blank status means "unreviewed" or "the export just has no status
+ * columns" (see reconcileStatus).
+ */
+export function anyStatusColumnPresent(
+  rows: Array<{ status?: string | null; jomaStatus?: string | null }>,
+): boolean {
+  return rows.some((r) => !!blankToNull(r.status) || !!blankToNull(r.jomaStatus));
 }
 
 /** Inventory pushes are only safe for styles confirmed present + sellable. */
 export function isInventoryPushEligible(matchStatus: PortalMatchStatus | null | undefined): boolean {
   return matchStatus === "Confirmed Live" || matchStatus === "Active in Portal";
+}
+
+// ---------- "Is this already on Jomashop?" lookup ----------
+//
+// The Products page and every push path need a cheap answer to one question:
+// does the Vendor Portal already have this style, and has Jomashop already
+// assigned it a SKU? That is what stops the same item being pushed twice.
+// It is deliberately separate from reconcileAll(), which walks the whole
+// Shopify cache — this only reads the imported portal rows.
+
+export type PortalLiveState = "live" | "in_portal" | "unknown";
+
+export type PortalLiveHit = {
+  state: PortalLiveState;
+  vendorSku: string | null;
+  jomashopSku: string | null;
+  jomaStatus: string | null;
+  status: string | null;
+  /** Which candidate key produced the hit — shown in the UI / block message. */
+  matchedOn: string | null;
+};
+
+export type PortalLiveLookup = {
+  byKey: Map<string, PortalLiveHit>;
+  /** 0 when nothing has been imported — callers should then say "unknown", not "not live". */
+  rowCount: number;
+};
+
+const UNKNOWN_HIT: PortalLiveHit = {
+  state: "unknown",
+  vendorSku: null,
+  jomashopSku: null,
+  jomaStatus: null,
+  status: null,
+  matchedOn: null,
+};
+
+/**
+ * Index every imported portal row by each identifier it can be recognized by:
+ * its vendor SKU, its style/parent number, and its Jomashop SKU.
+ *
+ * A row counts as "live" when the portal has assigned it a Jomashop SKU (the
+ * signal the Manage Inventory workbook carries) or explicitly says so via Joma
+ * Status — unless the portal Status marks it Inactive, in which case it is not
+ * something we should treat as live. A row with no Jomashop SKU yet is
+ * "in_portal": known to the portal, not yet on Jomashop.
+ */
+export function buildPortalLiveLookup(): PortalLiveLookup {
+  const byKey = new Map<string, PortalLiveHit>();
+  const rows = storage.listPortalStyles();
+  for (const r of rows) {
+    const jomashopSku = r.jomashopSku ?? null;
+    const jomaStatus = r.jomaStatus ?? null;
+    const status = r.status ?? null;
+    const state: PortalLiveState =
+      isInactive(status) ? "in_portal" : jomashopSku || isLive(jomaStatus) ? "live" : "in_portal";
+    const set = (raw: string | null | undefined) => {
+      const key = normMatchKey(raw);
+      if (!key) return;
+      const existing = byKey.get(key);
+      // A live row always wins the key — two rows sharing a style number where
+      // one is already on Jomashop means the style IS on Jomashop.
+      if (existing && !(state === "live" && existing.state !== "live")) return;
+      byKey.set(key, {
+        state,
+        vendorSku: r.vendorSku,
+        jomashopSku,
+        jomaStatus,
+        status,
+        matchedOn: raw ? String(raw) : null,
+      });
+    };
+    set(r.vendorSku);
+    set(r.styleNumber);
+    set(jomashopSku);
+  }
+  return { byKey, rowCount: rows.length };
+}
+
+/**
+ * Resolve a product's identifiers against the portal lookup. Returns the
+ * strongest hit — "live" beats "in_portal" beats "unknown" — so a product
+ * whose style is live counts as live even if one of its size SKUs is not in
+ * the export.
+ */
+export function portalLiveStateFor(
+  lookup: PortalLiveLookup,
+  candidates: Array<string | null | undefined>,
+): PortalLiveHit {
+  if (lookup.rowCount === 0) return UNKNOWN_HIT;
+  let best: PortalLiveHit = UNKNOWN_HIT;
+  for (const c of candidates) {
+    const key = normMatchKey(c);
+    if (!key) continue;
+    const hit = lookup.byKey.get(key);
+    if (!hit) continue;
+    if (hit.state === "live") return { ...hit, matchedOn: String(c) };
+    if (best.state === "unknown") best = { ...hit, matchedOn: String(c) };
+  }
+  return best;
+}
+
+/** Every identifier a mapped product can be recognized by in the portal. */
+export function portalCandidatesForProduct(m: Record<string, any> | null | undefined): string[] {
+  if (!m || typeof m !== "object") return [];
+  const out: string[] = [];
+  const push = (v: unknown) => {
+    if (v === null || v === undefined) return;
+    const s = String(v).trim();
+    if (s) out.push(s);
+  };
+  push(m.vendor_sku);
+  push(m.sku);
+  push(m.manufacturer_number);
+  push(m.jomashop_sku);
+  if (Array.isArray(m.variants)) for (const v of m.variants) push(v?.vendor_sku);
+  return Array.from(new Set(out));
 }
 
 // ---------- Reconciliation against the live cache ----------
@@ -409,6 +623,7 @@ function readAllCachedProducts(): CachedRow[] {
 export type ReconciledStyle = {
   vendor_sku: string;
   jomashop_sku: string | null;
+  style_number: string | null;
   name: string | null;
   brand: string | null;
   category: string | null;
@@ -444,6 +659,8 @@ export function reconcileAll(): {
   const index = buildCatalogIndex(catalogEntriesFromProducts(products));
   const stored = storage.listPortalStyles();
   const now = Date.now();
+  // Whole-dataset question, so it is computed once outside the row loop.
+  const statusColumnsPresent = anyStatusColumnPresent(stored);
 
   const matchedShopifyKeys = new Set<string>();
   const styles: ReconciledStyle[] = [];
@@ -461,6 +678,7 @@ export function reconcileAll(): {
     const row: PortalRowInput = {
       vendorSku: s.vendorSku,
       jomashopSku: s.jomashopSku ?? null,
+      styleNumber: s.styleNumber ?? null,
       name: s.name ?? null,
       brand: s.brand ?? null,
       category: s.category ?? null,
@@ -475,7 +693,7 @@ export function reconcileAll(): {
       raw: {},
     };
     const match = matchPortalStyle(row, index);
-    const matchStatus = reconcileStatus(row, match);
+    const matchStatus = reconcileStatus(row, match, { statusColumnsPresent });
     if (match.entry?.shopifyProductId) matchedShopifyKeys.add(match.entry.shopifyProductId);
 
     // Persist the refreshed match result so inventory/order guards read fresh.
@@ -494,6 +712,7 @@ export function reconcileAll(): {
     styles.push({
       vendor_sku: s.vendorSku,
       jomashop_sku: s.jomashopSku ?? null,
+      style_number: s.styleNumber ?? null,
       name: s.name ?? null,
       brand: s.brand ?? null,
       category: s.category ?? null,
@@ -544,30 +763,170 @@ function toInsert(s: ReturnType<typeof storage.listPortalStyles>[number]): Inser
 
 // ---------- Import ----------
 
-/** Parse an uploaded buffer (CSV or XLSX) into raw header→value records. */
-async function recordsFromBuffer(
+/** Cells the Jomashop workbook uses as per-column annotations, never as data. */
+const TEMPLATE_MARKER_CELLS = new Set([
+  "required",
+  "readonly",
+  "read only",
+  "optional",
+  "conditional",
+  "n/a",
+  "na",
+  "-",
+]);
+
+/** Flatten one ExcelJS cell value (rich text, formula, hyperlink, date) to text. */
+function cellText(v: unknown): string {
+  if (v === null || v === undefined) return "";
+  if (v instanceof Date) return v.toISOString().slice(0, 10);
+  if (typeof v === "object") {
+    const o = v as Record<string, unknown>;
+    if (typeof o.text === "string") return o.text.trim();
+    if (Array.isArray(o.richText)) {
+      return (o.richText as Array<{ text?: string }>).map((r) => r?.text ?? "").join("").trim();
+    }
+    if (o.result !== undefined && o.result !== null) return String(o.result).trim();
+    if (typeof o.hyperlink === "string") return o.hyperlink.trim();
+  }
+  return String(v).trim();
+}
+
+/** Read a worksheet into a dense, column-aligned string table. */
+function sheetToTable(ws: ExcelJS.Worksheet): string[][] {
+  const table: string[][] = [];
+  ws.eachRow({ includeEmpty: true }, (wsRow) => {
+    const cells: string[] = [];
+    wsRow.eachCell({ includeEmpty: true }, (cell, colNumber) => {
+      cells[colNumber - 1] = cellText(cell.value);
+    });
+    for (let i = 0; i < cells.length; i++) {
+      if (cells[i] === undefined) cells[i] = "";
+    }
+    table.push(cells);
+  });
+  return table;
+}
+
+/**
+ * Locate the header row in a table. Exports rarely put it on row 1 — the
+ * Jomashop workbook opens with a title/banner block — so scan the top of the
+ * sheet for the row that maps to the most known fields and includes a SKU
+ * column. Returns -1 when no row qualifies (e.g. the "Instructions" sheet).
+ */
+export function findHeaderRow(table: string[][]): number {
+  const limit = Math.min(table.length, 25);
+  let best = -1;
+  let bestScore = 0;
+  for (let r = 0; r < limit; r++) {
+    const fields = new Set<PortalHeaderField>();
+    for (const cell of table[r] ?? []) {
+      const f = headerToField(cell);
+      if (f) fields.add(f);
+    }
+    const hasSku = fields.has("vendorSku") || fields.has("jomashopSku");
+    if (!hasSku || fields.size < 2) continue;
+    if (fields.size > bestScore) {
+      bestScore = fields.size;
+      best = r;
+    }
+  }
+  return best;
+}
+
+/** Does this cell look like an actual SKU/style token (vs. prose)? */
+function looksLikeSkuToken(s: string): boolean {
+  const t = s.trim();
+  return t.length >= 4 && !/\s/.test(t) && /\d/.test(t) && /^[A-Za-z0-9._/\-]+$/.test(t);
+}
+
+/**
+ * Is this one of the template's sub-header rows?
+ *
+ * The Jomashop workbook puts two annotation rows directly under the header:
+ * a prose description ("Your unique vendor SKU") and a requirement flag
+ * ("required" / "readonly"). Imported as-is they become phantom styles. Both
+ * are recognizable: either every filled cell is an annotation keyword, or the
+ * row is pure prose — no SKU-shaped token and no number anywhere.
+ */
+export function isTemplateNoiseRow(cells: string[]): boolean {
+  const filled = cells.map((c) => String(c ?? "").trim()).filter((c) => c !== "");
+  if (filled.length === 0) return true;
+  if (filled.every((c) => TEMPLATE_MARKER_CELLS.has(c.toLowerCase()))) return true;
+  const hasSkuToken = filled.some(looksLikeSkuToken);
+  const hasNumber = filled.some((c) => dollarsToCents(c) !== null);
+  return !hasSkuToken && !hasNumber;
+}
+
+/**
+ * Slice a raw sheet table down to [header row, ...data rows], dropping the
+ * template's annotation rows that sit between them. Only the LEADING run
+ * after the header is inspected, so a legitimate data row can never be
+ * discarded from the middle of the sheet.
+ */
+export function trimTemplateRows(table: string[][], headerRow: number): string[][] {
+  const out: string[][] = [table[headerRow]];
+  let r = headerRow + 1;
+  while (r < table.length && isTemplateNoiseRow(table[r])) r++;
+  for (; r < table.length; r++) out.push(table[r]);
+  return out;
+}
+
+/** True when the buffer is a ZIP container — every modern Excel format is. */
+function looksLikeZip(buffer: Buffer): boolean {
+  return buffer.length >= 4 && buffer[0] === 0x50 && buffer[1] === 0x4b;
+}
+
+export type ParsedUpload = {
+  records: Array<Record<string, string>>;
+  /** Human-readable note about what was parsed, surfaced in the import response. */
+  note: string;
+};
+
+/**
+ * Parse an uploaded buffer (CSV or any zipped Excel format) into raw
+ * header→value records.
+ *
+ * Format is decided by CONTENT, not by extension: the Jomashop portal hands
+ * out a macro-enabled .xlsm workbook, and matching only ".xlsx"/".xls" sent it
+ * down the CSV path, where the binary parsed into gibberish and every import
+ * failed with "no usable rows". Sheet and header row are then discovered
+ * rather than assumed — the workbook's first sheet is "Instructions" and its
+ * header sits under a banner, so worksheets[0] / row 1 both pointed at the
+ * wrong cells.
+ */
+export async function recordsFromBuffer(
   buffer: Buffer,
   filename: string,
-): Promise<Array<Record<string, string>>> {
+): Promise<ParsedUpload> {
   const lower = filename.toLowerCase();
-  const looksXlsx = lower.endsWith(".xlsx") || lower.endsWith(".xls");
-  if (looksXlsx) {
+  const zipped = looksLikeZip(buffer);
+  const excelExt = /\.(xlsx|xlsm|xltx|xltm|xls)$/.test(lower);
+  if (zipped || excelExt) {
     const wb = new ExcelJS.Workbook();
     await wb.xlsx.load(buffer as unknown as ArrayBuffer);
-    const ws = wb.worksheets[0];
-    if (!ws) return [];
-    const table: string[][] = [];
-    ws.eachRow((wsRow) => {
-      const cells: string[] = [];
-      wsRow.eachCell({ includeEmpty: true }, (cell) => {
-        const v = cell.value;
-        cells.push(v === null || v === undefined ? "" : String(typeof v === "object" && "text" in (v as any) ? (v as any).text : v));
-      });
-      table.push(cells);
-    });
-    return tableToRecords(table);
+    let picked: { name: string; table: string[][]; headerRow: number } | null = null;
+    for (const ws of wb.worksheets) {
+      const table = sheetToTable(ws);
+      const headerRow = findHeaderRow(table);
+      if (headerRow < 0) continue;
+      const dataRows = table.length - headerRow - 1;
+      if (!picked || dataRows > picked.table.length - picked.headerRow - 1) {
+        picked = { name: ws.name, table, headerRow };
+      }
+    }
+    if (!picked) {
+      const names = wb.worksheets.map((w) => w.name).join(", ") || "(none)";
+      throw new Error(
+        `No sheet in this workbook has a recognizable header row with a SKU column. Sheets found: ${names}.`,
+      );
+    }
+    const trimmed = trimTemplateRows(picked.table, picked.headerRow);
+    return {
+      records: tableToRecords(trimmed),
+      note: `sheet "${picked.name}", header on row ${picked.headerRow + 1}`,
+    };
   }
-  return tableToRecords(parsePortalCsv(buffer.toString("utf8")));
+  return { records: tableToRecords(parsePortalCsv(buffer.toString("utf8"))), note: "CSV" };
 }
 
 // ---------- Routes ----------
@@ -590,8 +949,11 @@ export function registerPortalRoutes(app: Express): void {
         "false";
 
       let records: Array<Record<string, string>> = [];
+      let parseNote = "";
       if (req.file) {
-        records = await recordsFromBuffer(req.file.buffer, req.file.originalname || "upload.csv");
+        const parsed = await recordsFromBuffer(req.file.buffer, req.file.originalname || "upload.csv");
+        records = parsed.records;
+        parseNote = parsed.note;
       } else if (req.body && Array.isArray(req.body.rows)) {
         records = req.body.rows.map((r: Record<string, unknown>) => {
           const rec: Record<string, string> = {};
@@ -628,6 +990,7 @@ export function registerPortalRoutes(app: Express): void {
         storage.upsertPortalStyle({
           vendorSku: row.vendorSku,
           jomashopSku: row.jomashopSku,
+          styleNumber: row.styleNumber,
           name: row.name,
           brand: row.brand,
           category: row.category,
@@ -658,7 +1021,14 @@ export function registerPortalRoutes(app: Express): void {
         detailsJson: JSON.stringify(summary),
         createdAt: Date.now(),
       });
-      res.json({ ok: true, imported: normalized.length, skipped, replaced: replace, summary });
+      res.json({
+        ok: true,
+        imported: normalized.length,
+        skipped,
+        replaced: replace,
+        parsed_from: parseNote || null,
+        summary,
+      });
     } catch (err) {
       res.status(500).json({ ok: false, error: (err as Error).message });
     }

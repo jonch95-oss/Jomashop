@@ -106,9 +106,17 @@ import {
   catalogEntriesFromProducts,
   matchPortalStyle,
   reconcileStatus,
+  anyStatusColumnPresent,
   isInventoryPushEligible,
   extractOrderLineSkus,
+  findHeaderRow,
+  isTemplateNoiseRow,
+  trimTemplateRows,
+  inferStyleNumber,
+  portalLiveStateFor,
+  portalCandidatesForProduct,
   type CatalogEntry,
+  type PortalLiveLookup,
 } from "../server/portal_reconcile";
 
 // Pure (storage-free) enum override resolver that mimics the production
@@ -7326,6 +7334,7 @@ function runPortalReconcileTests() {
   const mkRow = (o: Record<string, any> & { vendorSku: string }) => ({
     vendorSku: o.vendorSku,
     jomashopSku: o.jomashopSku ?? null,
+    styleNumber: o.styleNumber ?? null,
     name: o.name ?? null,
     brand: o.brand ?? null,
     category: null,
@@ -7409,6 +7418,175 @@ function runPortalReconcileTests() {
     nested: { line: { "Jomashop SKU": "J-3" } },
   });
   assert(skus.includes("A-1") && skus.includes("B-2") && skus.includes("J-3"), "extractOrderLineSkus: nested SKUs found");
+
+  // ------------------------------------------------------------------
+  // The REAL Jomashop "Manage Inventory" workbook.
+  //
+  // Its shape broke every stage of the import: a macro-enabled .xlsm that the
+  // extension check sent down the CSV path, an "Instructions" sheet in front
+  // of the data, two annotation rows under the header, a style number in an
+  // unnamed column, a "Joma SKU" header the mapper read as the vendor SKU,
+  // and no Status columns at all.
+  // ------------------------------------------------------------------
+  console.log("\n  Jomashop workbook shape:");
+
+  assert(headerToField("Joma SKU") === "jomashopSku", "workbook: 'Joma SKU' header → jomashopSku");
+  assert(headerToField("Joma Status") === "jomaStatus", "workbook: 'Joma Status' still → jomaStatus");
+  assert(headerToField("Vendor SKU") === "vendorSku", "workbook: 'Vendor SKU' → vendorSku");
+  assert(headerToField("Style Number") === "styleNumber", "workbook: 'Style Number' → styleNumber");
+  assert(headerToField("Manufacturer Number") === "styleNumber", "workbook: manufacturer # → styleNumber");
+
+  // Verbatim first rows of the portal download, blank header cell included.
+  const wbTable = [
+    ["Vendor SKU", "", "Joma SKU", "Brand", "MSRP", "Price"],
+    ["Your unique vendor SKU", "", "Jomashop SKU", "", "", "Your selling price in USD"],
+    ["required", "", "readonly", "readonly", "", "required"],
+    ["L1833LCL395X1N001-OS", "L1833LCL395X1N001", "Z-YE4D4", "Tom Ford", "3490", "2000"],
+    ["3100B374-6/12", "3100B374", "", "Canada Goose", "565", "350"],
+  ];
+  assert(findHeaderRow(wbTable) === 0, "workbook: header row located");
+  assert(isTemplateNoiseRow(wbTable[1]), "workbook: prose description row is noise");
+  assert(isTemplateNoiseRow(wbTable[2]), "workbook: required/readonly row is noise");
+  assert(!isTemplateNoiseRow(wbTable[3]), "workbook: real data row is not noise");
+
+  const wbTrimmed = trimTemplateRows(wbTable, 0);
+  assert(wbTrimmed.length === 3, "workbook: trim drops both annotation rows, keeps 2 data rows");
+  const wbRecords = tableToRecords(wbTrimmed);
+  assert(wbRecords.length === 2, "workbook: 2 records after trim");
+  assert(wbRecords[0]["__col1"] === "L1833LCL395X1N001", "workbook: unnamed column preserved as __col1");
+
+  const wbRow = coercePortalRecord(wbRecords[0]);
+  assert(wbRow!.vendorSku === "L1833LCL395X1N001-OS", "workbook: vendor SKU");
+  assert(wbRow!.jomashopSku === "Z-YE4D4", "workbook: 'Joma SKU' lands in jomashopSku, not vendorSku");
+  assert(wbRow!.styleNumber === "L1833LCL395X1N001", "workbook: style number recovered from unnamed column");
+  assert(wbRow!.priceCents === 200000 && wbRow!.msrpCents === 349000, "workbook: price + MSRP cents");
+  assert(inferStyleNumber("3100B374-6/12", { __col1: "3100B374" }) === "3100B374", "inferStyleNumber: prefix wins");
+  assert(inferStyleNumber("3100B374-6/12", { __col1: "UNRELATED" }) === null, "inferStyleNumber: non-prefix ignored");
+  assert(inferStyleNumber("3100B374", { Brand: "3100B3" }) === null, "inferStyleNumber: named columns ignored");
+
+  // Style number matches manufacturer_number — the vendor SKU carries a size
+  // suffix, so without it these rows never reconcile.
+  const styleIndex = buildCatalogIndex([
+    {
+      shopifyProductId: "gid-style",
+      shopifyVariantId: "v-style",
+      sku: "TF-SHIRT-OS",
+      vendorSku: "TF-SHIRT-OS",
+      jomashopSku: null,
+      manufacturerNumber: "L1833LCL395X1N001",
+      brand: "Tom Ford",
+      name: "Shirt",
+      upcs: [],
+      pushState: "pushed",
+    },
+  ]);
+  const mStyleCol = matchPortalStyle(
+    mkRow({ vendorSku: "L1833LCL395X1N001-OS", styleNumber: "L1833LCL395X1N001" }),
+    styleIndex,
+  );
+  assert(
+    mStyleCol.confidence === "Style/Parent SKU" && mStyleCol.entry?.shopifyProductId === "gid-style",
+    "workbook: style column matches manufacturer_number",
+  );
+
+  // No Status / Joma Status columns anywhere → presence in the export IS the
+  // signal, and a Jomashop SKU means it is already on Jomashop.
+  assert(
+    !anyStatusColumnPresent([{ status: null, jomaStatus: null }, { status: "", jomaStatus: "  " }]),
+    "anyStatusColumnPresent: blank-only batch → false",
+  );
+  assert(
+    anyStatusColumnPresent([{ status: null, jomaStatus: null }, { status: "Active", jomaStatus: null }]),
+    "anyStatusColumnPresent: one populated status → true",
+  );
+  assert(
+    reconcileStatus(mkRow({ vendorSku: "3102Y378-M", jomashopSku: "Z-YE4D4" }), mExact, {
+      statusColumnsPresent: false,
+    }) === "Confirmed Live",
+    "status: no status columns + Jomashop SKU → Confirmed Live",
+  );
+  assert(
+    reconcileStatus(mkRow({ vendorSku: "3102Y378-M" }), mExact, { statusColumnsPresent: false }) ===
+      "Active in Portal",
+    "status: no status columns, no Jomashop SKU → Active in Portal",
+  );
+  assert(
+    reconcileStatus(mkRow({ vendorSku: "3102Y378-M", jomashopSku: "Z-YE4D4" }), mExact) === "Needs Review",
+    "status: export HAS status columns + blank row → still Needs Review",
+  );
+  assert(
+    reconcileStatus(mkRow({ vendorSku: "UNKNOWN", brand: "Gucci", name: "Belt" }), mBT, {
+      statusColumnsPresent: false,
+    }) === "Needs Review",
+    "status: brand+title stays Needs Review even without status columns",
+  );
+
+  // ------------------------------------------------------------------
+  // Duplicate guard: is this style already on Jomashop?
+  // ------------------------------------------------------------------
+  console.log("\n  Portal live lookup (duplicate guard):");
+
+  const mkLookup = (
+    entries: Array<[string, "live" | "in_portal", string | null]>,
+  ): PortalLiveLookup => ({
+    rowCount: entries.length,
+    byKey: new Map(
+      entries.map(([key, state, joma]) => [
+        key.toLowerCase().replace(/[^a-z0-9]+/g, ""),
+        { state, vendorSku: key, jomashopSku: joma, jomaStatus: null, status: null, matchedOn: key },
+      ]),
+    ),
+  });
+
+  const lookup = mkLookup([
+    ["3100B374-6/12", "live", "Y-A849U"],
+    ["XXM06G0ES50RE0S611", "in_portal", null],
+  ]);
+
+  assert(
+    portalLiveStateFor(lookup, ["3100B374-6/12"]).state === "live",
+    "portal lookup: exact vendor SKU → live",
+  );
+  assert(
+    portalLiveStateFor(lookup, ["3100b374 6 12"]).state === "live",
+    "portal lookup: match is punctuation/case insensitive",
+  );
+  assert(
+    portalLiveStateFor(lookup, ["3100B374-6/12"]).jomashopSku === "Y-A849U",
+    "portal lookup: carries the Jomashop SKU for the block message",
+  );
+  assert(
+    portalLiveStateFor(lookup, ["XXM06G0ES50RE0S611"]).state === "in_portal",
+    "portal lookup: no Jomashop SKU yet → in_portal, push still allowed",
+  );
+  assert(
+    portalLiveStateFor(lookup, ["BRAND-NEW-SKU"]).state === "unknown",
+    "portal lookup: unseen SKU → unknown",
+  );
+  // A live hit anywhere in the candidate list wins, so a product whose style
+  // is live is caught even when the size SKU we look up first is not.
+  assert(
+    portalLiveStateFor(lookup, ["XXM06G0ES50RE0S611", "3100B374-6/12"]).state === "live",
+    "portal lookup: strongest hit wins over candidate order",
+  );
+  // Nothing imported → never claim an item is absent from the portal.
+  assert(
+    portalLiveStateFor({ rowCount: 0, byKey: new Map() }, ["3100B374-6/12"]).state === "unknown",
+    "portal lookup: empty import → unknown, never a false 'not live'",
+  );
+
+  const cands = portalCandidatesForProduct({
+    vendor_sku: "TF-1",
+    sku: "TF-1",
+    manufacturer_number: "L1833LCL395X1N001",
+    jomashop_sku: "Z-YE4D4",
+    variants: [{ vendor_sku: "TF-1-S" }, { vendor_sku: "TF-1-M" }, { vendor_sku: "" }],
+  });
+  assert(cands.includes("L1833LCL395X1N001"), "candidates: style number included");
+  assert(cands.includes("TF-1-S") && cands.includes("TF-1-M"), "candidates: variant SKUs included");
+  assert(cands.filter((c) => c === "TF-1").length === 1, "candidates: de-duplicated");
+  assert(!cands.includes(""), "candidates: blanks dropped");
+  assert(portalCandidatesForProduct(null).length === 0, "candidates: null product → empty");
 }
 
 runPortalReconcileTests();

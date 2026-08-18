@@ -233,6 +233,7 @@ sqlite.exec(`
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     vendor_sku TEXT NOT NULL UNIQUE,
     jomashop_sku TEXT,
+    style_number TEXT,
     name TEXT,
     brand TEXT,
     category TEXT,
@@ -280,6 +281,18 @@ try {
   }
   if (!existing.has("last_rejected_brand")) {
     sqlite.exec("ALTER TABLE push_statuses ADD COLUMN last_rejected_brand TEXT");
+  }
+} catch {
+  // ignore
+}
+
+// Lightweight migration: add style_number to portal_styles for pre-existing
+// tables. The Jomashop "Manage Inventory" workbook carries the style/parent
+// number in an unnamed column; older imports simply dropped it.
+try {
+  const cols = sqlite.prepare("PRAGMA table_info(portal_styles)").all() as Array<{ name: string }>;
+  if (!cols.some((c) => c.name === "style_number")) {
+    sqlite.exec("ALTER TABLE portal_styles ADD COLUMN style_number TEXT");
   }
 } catch {
   // ignore

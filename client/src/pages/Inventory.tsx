@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { Download, RefreshCw, Ban } from "lucide-react";
+import { Download, RefreshCw, Ban, History } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -9,7 +9,24 @@ import { PageHeader, LoadingRows, ErrorBlock } from "@/components/AppShell";
 import { apiRequest } from "@/lib/queryClient";
 
 type Row = { vendor_sku: string; price: number; status: string; quantity: number };
-type Preview = { headers: string[]; rows: Row[]; note: string };
+type Preview = {
+  headers: string[];
+  rows: Row[];
+  note: string;
+  pushed_sku_count?: number;
+  unresolved_in_cache?: number;
+};
+type ReconcileResult = {
+  ok?: boolean;
+  source?: string;
+  dryRun?: boolean;
+  live_rows?: number;
+  adopted?: number;
+  already_known?: number;
+  unmatched?: number;
+  note?: string;
+  error?: string;
+};
 type SyncResult = {
   ok: boolean;
   attempted?: number;
@@ -32,6 +49,20 @@ export default function Inventory() {
     },
     onSuccess: (r) => setSyncResult(r),
     onError: (e: Error) => setSyncResult({ ok: false, error: e.message }),
+  });
+
+  const [reconcileSource, setReconcileSource] = useState<"jomashop" | "portal">("jomashop");
+  const [reconcileResult, setReconcileResult] = useState<ReconcileResult | null>(null);
+  const reconcile = useMutation({
+    mutationFn: async (args: { source: "jomashop" | "portal"; dryRun: boolean }) => {
+      const res = await apiRequest("POST", "/api/jomashop/reconcile-push-state", args);
+      return (await res.json()) as ReconcileResult;
+    },
+    onSuccess: (r) => {
+      setReconcileResult(r);
+      if (r.ok && !r.dryRun) q.refetch();
+    },
+    onError: (e: Error) => setReconcileResult({ ok: false, error: e.message }),
   });
 
   const [zeroBrand, setZeroBrand] = useState("");
@@ -92,6 +123,67 @@ export default function Inventory() {
       <div className="mb-4 rounded-md border border-border bg-card/40 px-4 py-2.5 text-xs text-muted-foreground">
         {q.data.note} Inventory updates use Jomashop's documented fields: quantity, price, map_price, and status. Shopify visibility follows stock automatically for pushed products.
       </div>
+
+      <Card className="mb-4" data-testid="card-reconcile-push-state">
+        <CardHeader className="border-b border-card-border">
+          <CardTitle className="flex items-center gap-2 text-sm">
+            <History className="h-4 w-4 text-sky-500" /> Rebuild push state from what is actually live
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-3 p-5">
+          <p className="text-xs text-muted-foreground">
+            &ldquo;Pushed&rdquo; is tracked in this app&apos;s own database. If that database was reset — a redeploy
+            without a persistent disk wipes it — products stay live on Jomashop while this app forgets it ever
+            pushed them, so they vanish from the Inventory list and reappear as &ldquo;needs pushing&rdquo;. This
+            reads what is really there and re-creates the missing records. Preview first; nothing is written
+            until you apply. It never pushes anything to Jomashop.
+          </p>
+          <div className="flex flex-wrap items-center gap-2">
+            <select
+              data-testid="select-reconcile-source"
+              value={reconcileSource}
+              onChange={(e) => setReconcileSource(e.target.value as "jomashop" | "portal")}
+              className="rounded-md border border-border bg-background px-2 py-1.5 text-sm"
+            >
+              <option value="jomashop">Live Jomashop inventory (GET /v1/inventory)</option>
+              <option value="portal">Imported Vendor Portal export (Portal Styles)</option>
+            </select>
+            <Button
+              data-testid="button-reconcile-preview"
+              variant="outline"
+              size="sm"
+              disabled={reconcile.isPending}
+              onClick={() => reconcile.mutate({ source: reconcileSource, dryRun: true })}
+            >
+              Preview
+            </Button>
+            {reconcileResult?.ok && reconcileResult.dryRun && (reconcileResult.adopted ?? 0) > 0 && (
+              <Button
+                data-testid="button-reconcile-apply"
+                size="sm"
+                disabled={reconcile.isPending}
+                onClick={() => reconcile.mutate({ source: reconcileSource, dryRun: false })}
+              >
+                Adopt {reconcileResult.adopted} SKU(s)
+              </Button>
+            )}
+          </div>
+          {reconcileResult && (
+            <div
+              data-testid="banner-reconcile-result"
+              className={`rounded-md border px-3 py-2 text-xs ${
+                reconcileResult.ok
+                  ? "border-border bg-card/40 text-muted-foreground"
+                  : "border-rose-500/50 bg-rose-500/10 text-rose-600"
+              }`}
+            >
+              {reconcileResult.ok
+                ? `${reconcileResult.live_rows ?? 0} live row(s) read — ${reconcileResult.adopted ?? 0} missing from push state, ${reconcileResult.already_known ?? 0} already tracked, ${reconcileResult.unmatched ?? 0} with no Shopify match. ${reconcileResult.note ?? ""}`
+                : `Reconcile failed: ${reconcileResult.error ?? "unknown error"}`}
+            </div>
+          )}
+        </CardContent>
+      </Card>
 
       <Card className="mb-4" data-testid="card-bulk-zero">
         <CardHeader className="border-b border-card-border">
@@ -171,7 +263,14 @@ export default function Inventory() {
 
       <Card>
         <CardHeader className="border-b border-card-border">
-          <CardTitle className="text-sm">Pushed SKU inventory preview</CardTitle>
+          <CardTitle className="text-sm">
+            Pushed SKU inventory preview
+            {typeof q.data.pushed_sku_count === "number" && (
+              <span className="ml-2 font-normal text-muted-foreground">
+                {q.data.pushed_sku_count} SKU(s)
+              </span>
+            )}
+          </CardTitle>
         </CardHeader>
         <CardContent className="p-0">
           <div className="overflow-x-auto">
@@ -184,6 +283,14 @@ export default function Inventory() {
                 </tr>
               </thead>
               <tbody>
+                {q.data.rows.length === 0 && (
+                  <tr>
+                    <td className="px-4 py-6 text-center text-xs text-muted-foreground" colSpan={q.data.headers.length}>
+                      No pushed SKUs recorded for this store. If products are live on Jomashop, use
+                      &ldquo;Rebuild push state&rdquo; above.
+                    </td>
+                  </tr>
+                )}
                 {q.data.rows.map((r) => (
                   <tr key={r.vendor_sku} className="border-b border-card-border last:border-0" data-testid={`row-inventory-${r.vendor_sku}`}>
                     <td className="px-4 py-2.5 font-mono text-xs">{r.vendor_sku}</td>

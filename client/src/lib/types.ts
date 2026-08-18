@@ -107,6 +107,18 @@ export type MappedProduct = {
    *  POST /v1/products. "rejected" when the last push returned a validation
    *  error like "Brand must exist". "failed" for non-validation errors. */
   push_state?: "not_pushed" | "pushed" | "rejected" | "failed";
+  /** What the imported Vendor Portal export says about this style, independent
+   *  of this app's own push history. "live" — the portal has already assigned
+   *  it a Jomashop SKU, so pushing again would duplicate it. "in_portal" — the
+   *  portal knows the style but Jomashop has not listed it yet. "unknown" — no
+   *  portal row matched, or nothing has been imported. */
+  portal_state?: "live" | "in_portal" | "unknown";
+  /** Jomashop SKU from the portal export (present when portal_state is "live"). */
+  portal_jomashop_sku?: string | null;
+  /** The portal row's own vendor SKU, which may differ from this variant's. */
+  portal_vendor_sku?: string | null;
+  /** Which identifier matched the portal row (vendor SKU, style number, …). */
+  portal_matched_on?: string | null;
   jomashop_sku?: string | null;
   last_push_error?: string | null;
   last_pushed_at?: number | null;
