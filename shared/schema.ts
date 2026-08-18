@@ -246,6 +246,11 @@ export const portalStyles = sqliteTable("portal_styles", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   vendorSku: text("vendor_sku").notNull().unique(), // portal "SKU" column (e.g. 3102Y378-M)
   jomashopSku: text("jomashop_sku"), // portal "Jomashop SKU" (e.g. Y-A7C4T)
+  // Style / parent number from the export (the Jomashop workbook ships it in
+  // an UNNAMED column right after "Vendor SKU", e.g. vendor SKU
+  // "L1833LCL395X1N001-OS" -> style "L1833LCL395X1N001"). It is the key that
+  // matches a Shopify product's manufacturer_number, so we keep it.
+  styleNumber: text("style_number"),
   name: text("name"),
   brand: text("brand"),
   category: text("category"),

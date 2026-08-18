@@ -70,7 +70,15 @@ import {
 } from "./jomashop_product_field_excel";
 import { registerInlineFieldRepairRoutes } from "./inline_field_repair";
 import { registerMappingMemoryRoutes } from "./mapping_memory";
-import { registerPortalRoutes } from "./portal_reconcile";
+import {
+  registerPortalRoutes,
+  buildCatalogIndex,
+  catalogEntriesFromProducts,
+  matchPortalStyle,
+  normMatchKey,
+  type CatalogIndex,
+  type PortalRowInput,
+} from "./portal_reconcile";
 import { registerAutoSyncRoutes, startAutoSyncScheduler } from "./auto_sync";
 import { pushInventoryUpdate, registerWebhookRoutes, registerShopifyWebhooks } from "./webhooks";
 import { heapMb, logMemory, rssMb } from "./memlog";
@@ -2311,6 +2319,206 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.json({ configured: true, data: result.data });
   });
 
+  // --------------------------------------------------------------------
+  // Rebuild local push state from a source of truth.
+  //
+  // `push_state` is derived ENTIRELY from the local push_statuses table, which
+  // lives in the sqlite file at DATA_DB_PATH. If that file is not on a
+  // persistent disk it is wiped on every redeploy, and the app then reports
+  // "not pushed" for products that are demonstrably live on Jomashop — nothing
+  // ever reconciled the two. This endpoint closes that loop: it takes what is
+  // actually on Jomashop (the live /v1/inventory list, or an imported Vendor
+  // Portal export), matches it against the cached Shopify catalog with the
+  // same matcher the Portal Styles page uses, and re-creates the missing
+  // push_statuses rows.
+  //
+  // body: { source?: "jomashop" | "portal", dryRun?: boolean }
+  //   - source "jomashop" (default): read GET /v1/inventory.
+  //   - source "portal": read the imported portal styles.
+  //   - dryRun defaults to TRUE — nothing is written until dryRun:false.
+  app.post("/api/jomashop/reconcile-push-state", async (req, res) => {
+    const source = req.body?.source === "portal" ? "portal" : "jomashop";
+    const dryRun = req.body?.dryRun !== false;
+
+    const conn = getActiveShopifyConnection();
+    if (!conn) {
+      return res.status(503).json({ ok: false, error: "No connected Shopify store with an access token." });
+    }
+    const shopDomain = conn.shopDomain;
+
+    const cache = storage.getProductCache(shopDomain);
+    if (!cache) {
+      return res.status(409).json({
+        ok: false,
+        error: "No product cache for this store. Refresh products first, then re-run.",
+      });
+    }
+    let mapped: any[] = [];
+    try {
+      const payload = JSON.parse(cache.payloadJson);
+      mapped = Array.isArray(payload?.mapped) ? payload.mapped : [];
+    } catch {
+      return res.status(500).json({ ok: false, error: "Corrupt product cache." });
+    }
+    const index: CatalogIndex = buildCatalogIndex(catalogEntriesFromProducts(mapped));
+    const mappedByProductId = new Map<string, any>(
+      mapped.map((m) => [String(m?.source?.shopify_product_id ?? ""), m]),
+    );
+
+    // ---- Collect the live rows from the chosen source ----
+    type LiveRow = { vendorSku: string; jomashopSku: string | null; styleNumber: string | null };
+    const live: LiveRow[] = [];
+    if (source === "portal") {
+      for (const p of storage.listPortalStyles()) {
+        live.push({
+          vendorSku: p.vendorSku,
+          jomashopSku: p.jomashopSku ?? null,
+          styleNumber: p.styleNumber ?? null,
+        });
+      }
+      if (live.length === 0) {
+        return res.status(409).json({
+          ok: false,
+          error: "No portal styles imported. Upload the Vendor Portal export on the Portal Styles page first.",
+        });
+      }
+    } else {
+      if (!jomashopConfigured()) {
+        return res.status(503).json({ ok: false, error: "Jomashop credentials not configured." });
+      }
+      const result = await jomashopRequest<any>({ path: "/v1/inventory", query: { per_page: "99999" } });
+      if (!result.ok) return res.status(502).json({ ok: false, error: result.error });
+      const raw = result.data;
+      const items: any[] = Array.isArray(raw)
+        ? raw
+        : Array.isArray(raw?.items)
+          ? raw.items
+          : Array.isArray(raw?.data)
+            ? raw.data
+            : Array.isArray(raw?.results)
+              ? raw.results
+              : [];
+      for (const it of items) {
+        if (!it || typeof it !== "object") continue;
+        const vendorSku = String(it.vendor_sku ?? it.vendorSku ?? it.sku ?? "").trim();
+        if (!vendorSku) continue;
+        const jomashopSku = String(
+          it.jomashop_sku ?? it.jomashopSku ?? it.joma_sku ?? it.jomaSku ?? "",
+        ).trim();
+        live.push({ vendorSku, jomashopSku: jomashopSku || null, styleNumber: null });
+      }
+      if (live.length === 0) {
+        return res.json({
+          ok: true,
+          source,
+          dryRun,
+          live_rows: 0,
+          adopted: 0,
+          already_known: 0,
+          unmatched: 0,
+          adoptions: [],
+          note: "Jomashop returned no inventory rows — nothing to reconcile.",
+        });
+      }
+    }
+
+    // ---- Match each live row to the Shopify catalog, adopt the misses ----
+    const now = Date.now();
+    const adoptions: Array<{
+      vendor_sku: string;
+      shopify_sku: string;
+      shopify_product_id: string;
+      jomashop_sku: string | null;
+      confidence: string;
+    }> = [];
+    let alreadyKnown = 0;
+    let unmatched = 0;
+    const seen = new Set<string>();
+
+    for (const row of live) {
+      const key = normMatchKey(row.vendorSku);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      const portalRow: PortalRowInput = {
+        vendorSku: row.vendorSku,
+        jomashopSku: row.jomashopSku,
+        styleNumber: row.styleNumber,
+        name: null,
+        brand: null,
+        category: null,
+        status: null,
+        jomaStatus: null,
+        qty: null,
+        priceCents: null,
+        msrpCents: null,
+        dateCreated: null,
+        dateUpdated: null,
+        productId: null,
+        raw: {},
+      };
+      const match = matchPortalStyle(portalRow, index);
+      const entry = match.entry;
+      if (!entry || match.confidence === "Brand+Title") {
+        unmatched += 1;
+        continue;
+      }
+      const existing = storage.getPushStatusBySku(shopDomain, entry.sku);
+      if (existing && existing.state === "pushed") {
+        alreadyKnown += 1;
+        continue;
+      }
+      adoptions.push({
+        vendor_sku: row.vendorSku,
+        shopify_sku: entry.sku,
+        shopify_product_id: entry.shopifyProductId,
+        jomashop_sku: row.jomashopSku ?? entry.jomashopSku ?? null,
+        confidence: match.confidence,
+      });
+      if (dryRun) continue;
+      const product = mappedByProductId.get(entry.shopifyProductId);
+      storage.upsertPushStatus({
+        shopDomain,
+        shopifyProductId: entry.shopifyProductId,
+        shopifyVariantId: entry.shopifyVariantId,
+        shopifySku: entry.sku,
+        jomashopSku: row.jomashopSku ?? entry.jomashopSku ?? null,
+        state: "pushed",
+        lastStatus: null,
+        // Marked so the operator can tell an adopted row from a real push.
+        lastError: null,
+        lastPayloadJson: product ? JSON.stringify(product) : null,
+        lastInvalidParams: null,
+        lastRejectedCategory: null,
+        lastRejectedBrand: null,
+        lastPushedAt: existing?.lastPushedAt ?? now,
+        updatedAt: now,
+      });
+    }
+
+    storage.appendLog({
+      level: "info",
+      message:
+        `Push-state reconcile from ${source}: ${adoptions.length} adopted, ` +
+        `${alreadyKnown} already known, ${unmatched} unmatched (dryRun=${dryRun})`,
+      detailsJson: JSON.stringify({ source, dryRun, adoptions: adoptions.slice(0, 200) }),
+      createdAt: now,
+    });
+
+    res.json({
+      ok: true,
+      source,
+      dryRun,
+      live_rows: live.length,
+      adopted: adoptions.length,
+      already_known: alreadyKnown,
+      unmatched,
+      adoptions: adoptions.slice(0, 500),
+      note: dryRun
+        ? "Dry run — nothing written. Re-send with dryRun:false to adopt these into push_statuses."
+        : `Adopted ${adoptions.length} SKU(s) into push_statuses for ${shopDomain}.`,
+    });
+  });
+
   app.get("/api/jomashop/orders", async (req, res) => {
     if (!jomashopConfigured()) return res.json({ configured: false, items: [] });
     const status = String(req.query.status || "new");
@@ -3460,24 +3668,82 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     });
   });
 
+  // Preview of the rows POST /api/jomashop/inventory-sync would send. This
+  // reads the REAL pushed SKUs (push_statuses joined against the cached
+  // Shopify catalog) — it used to render SAMPLE_SHOPIFY_PRODUCTS, which meant
+  // the Inventory page showed the same demo fixtures no matter what had
+  // actually been pushed to Jomashop.
   app.get("/api/sync/inventory-preview", (_req, res) => {
-    const sample = SAMPLE_SHOPIFY_PRODUCTS.flatMap((p) =>
-      (p.variants || []).map((v) => ({
-        vendor_sku: v.sku,
-        price: parseFloat(v.price || "0"),
-        status:
-          v.inventory_quantity === undefined || v.inventory_quantity === null
-            ? "inactive"
-            : v.inventory_quantity > 0
-              ? "active"
-              : "out_of_stock",
-        quantity: v.inventory_quantity ?? 0,
-      })),
-    );
+    const headers = ["Vendor SKU", "Price", "Status", "Quantity"];
+    const conn = getActiveShopifyConnection();
+    const shopDomain = conn?.shopDomain ?? null;
+    const pushed = storage
+      .listPushStatuses(shopDomain ?? undefined)
+      .filter((p) => p.state === "pushed");
+    if (pushed.length === 0) {
+      return res.json({
+        headers,
+        rows: [],
+        pushed_sku_count: 0,
+        note:
+          "No SKUs are recorded as pushed for this store. If products ARE live on Jomashop, run " +
+          "POST /api/jomashop/reconcile-push-state to rebuild push state from Jomashop or from a portal import.",
+      });
+    }
+
+    // Index the cached catalog by vendor SKU for price / quantity / status.
+    const variantBySku = new Map<
+      string,
+      { price: number | null; jomashopPrice: number | null; quantity: number; status: string }
+    >();
+    if (shopDomain) {
+      const cache = storage.getProductCache(shopDomain);
+      if (cache) {
+        try {
+          const payload = JSON.parse(cache.payloadJson);
+          for (const m of Array.isArray(payload?.mapped) ? payload.mapped : []) {
+            for (const v of Array.isArray(m?.variants) ? m.variants : []) {
+              const sku = String(v?.vendor_sku ?? "").trim();
+              if (!sku || variantBySku.has(sku)) continue;
+              const quantity = typeof v?.quantity === "number" ? v.quantity : 0;
+              variantBySku.set(sku, {
+                price: typeof v?.price === "number" ? v.price : null,
+                jomashopPrice: typeof v?.jomashop_price === "number" ? v.jomashop_price : null,
+                quantity,
+                status: typeof v?.status === "string" ? v.status : quantity > 0 ? "active" : "out_of_stock",
+              });
+            }
+          }
+        } catch {
+          // Corrupt cache — fall through and render SKUs without pricing.
+        }
+      }
+    }
+
+    let unresolved = 0;
+    const rows = pushed.map((p) => {
+      const hit = variantBySku.get(p.shopifySku);
+      if (!hit) unresolved += 1;
+      const quantity = hit?.quantity ?? 0;
+      return {
+        vendor_sku: p.shopifySku,
+        price: hit?.jomashopPrice ?? hit?.price ?? 0,
+        status: hit?.status ?? (quantity > 0 ? "active" : "out_of_stock"),
+        quantity,
+      };
+    });
+
     res.json({
-      headers: ["Vendor SKU", "Price", "Status", "Quantity"],
-      rows: sample,
-      note: "Preview of the bulk inventory CSV payload (PUT /v1/inventory/update-statuses).",
+      headers,
+      rows,
+      pushed_sku_count: pushed.length,
+      unresolved_in_cache: unresolved,
+      note:
+        `${pushed.length} pushed SKU(s) for ${shopDomain ?? "(no connected store)"}. ` +
+        (unresolved > 0
+          ? `${unresolved} have no cached Shopify variant — refresh products to fill in price/quantity. `
+          : "") +
+        "This is the payload POST /api/jomashop/inventory-sync sends (PUT /v1/inventory/update-statuses).",
     });
   });
 

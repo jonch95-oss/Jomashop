@@ -93,9 +93,10 @@ Scopes selected on the Shopify side must match `SHOPIFY_SCOPES` exactly.
 | GET    | `/api/jomashop/inventory`                       | Proxy `GET /v1/inventory`                        |
 | GET    | `/api/jomashop/orders`                          | Proxy `GET /v1/orders?status=…`                  |
 | POST   | `/api/sync/preview-products`                    | Shopify product → Jomashop payload mapping       |
-| GET    | `/api/sync/inventory-preview`                   | Bulk inventory CSV preview                       |
+| GET    | `/api/sync/inventory-preview`                   | Bulk inventory CSV preview for the real pushed SKUs |
 | GET    | `/api/sync/orders-preview`                      | Orders + fulfill payload preview                 |
-| POST   | `/api/portal/import`                            | Import a Vendor Portal export (CSV/XLSX upload, or JSON `{rows}`/`{csv}`) |
+| POST   | `/api/jomashop/reconcile-push-state`            | Rebuild local push state from Jomashop's live inventory or an imported portal export (`dryRun` defaults to true) |
+| POST   | `/api/portal/import`                            | Import a Vendor Portal export (CSV / XLSX / XLSM upload, or JSON `{rows}`/`{csv}`) |
 | GET    | `/api/portal/styles`                            | Reconciled portal styles (recomputed vs. cache)  |
 | GET    | `/api/portal/summary`                           | Reconciliation counts + portal-missing list      |
 | GET    | `/api/portal/inventory-eligibility`             | Push-eligibility guard (all, or `?sku=`)         |
@@ -120,8 +121,27 @@ The Jomashop client (`server/jomashop.ts`) handles:
 The Jomashop **Vendor Portal** ("Manage Inventory") is the source of truth for
 what is actually live on Jomashop. It has no public API, so this feature is
 **import/export driven** — no scraping, no portal credentials. Export the
-Manage Inventory list to CSV/XLSX (or copy the rows), import it here, and the
-app reconciles each style against the cached Shopify catalog.
+Manage Inventory list (or copy the rows), import it here, and the app
+reconciles each style against the cached Shopify catalog.
+
+### File formats
+
+Upload the portal download **as-is**. Format is detected from the file's
+contents, not its extension, so the macro-enabled `.xlsm` workbook the portal
+hands out works alongside `.xlsx` / `.xltx` / `.csv`. Inside a workbook the
+importer *finds* its data rather than assuming a layout:
+
+- the **data sheet** is chosen by looking for a header row with a SKU column,
+  so the workbook's leading `Instructions` sheet is skipped;
+- the **header row** is located by scanning the top of the sheet, so title and
+  banner blocks above it don't shift the columns;
+- the template's two annotation rows directly under the header (the prose
+  descriptions, and the `required` / `readonly` flags) are dropped instead of
+  being imported as phantom styles;
+- **unnamed columns are kept**. The workbook ships the style/parent number in a
+  column with a blank header; a cell there whose value is a prefix of the
+  vendor SKU (`L1833LCL395X1N001` for `L1833LCL395X1N001-OS`) is read as the
+  style number, which is what matches a Shopify `manufacturer_number`.
 
 ### Expected columns
 
@@ -132,8 +152,9 @@ export typically includes:
 | ---------------------- | -------------- | --------------------------------------------- |
 | `Status`               | portal status  | `Active` / `Inactive`                         |
 | `Joma Status`          | live status    | `Live` ⇒ confirmed live on Jomashop           |
-| `SKU`                  | vendor SKU     | **required** — rows without a SKU are skipped  |
-| `Jomashop SKU`         | jomashop SKU   | secondary match key                            |
+| `SKU` / `Vendor SKU`   | vendor SKU     | **required** — rows without a SKU are skipped  |
+| `Jomashop SKU` / `Joma SKU` | jomashop SKU | secondary match key; the workbook uses the short spelling |
+| `Style` / `Manufacturer #` / unnamed column | style number | matches Shopify `manufacturer_number` |
 | `Name`                 | title          | brand+title fallback match                     |
 | `Category`             | category       | informational                                  |
 | `Qty`                  | quantity       | integer                                        |
@@ -155,6 +176,13 @@ order: **Exact SKU → Jomashop SKU → UPC/Product ID → Style/Parent SKU
 - **Active in Portal** — matched and `Status = Active`
 - **Inactive in Portal** — matched and `Status = Inactive`
 - **Needs Review** — matched only by Brand+Title (low confidence) or status unknown
+
+When the export carries **no status columns at all** — the `.xlsm` Manage
+Inventory workbook has none — a blank status is not "unknown", it means "this
+row is in the portal". Those rows resolve on the Jomashop SKU instead: a row
+that already has one is **Confirmed Live**, a row still waiting for one is
+**Active in Portal**. An export that *does* have status columns is unaffected;
+a blank status there still means **Needs Review**.
 - **Unmatched Portal Row** — no catalog match
 - **Portal Missing** — a product pushed to Jomashop that has **no** portal row
   (surfaced separately as a gap to investigate)
@@ -171,11 +199,57 @@ order: **Exact SKU → Jomashop SKU → UPC/Product ID → Style/Parent SKU
 
 ### Workflow
 
-1. In the Vendor Portal, export Manage Inventory (CSV/XLSX).
-2. Open `/#/portal-styles`, **Upload CSV / XLSX** (or paste rows). Import
-   replaces the prior snapshot by default (`replace=false` to append).
+1. In the Vendor Portal, export Manage Inventory.
+2. Open `/#/portal-styles`, **Upload CSV / XLSX / XLSM** (or paste rows) —
+   the downloaded file needs no cleanup first. Import replaces the prior
+   snapshot by default (`replace=false` to append).
 3. Review the reconciliation table — filter by status, check matched Shopify
    SKU/product and confidence, and confirm inventory eligibility before pushing.
+
+---
+
+## "It's live on Jomashop but the app says it was never pushed"
+
+`push_state` is derived **entirely** from this app's own `push_statuses` table
+— nothing reads back from Jomashop to confirm it. That table lives in the
+SQLite file at `DATA_DB_PATH`, which defaults to a relative `data.db` in the
+working directory. Most hosts give a fresh container on every redeploy, so
+unless `DATA_DB_PATH` points at a **mounted persistent disk** the push history
+is wiped while the products stay live on Jomashop. The symptoms:
+
+- the Inventory page lists no pushed SKUs,
+- Products shows items as needing a push when they are already on Jomashop,
+- inventory webhooks skip those SKUs (`has not been pushed to Jomashop yet`),
+- Portal Styles reports them under **Portal Missing**.
+
+Two things to do:
+
+1. **Stop it recurring** — set `DATA_DB_PATH` to a path on a persistent disk
+   (e.g. `/var/data/data.db`) and redeploy.
+2. **Recover what was lost** — Inventory page → **Rebuild push state**, or
+   `POST /api/jomashop/reconcile-push-state`. It reads what is actually there
+   (Jomashop's live `GET /v1/inventory`, or an imported Vendor Portal export),
+   matches it against the cached Shopify catalog with the same matcher the
+   Portal Styles page uses, and re-creates the missing `push_statuses` rows.
+   It runs as a **dry run by default** — send `{"dryRun": false}` to write —
+   and never pushes anything to Jomashop.
+
+```bash
+# preview
+curl -X POST "$APP_URL/api/jomashop/reconcile-push-state" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"source":"jomashop"}'
+
+# apply
+curl -X POST "$APP_URL/api/jomashop/reconcile-push-state" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"source":"jomashop","dryRun":false}'
+```
+
+A product cache is required (Products → **Refresh from Shopify**), since the
+match is made against it.
+
+---
 
 ## Data model
 

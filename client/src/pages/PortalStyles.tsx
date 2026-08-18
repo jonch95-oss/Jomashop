@@ -26,6 +26,7 @@ type MatchStatus =
 type ReconciledStyle = {
   vendor_sku: string;
   jomashop_sku: string | null;
+  style_number: string | null;
   name: string | null;
   brand: string | null;
   category: string | null;
@@ -99,7 +100,10 @@ export default function PortalStyles() {
       });
       const body = await res.json();
       if (!res.ok || !body.ok) throw new Error(body.error || `Import failed (${res.status})`);
-      setNotice(`Imported ${body.imported} style(s)${body.skipped ? `, ${body.skipped} skipped` : ""}.`);
+      setNotice(
+        `Imported ${body.imported} style(s)${body.skipped ? `, ${body.skipped} skipped` : ""}` +
+          `${body.parsed_from ? ` from ${body.parsed_from}` : ""}.`,
+      );
       stylesQ.refetch();
     } catch (e) {
       setError((e as Error).message);
@@ -167,7 +171,7 @@ export default function PortalStyles() {
             <input
               ref={fileRef}
               type="file"
-              accept=".csv,.xlsx,.xls"
+              accept=".csv,.xlsx,.xlsm,.xltx,.xltm,.xls"
               className="hidden"
               onChange={(e) => {
                 const f = e.target.files?.[0];
@@ -176,10 +180,12 @@ export default function PortalStyles() {
             />
             <Button onClick={() => fileRef.current?.click()} disabled={busy}>
               {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
-              Upload CSV / XLSX
+              Upload CSV / XLSX / XLSM
             </Button>
             <span className="text-sm text-muted-foreground">
-              Expected columns: Status / Joma Status, SKU, Jomashop SKU, Name, Category, Qty, Price, MSRP, Date Created, Date Updated.
+              Upload the portal&apos;s inventory workbook as-is — the macro-enabled .xlsm download works, and the
+              data sheet and header row are detected automatically. Recognized columns: Vendor SKU, Joma
+              (Jomashop) SKU, Style / parent number, Brand, Name, Category, Status / Joma Status, Qty, Price, MSRP.
             </span>
           </div>
 
@@ -248,6 +254,7 @@ export default function PortalStyles() {
                     <th className="px-3 py-2">Status</th>
                     <th className="px-3 py-2">Vendor SKU</th>
                     <th className="px-3 py-2">Jomashop SKU</th>
+                    <th className="px-3 py-2">Style #</th>
                     <th className="px-3 py-2">Name</th>
                     <th className="px-3 py-2 text-right">Qty</th>
                     <th className="px-3 py-2 text-right">Price</th>
@@ -264,6 +271,7 @@ export default function PortalStyles() {
                       </td>
                       <td className="px-3 py-2 font-mono text-xs">{s.vendor_sku}</td>
                       <td className="px-3 py-2 font-mono text-xs">{s.jomashop_sku || "—"}</td>
+                      <td className="px-3 py-2 font-mono text-xs">{s.style_number || "—"}</td>
                       <td className="px-3 py-2 max-w-[22rem] truncate" title={s.name || ""}>
                         {s.name || "—"}
                         {s.brand ? <span className="ml-1 text-muted-foreground">· {s.brand}</span> : null}
