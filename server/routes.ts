@@ -2669,8 +2669,16 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         needs_stamp: boolean;
       };
       const items: Item[] = [];
-      let unmatched = 0;
-      let notPushed = 0;
+      // Counts alone left the operator with "108 are not pushed yet" and no
+      // way to find out which, so the rows themselves are collected.
+      const unmatchedSkus: Array<{ vendor_sku: string; jomashop_sku: string | null }> = [];
+      const notPushedSkus: Array<{
+        vendor_sku: string;
+        shopify_sku: string;
+        state: string;
+        last_status: number | null;
+        last_error: string | null;
+      }> = [];
       let noValues = 0;
       const seen = new Set<string>();
 
@@ -2680,12 +2688,24 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         if (price === null && msrp === null) { noValues += 1; continue; }
         const portalRow = { ...row, raw: {} };
         const match = matchPortalStyle(portalRow, index);
-        if (!match.entry || match.confidence === "Brand+Title") { unmatched += 1; continue; }
+        if (!match.entry || match.confidence === "Brand+Title") {
+          unmatchedSkus.push({ vendor_sku: row.vendorSku, jomashop_sku: row.jomashopSku });
+          continue;
+        }
         const shopifySku = match.entry.sku;
         if (seen.has(shopifySku)) continue;
         seen.add(shopifySku);
         const ps = storage.getPushStatusBySku(shopDomain, shopifySku);
-        if (!ps || ps.state !== "pushed") { notPushed += 1; continue; }
+        if (!ps || ps.state !== "pushed") {
+          notPushedSkus.push({
+            vendor_sku: row.vendorSku,
+            shopify_sku: shopifySku,
+            state: ps?.state ?? "never pushed",
+            last_status: ps?.lastStatus ?? null,
+            last_error: ps?.lastError ?? null,
+          });
+          continue;
+        }
         // What the bridge would currently replay on the next stock webhook.
         let currentPrice: number | null = null;
         let currentMsrp: number | null = null;
@@ -2720,14 +2740,21 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         will_change: changed.length,
         will_stamp: toStamp.length,
         unchanged: items.length - changed.length - toStamp.length,
-        unmatched,
-        not_pushed: notPushed,
+        unmatched: unmatchedSkus.length,
+        not_pushed: notPushedSkus.length,
         no_price_or_msrp: noValues,
+      };
+      // Capped so a pathological file cannot blow up the response.
+      const bucketLists = {
+        not_pushed_skus: notPushedSkus.slice(0, 500),
+        not_pushed_truncated: notPushedSkus.length > 500,
+        unmatched_skus: unmatchedSkus.slice(0, 500),
+        unmatched_truncated: unmatchedSkus.length > 500,
       };
 
       if (dryRun) {
         return res.json({
-          ok: true, dryRun: true, parsed_from: parseNote || null, ...baseCounts,
+          ok: true, dryRun: true, parsed_from: parseNote || null, ...baseCounts, ...bucketLists,
           preview: changed.slice(0, 200),
           note: `Nothing written. ${changed.length} SKU(s) would change. Re-send with dryRun:false to apply.`,
         });

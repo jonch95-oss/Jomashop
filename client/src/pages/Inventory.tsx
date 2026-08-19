@@ -39,6 +39,16 @@ type PriceImportResult = {
     current_price: number | null;
     current_msrp: number | null;
   }>;
+  not_pushed_skus?: Array<{
+    vendor_sku: string;
+    shopify_sku: string;
+    state: string;
+    last_status: number | null;
+    last_error: string | null;
+  }>;
+  not_pushed_truncated?: boolean;
+  unmatched_skus?: Array<{ vendor_sku: string; jomashop_sku: string | null }>;
+  unmatched_truncated?: boolean;
   note?: string;
   error?: string;
 };
@@ -95,6 +105,20 @@ export default function Inventory() {
   const [priceBusy, setPriceBusy] = useState(false);
   const [priceResult, setPriceResult] = useState<PriceImportResult | null>(null);
   const [priceProgress, setPriceProgress] = useState<PriceProgress | null>(null);
+
+  function downloadRowsCsv(filename: string, header: string[], rows: Array<Array<string | number | null>>) {
+    const esc = (v: string | number | null) => {
+      const t = v === null || v === undefined ? "" : String(v);
+      return /[",\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t;
+    };
+    const body = [header.join(","), ...rows.map((r) => r.map(esc).join(","))].join("\n");
+    const url = URL.createObjectURL(new Blob([body], { type: "text/csv" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
 
   async function runPriceImport(dryRun: boolean) {
     if (!priceFile) return;
@@ -297,6 +321,77 @@ export default function Inventory() {
                   ))}
                 </tbody>
               </table>
+            </div>
+          )}
+
+          {priceResult?.ok && (priceResult.not_pushed_skus?.length ?? 0) > 0 && (
+            <div className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs">
+              <div className="mb-1 flex flex-wrap items-center gap-2">
+                <span className="font-medium text-amber-700 dark:text-amber-400">
+                  In your file but not priced ({priceResult.not_pushed ?? 0})
+                </span>
+                <Button
+                  data-testid="button-export-not-pushed"
+                  variant="outline"
+                  size="sm"
+                  onClick={() =>
+                    downloadRowsCsv(
+                      "not-priced-skus.csv",
+                      ["vendor_sku", "shopify_sku", "state", "last_status", "last_error"],
+                      priceResult.not_pushed_skus!.map((r) => [r.vendor_sku, r.shopify_sku, r.state, r.last_status, r.last_error]),
+                    )
+                  }
+                >
+                  <Download className="mr-1.5 h-3.5 w-3.5" /> Export CSV
+                </Button>
+              </div>
+              <p className="mb-2 text-muted-foreground">
+                These matched a Shopify product but the bridge does not consider them pushed, so they were skipped.
+                A state of &ldquo;failed&rdquo; with a 429/503 means Jomashop was busy, not that anything is wrong with
+                the product — use &ldquo;Rebuild push state&rdquo; below to recover them, then re-run this import.
+              </p>
+              <div className="max-h-40 overflow-y-auto font-mono text-[11px] text-muted-foreground">
+                {priceResult.not_pushed_skus!.map((r) => (
+                  <div key={r.shopify_sku}>
+                    {r.vendor_sku} — {r.state}
+                    {r.last_status ? ` (${r.last_status})` : ""}
+                  </div>
+                ))}
+              </div>
+              {priceResult.not_pushed_truncated && <div className="mt-1">Showing the first 500.</div>}
+            </div>
+          )}
+
+          {priceResult?.ok && (priceResult.unmatched_skus?.length ?? 0) > 0 && (
+            <div className="rounded-md border border-border bg-card/40 px-3 py-2 text-xs">
+              <div className="mb-1 flex flex-wrap items-center gap-2">
+                <span className="font-medium">No Shopify match ({priceResult.unmatched ?? 0})</span>
+                <Button
+                  data-testid="button-export-unmatched"
+                  variant="outline"
+                  size="sm"
+                  onClick={() =>
+                    downloadRowsCsv(
+                      "no-shopify-match.csv",
+                      ["vendor_sku", "jomashop_sku"],
+                      priceResult.unmatched_skus!.map((r) => [r.vendor_sku, r.jomashop_sku]),
+                    )
+                  }
+                >
+                  <Download className="mr-1.5 h-3.5 w-3.5" /> Export CSV
+                </Button>
+              </div>
+              <p className="mb-2 text-muted-foreground">
+                In your Jomashop file with nothing corresponding in the Shopify catalog, so the bridge cannot price them.
+              </p>
+              <div className="max-h-32 overflow-y-auto font-mono text-[11px] text-muted-foreground">
+                {priceResult.unmatched_skus!.map((r) => (
+                  <div key={r.vendor_sku}>
+                    {r.vendor_sku}
+                    {r.jomashop_sku ? ` — ${r.jomashop_sku}` : ""}
+                  </div>
+                ))}
+              </div>
             </div>
           )}
 
