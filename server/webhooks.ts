@@ -69,6 +69,10 @@ function isTransientStatus(status: number): boolean {
 type PushStatusPayload = {
   price?: number | null;
   msrp?: number | null;
+  /** "operator" when the price came from an explicit import of the operator's
+   *  own price file, rather than being derived from Shopify retail. Such a
+   *  price is authoritative and must never be recomputed away. */
+  price_source?: string | null;
   category?: string;
   variants?: Array<{
     vendor_sku: string;
@@ -260,7 +264,18 @@ export async function pushInventoryUpdate(opts: {
     null;
   // Live price change from products/update: recompute the outbound Jomashop
   // price using the stored discount ratio, then charm + 50% margin guard.
-  if (typeof newShopifyPrice === "number" && Number.isFinite(newShopifyPrice) && newShopifyPrice > 0) {
+  //
+  // Skipped when the stored price came from an operator price import. That
+  // price IS the decision — recomputing it from Shopify retail silently threw
+  // away a deliberate bulk update, which is exactly how an imported price
+  // reverted hours later with no failure anywhere to show for it.
+  const operatorPriced = stored?.price_source === "operator";
+  if (
+    !operatorPriced &&
+    typeof newShopifyPrice === "number" &&
+    Number.isFinite(newShopifyPrice) &&
+    newShopifyPrice > 0
+  ) {
     const priorShopify =
       (typeof variantSnapshot?.price === "number" ? variantSnapshot.price : null) ??
       (typeof stored?.price === "number" ? stored.price : null);
@@ -285,9 +300,6 @@ export async function pushInventoryUpdate(opts: {
   }
   const status = inventoryStatusFor(qty);
   const body: Record<string, unknown> = { status, quantity: qty };
-  if (price !== null && price !== undefined && Number.isFinite(Number(price))) {
-    body.price = price;
-  }
   // Persist MSRP across inventory updates so the Jomashop portal keeps a
   // populated MSRP column when only stock/price changes are pushed. The
   // Jomashop inventory API calls this field `map_price` (while product create
@@ -298,6 +310,30 @@ export async function pushInventoryUpdate(opts: {
       : stored?.msrp;
   if (msrp !== null && msrp !== undefined && Number.isFinite(Number(msrp))) {
     body.map_price = msrp;
+  }
+  // A payout above list price is never right. The margin floor in the
+  // recompute above can raise a price past MSRP to clear a high cost, which
+  // put "Price 559.99 / MSRP 500.00" on the portal. Clamp instead: a margin
+  // problem is for the operator to price, not for us to publish upside down.
+  if (
+    price !== null &&
+    price !== undefined &&
+    Number.isFinite(Number(price)) &&
+    msrp !== null &&
+    msrp !== undefined &&
+    Number.isFinite(Number(msrp)) &&
+    Number(price) > Number(msrp)
+  ) {
+    storage.appendLog({
+      level: "warn",
+      message: `Clamped ${shopifySku} outbound price ${price} to MSRP ${msrp} (price exceeded list)`,
+      detailsJson: JSON.stringify({ shopifySku, price, msrp, topic }),
+      createdAt: Date.now(),
+    });
+    price = Number(msrp);
+  }
+  if (price !== null && price !== undefined && Number.isFinite(Number(price))) {
+    body.price = price;
   }
   const targetSku = lookup.jomashopSku || lookup.shopifySku;
   const resp = await jomashopRequest({
@@ -319,6 +355,11 @@ export async function pushInventoryUpdate(opts: {
       const snap = (stored ? { ...stored } : {}) as PushStatusPayload & Record<string, unknown>;
       if (price !== null && price !== undefined && Number.isFinite(Number(price))) {
         snap.price = Number(price);
+      }
+      // An explicitly supplied price is the operator's decision; mark it so a
+      // later products/update webhook leaves it alone.
+      if (typeof outboundPrice === "number" && Number.isFinite(outboundPrice) && outboundPrice > 0) {
+        snap.price_source = "operator";
       }
       if (msrp !== null && msrp !== undefined && Number.isFinite(Number(msrp))) {
         snap.msrp = Number(msrp);
