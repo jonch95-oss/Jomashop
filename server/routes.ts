@@ -2664,6 +2664,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         current_price: number | null;
         current_msrp: number | null;
         changed: boolean;
+        /** Values already match, but the snapshot is not marked operator-owned
+         *  yet, so a products/update webhook could still recompute them away. */
+        needs_stamp: boolean;
       };
       const items: Item[] = [];
       let unmatched = 0;
@@ -2686,11 +2689,13 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         // What the bridge would currently replay on the next stock webhook.
         let currentPrice: number | null = null;
         let currentMsrp: number | null = null;
+        let operatorOwned = false;
         if (ps.lastPayloadJson) {
           try {
             const snap = JSON.parse(ps.lastPayloadJson);
             currentPrice = typeof snap?.price === "number" ? snap.price : null;
             currentMsrp = typeof snap?.msrp === "number" ? snap.msrp : null;
+            operatorOwned = snap?.price_source === "operator";
           } catch { /* stale/corrupt snapshot — treat as unknown */ }
         }
         items.push({
@@ -2699,15 +2704,22 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           shopify_product_id: match.entry.shopifyProductId,
           price, msrp, current_price: currentPrice, current_msrp: currentMsrp,
           changed: (price !== null && price !== currentPrice) || (msrp !== null && msrp !== currentMsrp),
+          // Imports run before price_source existed left correct values with no
+          // ownership mark. Re-running would skip them as "already match" and
+          // they would stay recomputable, so claim them without a Jomashop
+          // call — the value there is already right.
+          needs_stamp: !operatorOwned,
         });
       }
 
       const changed = items.filter((i) => i.changed);
+      const toStamp = items.filter((i) => !i.changed && i.needs_stamp);
       const baseCounts = {
         parsed_rows: rows.length,
         matched: items.length,
         will_change: changed.length,
-        unchanged: items.length - changed.length,
+        will_stamp: toStamp.length,
+        unchanged: items.length - changed.length - toStamp.length,
         unmatched,
         not_pushed: notPushed,
         no_price_or_msrp: noValues,
@@ -2723,8 +2735,45 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       if (priceImportProgress.active) {
         return res.status(409).json({ ok: false, error: "A price import is already running. Poll GET /api/jomashop/price-import-progress." });
       }
+      // Claim rows whose values are already correct but carry no ownership
+      // mark. No Jomashop call is needed — the value there is right; only the
+      // local snapshot needs to say the operator set it, so a later
+      // products/update webhook does not recompute it away.
+      let stamped = 0;
+      for (const it of toStamp) {
+        const ps = storage.getPushStatusBySku(shopDomain, it.shopify_sku);
+        if (!ps) continue;
+        try {
+          const snap = ps.lastPayloadJson ? JSON.parse(ps.lastPayloadJson) : {};
+          snap.price_source = "operator";
+          if (it.price !== null) snap.price = it.price;
+          if (it.msrp !== null) snap.msrp = it.msrp;
+          storage.upsertPushStatus({
+            ...ps,
+            lastPayloadJson: JSON.stringify(snap),
+            updatedAt: Date.now(),
+          });
+          stamped += 1;
+        } catch {
+          // A corrupt snapshot is not worth failing the run over.
+        }
+      }
+      if (stamped > 0) {
+        storage.appendLog({
+          level: "info",
+          message: `Price import: marked ${stamped} already-correct SKU(s) as operator-priced (no Jomashop calls)`,
+          detailsJson: "{}",
+          createdAt: Date.now(),
+        });
+      }
+
       if (changed.length === 0) {
-        return res.json({ ok: true, dryRun: false, ...baseCounts, note: "Nothing to change — the bridge already holds these prices." });
+        return res.json({
+          ok: true, dryRun: false, ...baseCounts, stamped,
+          note: stamped > 0
+            ? `Nothing to push — the bridge already holds these prices. Marked ${stamped} SKU(s) as operator-priced so they can no longer be recomputed.`
+            : "Nothing to change — the bridge already holds these prices.",
+        });
       }
 
       // ---- 1) Write MSRP back to Shopify so the mapper agrees with the file ----
@@ -2811,7 +2860,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       })();
 
       res.json({
-        ok: true, dryRun: false, parsed_from: parseNote || null, ...baseCounts,
+        ok: true, dryRun: false, parsed_from: parseNote || null, ...baseCounts, stamped,
         metafieldWrites, metaErrors: metaErrors.slice(0, 10),
         note: `MSRP written to Shopify. Pushing ${changed.length} SKU(s) to Jomashop in the background — poll GET /api/jomashop/price-import-progress.`,
       });

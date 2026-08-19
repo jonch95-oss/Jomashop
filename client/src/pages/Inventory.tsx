@@ -24,6 +24,8 @@ type PriceImportResult = {
   parsed_rows?: number;
   matched?: number;
   will_change?: number;
+  will_stamp?: number;
+  stamped?: number;
   unchanged?: number;
   unmatched?: number;
   not_pushed?: number;
@@ -258,6 +260,9 @@ export default function Inventory() {
                 <>
                   Read {priceResult.parsed_rows ?? 0} row(s){priceResult.parsed_from ? ` from ${priceResult.parsed_from}` : ""} — {priceResult.matched ?? 0} matched a pushed SKU,{" "}
                   <strong>{priceResult.will_change ?? 0} would change</strong>, {priceResult.unchanged ?? 0} already match.{" "}
+                  {(priceResult.will_stamp ?? 0) > 0 &&
+                    `${priceResult.will_stamp} already correct but not yet marked as yours — applying will claim them so they can't be recomputed. `}
+                  {(priceResult.stamped ?? 0) > 0 && `Marked ${priceResult.stamped} as operator-priced. `}
                   {(priceResult.unmatched ?? 0) > 0 && `${priceResult.unmatched} had no Shopify match. `}
                   {(priceResult.not_pushed ?? 0) > 0 && `${priceResult.not_pushed} are not pushed yet. `}
                   {priceResult.note}
