@@ -2614,7 +2614,14 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   app.post("/api/jomashop/price-import", priceUpload.single("file"), async (req, res) => {
+    // Same guard the other bulk imports use. Parsing a workbook and JSON-
+    // parsing the whole product cache are both memory-heavy, and this box has
+    // a history of OOMing when two such operations overlap (see memlog.ts).
+    // Without the lock, two previews - or a preview during a refresh - could
+    // hold two copies of the cache at once and take the instance down.
+    if (!withLockOr409(res, "import.price")) return;
     try {
+      logMemory("import.price.start", { bytes: req.file?.size ?? 0 });
       const dryRun = String(req.body?.dryRun ?? req.query?.dryRun ?? "true").toLowerCase() !== "false";
       const writeShopify = String(req.body?.writeShopify ?? "true").toLowerCase() !== "false";
 
@@ -2893,6 +2900,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       });
     } catch (err) {
       res.status(500).json({ ok: false, error: (err as Error).message });
+    } finally {
+      // Released as soon as the request returns. The background push that may
+      // still be running is guarded separately by priceImportProgress.active,
+      // and holds no workbook or cache in memory.
+      logMemory("import.price.done");
+      releaseLock("import.price");
     }
   });
 
