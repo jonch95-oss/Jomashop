@@ -160,6 +160,84 @@ export type JomashopRequestOptions = {
   body?: unknown;
 };
 
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+// ---------- Process-wide rate limiting ----------
+//
+// Jomashop enforces 120 GET/min and 600 PUT/POST/min per vendor account, and
+// emails a warning when either is exceeded. Pacing used to be a sleep(350ms)
+// inside individual background loops, which had three holes:
+//
+//   1. it was sized for the WRITE cap. 350ms/iteration is ~2.9 iterations a
+//      second, so a loop doing one GET per iteration runs at ~171 GET/min —
+//      over the 120 cap on its own;
+//   2. it paced one loop, not the process. Two background jobs, or a job plus
+//      an operator clicking through the UI, simply doubled the rate;
+//   3. only 9 of 19 call sites were inside a throttled loop at all.
+//
+// The budget is a property of the account, so it is enforced in the one place
+// every call passes through. Callers cannot opt out, and concurrent work
+// shares the allowance rather than multiplying it.
+
+/** Sliding-window limiter. Reservations are serialized, so concurrent callers
+ *  cannot each observe the same free slot and take it. */
+class RateWindow {
+  private hits: number[] = [];
+  private tail: Promise<unknown> = Promise.resolve();
+
+  constructor(
+    private readonly label: string,
+    private readonly limit: number,
+    private readonly windowMs: number,
+  ) {}
+
+  /** Resolves once a slot is available, having claimed it. */
+  acquire(): Promise<void> {
+    const run = this.tail.then(() => this.reserve());
+    // Keep the chain alive even if a reservation rejects.
+    this.tail = run.catch(() => undefined);
+    return run;
+  }
+
+  private async reserve(): Promise<void> {
+    for (;;) {
+      const now = Date.now();
+      while (this.hits.length > 0 && now - this.hits[0] >= this.windowMs) this.hits.shift();
+      if (this.hits.length < this.limit) {
+        this.hits.push(now);
+        return;
+      }
+      // Oldest hit leaves the window here; +25ms so we never wake up early.
+      const waitMs = this.windowMs - (now - this.hits[0]) + 25;
+      if (waitMs > 1000) {
+        // eslint-disable-next-line no-console
+        console.log(`[rate] ${this.label} at cap (${this.limit}/${this.windowMs}ms), waiting ${waitMs}ms`);
+      }
+      await sleep(waitMs);
+    }
+  }
+}
+
+// Defaults sit under the documented caps so a burst that lands right on a
+// window boundary still does not trip the limit.
+const GET_PER_MIN = Number(process.env.JOMASHOP_GET_PER_MIN) || 100;
+const WRITE_PER_MIN = Number(process.env.JOMASHOP_WRITE_PER_MIN) || 500;
+
+const getWindow = new RateWindow("GET", GET_PER_MIN, 60_000);
+const writeWindow = new RateWindow("WRITE", WRITE_PER_MIN, 60_000);
+
+/** Test seam: build an isolated window so tests never touch the live budgets. */
+export function __makeRateWindowForTest(limit: number, windowMs: number) {
+  const w = new RateWindow("test", limit, windowMs);
+  return { acquire: () => w.acquire() };
+}
+
+/** Claim a slot in the budget this request spends from. */
+async function acquireRateSlot(method: string): Promise<void> {
+  const m = (method || "GET").toUpperCase();
+  await (m === "GET" || m === "HEAD" ? getWindow : writeWindow).acquire();
+}
+
 // ---------- Transient-failure retry ----------
 //
 // Jomashop sheds load with "503 This website is under heavy load (queue
@@ -172,8 +250,6 @@ const TRANSIENT_STATUSES = new Set([429, 502, 503, 504]);
 
 const RETRY_MAX_ATTEMPTS = Number(process.env.JOMASHOP_RETRY_ATTEMPTS) || 4;
 const RETRY_BASE_MS = Number(process.env.JOMASHOP_RETRY_BASE_MS) || 1000;
-
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /**
  * Is retrying this request safe?
@@ -243,8 +319,11 @@ export async function jomashopRequest<T = unknown>(
     }
   }
 
-  const doFetch = async (): Promise<Response> =>
-    fetch(url.toString(), {
+  const doFetch = async (): Promise<Response> => {
+    // Every attempt spends from the account budget, retries included — a
+    // retry is a real request to Jomashop and has to be counted as one.
+    await acquireRateSlot(opts.method || "GET");
+    return fetch(url.toString(), {
       method: opts.method || "GET",
       headers: {
         Authorization: `Bearer ${token!.jwt}`,
@@ -252,6 +331,7 @@ export async function jomashopRequest<T = unknown>(
       },
       body: opts.body ? JSON.stringify(opts.body) : undefined,
     });
+  };
 
   let res: Response;
   try {

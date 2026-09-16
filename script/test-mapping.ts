@@ -95,6 +95,7 @@ import {
 import {
   jomashopRequest,
   __resetSessionPathForTest,
+  __makeRateWindowForTest,
 } from "../server/jomashop";
 import {
   parsePortalCsv,
@@ -7264,6 +7265,50 @@ async function runJomashopSessionEndpointFallback() {
 }
 
 await runJomashopSessionEndpointFallback();
+
+// ---------------------------------------------------------------------------
+// Rate limiting. Jomashop allows 120 GET/min and 600 write/min per account and
+// emails a warning when either is exceeded, so the limiter has to hold under
+// concurrency — the old per-loop sleeps did not.
+// ---------------------------------------------------------------------------
+async function runRateLimitTests() {
+  console.log("\nJomashop rate limiting:");
+
+  // 5 slots per 300ms. 12 concurrent callers must take at least 2 full windows
+  // (slots 1-5 now, 6-10 after one window, 11-12 after two).
+  const w = __makeRateWindowForTest(5, 300);
+  const started = Date.now();
+  const at: number[] = [];
+  await Promise.all(
+    Array.from({ length: 12 }, () => w.acquire().then(() => at.push(Date.now() - started))),
+  );
+  assert(at.length === 12, "rate: every caller eventually acquires");
+
+  // The core property: no 300ms span ever contains more than 5 acquisitions.
+  at.sort((a, b) => a - b);
+  let worst = 0;
+  for (let i = 0; i < at.length; i++) {
+    const inWindow = at.filter((t) => t >= at[i] && t < at[i] + 300).length;
+    worst = Math.max(worst, inWindow);
+  }
+  assert(worst <= 5, `rate: never exceeds 5 per window (worst observed ${worst})`);
+  assert(at[5] >= 300, `rate: 6th caller waits for the window to roll (waited ${at[5]}ms)`);
+  assert(at[10] >= 600, `rate: 11th caller waits two windows (waited ${at[10]}ms)`);
+
+  // Serialized reservation: concurrent callers must not all see the same slot.
+  const w2 = __makeRateWindowForTest(1, 200);
+  const t0 = Date.now();
+  await Promise.all([w2.acquire(), w2.acquire()]);
+  assert(Date.now() - t0 >= 200, "rate: concurrent callers cannot claim one slot twice");
+
+  // Under the cap, nothing should be delayed.
+  const w3 = __makeRateWindowForTest(10, 1000);
+  const t1 = Date.now();
+  await Promise.all(Array.from({ length: 10 }, () => w3.acquire()));
+  assert(Date.now() - t1 < 100, "rate: traffic under the cap is not slowed");
+}
+
+await runRateLimitTests();
 
 function runPortalReconcileTests() {
   console.log("\nPortal reconciliation:");

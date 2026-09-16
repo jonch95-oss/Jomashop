@@ -292,6 +292,26 @@ into `lastPayloadJson`. It previously rewrote the row with the *old* snapshot,
 which meant a deliberate price change was undone by the very next stock
 webhook replaying superseded figures.
 
+### Staying inside Jomashop's rate limits
+
+Jomashop allows **120 GET/min and 600 PUT/POST/min** per vendor account and
+emails a warning when either is exceeded. Both budgets are enforced in
+`jomashopRequest`, so every call in the app shares one allowance —
+`JOMASHOP_GET_PER_MIN` (default 100) and `JOMASHOP_WRITE_PER_MIN` (default
+500), deliberately under the caps so a burst landing on a window boundary
+still does not trip them. A caller that would exceed the budget waits; it is
+never dropped, and a wait over a second is logged as `[rate] …`.
+
+This replaced a `sleep(350ms)` inside individual background loops, which
+leaked in three ways: it was sized for the *write* cap, so a loop doing one
+GET per iteration ran at ~171 GET/min and broke the GET limit by itself; it
+paced one loop rather than the process, so two jobs at once simply doubled the
+rate; and only 9 of 19 call sites sat inside a throttled loop at all. The
+per-loop sleeps remain, since they also pace Shopify calls, but they are no
+longer what keeps the app compliant.
+
+Retries count against the budget too — a retry is a real request.
+
 ### Transient Jomashop failures
 
 Jomashop sheds load with `503 This website is under heavy load (queue full)`
