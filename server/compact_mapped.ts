@@ -39,6 +39,9 @@ export type CompactMappedProduct = {
     quantity: number;
     status: "active" | "out_of_stock" | "inactive";
     options: Record<string, string>;
+    /** This variant's own UPC/EAN. Kept so the UI can show which sizes still
+     *  have no barcode of their own and therefore push no Product ID. */
+    barcode: string | null;
   }>;
   warnings: string[];
   missing_required: string[];
@@ -99,6 +102,7 @@ export function compactifyMapped(m: any): CompactMappedProduct {
           quantity: typeof v.quantity === "number" ? v.quantity : 0,
           status: (v.status ?? "inactive") as "active" | "out_of_stock" | "inactive",
           options,
+          barcode: v.barcode ? String(v.barcode) : null,
         };
       })
     : [];

@@ -119,6 +119,10 @@ export type MappedProduct = {
     quantity: number;
     status: "active" | "out_of_stock" | "inactive";
     options: Record<string, string>;
+    /** This variant's OWN UPC/EAN. Each size is a separate listing on
+     *  Jomashop and needs its own barcode; carrying only the product-level
+     *  one made every size share a UPC. */
+    barcode: string | null;
   }>;
   warnings: string[];
   source: { shopify_product_id?: string | number; shopify_variant_ids: Array<string | number> };
@@ -2524,6 +2528,7 @@ export function mapShopifyToJomashop(
       quantity: v.inventory_quantity ?? 0,
       status: inventoryStatus(v.inventory_quantity),
       options,
+      barcode: (v.barcode && String(v.barcode).trim()) || null,
     };
   });
 
@@ -2810,6 +2815,36 @@ export function buildJomashopProductPayload(
         ) {
           properties[key] = variantSizeValue;
         }
+      }
+    }
+
+    // Per-variant Product ID (UPC/EAN). Same shape of bug as the size above:
+    // schema mapping wrote ONE product-level Product ID taken from the FIRST
+    // variant's barcode, so every size variant was pushed carrying the same
+    // UPC. Jomashop held those listings for review — a UPC identifies a
+    // single sellable item, and each size is a separate one.
+    //
+    // A variant with no barcode of its own sends NO Product ID rather than
+    // inheriting a sibling's: an absent identifier is a gap, a wrong one is a
+    // data-integrity problem, and the wrong one is what caused the review.
+    const variantBarcode = (variant.barcode && String(variant.barcode).trim()) || "";
+    const productIdKeys = Object.keys(properties).filter((key) => {
+      const tok = String(key).toLowerCase().replace(/[^a-z0-9]+/g, "");
+      return tok === "productid" || tok === "upc" || tok === "ean";
+    });
+    const productIdTypeKeys = Object.keys(properties).filter((key) => {
+      const tok = String(key).toLowerCase().replace(/[^a-z0-9]+/g, "");
+      return tok === "productidtype" || tok === "productidkind";
+    });
+    if (productIdKeys.length > 0) {
+      const valid = /^\d{12,13}$/.test(variantBarcode);
+      for (const key of productIdKeys) {
+        if (valid) properties[key] = variantBarcode;
+        else delete properties[key];
+      }
+      for (const key of productIdTypeKeys) {
+        if (valid) properties[key] = variantBarcode.length === 13 ? "EAN" : "UPC";
+        else delete properties[key];
       }
     }
   }

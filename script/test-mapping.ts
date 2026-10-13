@@ -7271,6 +7271,73 @@ await runJomashopSessionEndpointFallback();
 // emails a warning when either is exceeded, so the limiter has to hold under
 // concurrency — the old per-loop sleeps did not.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Per-variant UPC. Jomashop held 446 listings for review because every size
+// of a style was pushed carrying the same UPC — schema mapping wrote one
+// product-level Product ID from the FIRST variant's barcode, and the mapped
+// variant did not even carry its own.
+// ---------------------------------------------------------------------------
+function runVariantUpcTests() {
+  console.log("\nPer-variant UPC:");
+
+  const threeSizes: ShopifyProduct = {
+    id: "shopify-upc-1",
+    title: "Tods Womens Loafer",
+    vendor: "Tods",
+    product_type: "SHOE",
+    options: [{ name: "Size", values: ["36", "37", "38"] }],
+    variants: [
+      { id: 1, sku: "STYLE-1-36", price: "500.00", inventory_quantity: 2, option1: "36", barcode: "190000000001" },
+      { id: 2, sku: "STYLE-1-37", price: "500.00", inventory_quantity: 2, option1: "37", barcode: "190000000002" },
+      // Deliberately no barcode — must send NO Product ID, not a sibling's.
+      { id: 3, sku: "STYLE-1-38", price: "500.00", inventory_quantity: 2, option1: "38" },
+    ],
+    metafields: [
+      { namespace: "custom", key: "ff_designer_id", value: "STYLE-1" },
+      { namespace: "custom", key: "color", value: "Black", name: "Color" },
+    ],
+  };
+  // The fallback test schemas carry no Product ID field, but the live
+  // Jomashop categories do — that is how the shared UPC reached them.
+  const upcSchema = [
+    ...clothingSchema(),
+    { field: "Product ID", required: false, type: "text" as const, options: undefined },
+    { field: "Product ID Type", required: false, type: "text" as const, options: undefined },
+  ];
+  const mappedUpc = mapShopifyToJomashop(threeSizes, upcSchema);
+
+  assert(
+    mappedUpc.variants[0].barcode === "190000000001" && mappedUpc.variants[1].barcode === "190000000002",
+    "upc: each mapped variant keeps its own barcode",
+  );
+  assert(mappedUpc.variants[2].barcode === null, "upc: a variant with no barcode maps to null");
+
+  const idOf = (sku: string) => {
+    const { payload } = buildJomashopProductPayload(mappedUpc, sku, {
+      category: "Clothing",
+      brand: "Tod's",
+    });
+    const props = (payload.properties ?? {}) as Record<string, unknown>;
+    const key = Object.keys(props).find(
+      (k) => k.toLowerCase().replace(/[^a-z0-9]+/g, "") === "productid",
+    );
+    return key ? props[key] : undefined;
+  };
+
+  const id36 = idOf("STYLE-1-36");
+  const id37 = idOf("STYLE-1-37");
+  assert(id36 === "190000000001", `upc: size 36 pushes its own UPC (got ${String(id36)})`);
+  assert(id37 === "190000000002", `upc: size 37 pushes its own UPC (got ${String(id37)})`);
+  // The actual defect Jomashop reported.
+  assert(id36 !== id37, "upc: two sizes never share a UPC");
+  assert(
+    idOf("STYLE-1-38") === undefined,
+    "upc: a barcode-less size sends no Product ID rather than inheriting one",
+  );
+}
+
+runVariantUpcTests();
+
 async function runRateLimitTests() {
   console.log("\nJomashop rate limiting:");
 
